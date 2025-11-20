@@ -305,11 +305,16 @@ services:
 
 See the [examples/](./examples) directory for complete working examples:
 
-- **[simple/](./examples/simple)** - Single Redis service
-- **[local-dev/](./examples/local-dev)** - Local development workflow
-- **[microservices/](./examples/microservices)** - Multi-service application with dependencies
-- **[manifests-only/](./examples/manifests-only)** - Deploy using Kubernetes manifests
-- **[web-app/](./examples/web-app)** - Full-stack web application
+- **[minimal/](./examples/minimal)** - Simplest possible configuration (single service)
+- **[charts/](./examples/charts)** - All Helm chart sources (OCI, HTTPS, local)
+- **[manifests/](./examples/manifests)** - All manifest sources (local files, directories, remote URLs)
+- **[dependencies/](./examples/dependencies)** - Multi-service with dependency management
+
+Validate all examples:
+```bash
+make validate-examples   # CLI validation (integration test)
+make test                # Includes example unit tests
+```
 
 ## Development
 

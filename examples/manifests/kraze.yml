@@ -1,0 +1,48 @@
+# Kubernetes Manifests Example
+#
+# Demonstrates all supported manifest sources:
+# 1. Local single file
+# 2. Local directory (all .yaml/.yml files)
+# 3. Multiple specific files
+# 4. Remote HTTPS URL
+#
+# Usage:
+#   kraze up               # Apply all manifests
+#   kraze up nginx         # Apply only nginx
+#   kraze status           # Check resource status
+#   kraze down             # Delete all resources
+
+cluster:
+  name: manifests-cluster
+
+services:
+  # 1. Single local file
+  nginx:
+    type: manifests
+    path: ./k8s/nginx.yaml
+    namespace: web
+    create_namespace: true
+
+  # 2. Local directory - loads all .yaml/.yml files
+  app:
+    type: manifests
+    path: ./k8s/app/
+    namespace: apps
+    create_namespace: true
+
+  # 3. Multiple specific files
+  monitoring:
+    type: manifests
+    paths:
+      - ./k8s/monitoring/namespace.yaml
+      - ./k8s/monitoring/serviceaccount.yaml
+      - ./k8s/monitoring/deployment.yaml
+    namespace: monitoring
+
+  # 4. Remote HTTPS manifest
+  # Useful for installing CRDs or operators from GitHub releases
+  cert-manager:
+    type: manifests
+    path: https://github.com/cert-manager/cert-manager/releases/download/v1.13.3/cert-manager.yaml
+    namespace: cert-manager
+    create_namespace: true

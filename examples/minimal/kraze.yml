@@ -1,0 +1,20 @@
+# Minimal Example - Single Service
+#
+# This is the simplest possible kraze configuration.
+# It deploys a single Redis instance from an OCI registry.
+#
+# Usage:
+#   kraze up
+#   kraze status
+#   kraze down
+
+cluster:
+  name: minimal-cluster
+
+services:
+  redis:
+    type: helm
+    chart: redis
+    repo: oci://registry-1.docker.io/bitnamicharts
+    version: 20.2.1
+    namespace: default

@@ -1,0 +1,76 @@
+# Service Dependencies Example
+#
+# Demonstrates:
+# - Multi-service deployments
+# - Service dependencies (depends_on)
+# - Automatic installation ordering
+# - Mixed Helm and manifest services
+#
+# Installation order will be:
+#   1. postgres (no dependencies)
+#   2. redis (no dependencies)
+#   3. backend (depends on postgres and redis)
+#   4. frontend (depends on backend)
+#
+# Usage:
+#   kraze up               # Installs all in correct order
+#   kraze up frontend      # Installs frontend + all dependencies
+#   kraze status           # Check all service status
+#   kraze down             # Uninstalls in reverse order
+
+cluster:
+  name: deps-cluster
+
+services:
+  # Database layer
+  postgres:
+    type: helm
+    chart: postgresql
+    repo: oci://registry-1.docker.io/bitnamicharts
+    version: 15.5.38
+    namespace: data
+    create_namespace: true
+    values_inline: |
+      auth:
+        username: appuser
+        password: devpassword
+        database: appdb
+      primary:
+        resources:
+          requests:
+            memory: "128Mi"
+            cpu: "100m"
+
+  redis:
+    type: helm
+    chart: redis
+    repo: oci://registry-1.docker.io/bitnamicharts
+    version: 20.2.1
+    namespace: data
+    create_namespace: true
+    values_inline: |
+      master:
+        resources:
+          requests:
+            memory: "64Mi"
+            cpu: "50m"
+      replica:
+        replicaCount: 0
+
+  # Application layer
+  backend:
+    type: manifests
+    path: https://raw.githubusercontent.com/kubernetes/website/main/content/en/examples/application/deployment.yaml
+    namespace: app
+    create_namespace: true
+    depends_on:
+      - postgres
+      - redis
+
+  # Frontend layer
+  frontend:
+    type: manifests
+    path: https://raw.githubusercontent.com/kubernetes/website/main/content/en/examples/service/load-balancer-example.yaml
+    namespace: app
+    depends_on:
+      - backend

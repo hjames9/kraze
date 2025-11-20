@@ -1,0 +1,26 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: monitor
+  namespace: monitoring
+  labels:
+    app: monitor
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: monitor
+  template:
+    metadata:
+      labels:
+        app: monitor
+    spec:
+      serviceAccountName: monitor
+      containers:
+      - name: monitor
+        image: busybox:1.36
+        command: ['sh', '-c', 'while true; do echo monitoring...; sleep 30; done']
+        resources:
+          requests:
+            memory: "16Mi"
+            cpu: "10m"

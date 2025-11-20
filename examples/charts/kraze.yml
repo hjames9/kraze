@@ -1,0 +1,60 @@
+# Helm Charts Example
+#
+# Demonstrates all supported Helm chart sources:
+# 1. OCI Registry (Docker Hub, GHCR, etc.)
+# 2. HTTPS Repository (traditional Helm repos)
+# 3. Local chart directory
+#
+# Usage:
+#   kraze up               # Install all services
+#   kraze up redis         # Install only redis
+#   kraze status           # Check status
+#   kraze down             # Uninstall all
+
+cluster:
+  name: charts-cluster
+
+services:
+  # 1. OCI Registry - Docker Hub
+  redis:
+    type: helm
+    chart: redis
+    repo: oci://registry-1.docker.io/bitnamicharts
+    version: 20.2.1
+    namespace: data
+    create_namespace: true
+    values_inline: |
+      master:
+        resources:
+          requests:
+            memory: "128Mi"
+            cpu: "100m"
+      replica:
+        replicaCount: 1
+
+  # 2. HTTPS Repository - Prometheus Community
+  kube-state-metrics:
+    type: helm
+    chart: kube-state-metrics
+    repo: https://prometheus-community.github.io/helm-charts
+    version: 5.15.2
+    namespace: monitoring
+    create_namespace: true
+    values_inline: |
+      resources:
+        requests:
+          memory: "64Mi"
+          cpu: "50m"
+
+  # 3. Local Chart
+  # Chart stored in local directory
+  myapp:
+    type: helm
+    path: ./myapp
+    namespace: apps
+    create_namespace: true
+    values_inline: |
+      replicaCount: 1
+      image:
+        repository: nginx
+        tag: "1.25"

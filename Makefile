@@ -1,4 +1,4 @@
-.PHONY: all build test clean install fmt vet lint help run-tests coverage
+.PHONY: all build test clean install fmt vet lint help run-tests coverage validate-examples
 
 BINARY_NAME=kraze
 VERSION?=dev
@@ -97,6 +97,16 @@ run-help: build
 
 run-version: build
 	./$(BUILD_DIR)/$(BINARY_NAME) version
+
+validate-examples: build
+	@echo "Validating all examples..."
+	@for dir in examples/*/; do \
+		if [ -f "$$dir/kraze.yml" ]; then \
+			echo "Validating $$dir"; \
+			./$(BUILD_DIR)/$(BINARY_NAME) validate --file "$$dir/kraze.yml" || exit 1; \
+		fi \
+	done
+	@echo "All examples validated successfully"
 
 help:
 	@echo "$(BINARY_NAME) - Makefile help"
