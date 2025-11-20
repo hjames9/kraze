@@ -2,6 +2,31 @@
 
 > Bring the simplicity of docker-compose to Kubernetes local development
 
+## Table of Contents
+
+- [Description](#description)
+- [Installation](#installation)
+  - [Prerequisites](#prerequisites)
+  - [Build from Source](#build-from-source)
+- [Quick Start](#quick-start)
+- [Usage](#usage)
+  - [Commands](#commands)
+    - [`kraze up [services...]`](#kraze-up-services)
+    - [`kraze down [services...]`](#kraze-down-services)
+    - [`kraze status`](#kraze-status)
+    - [`kraze init`](#kraze-init)
+    - [`kraze destroy`](#kraze-destroy)
+    - [`kraze validate`](#kraze-validate)
+    - [`kraze load-image <image...>`](#kraze-load-image-image)
+    - [`kraze version`](#kraze-version)
+  - [Configuration File Reference](#configuration-file-reference)
+  - [Environment Variables](#environment-variables)
+  - [Global Flags](#global-flags)
+- [Examples](#examples)
+- [Development](#development)
+- [License](#license)
+- [Contributing](#contributing)
+
 ## Description
 
 kraze is a Kubernetes development environment manager that brings the familiar docker-compose developer experience to local Kubernetes development. It manages kind (Kubernetes in Docker) clusters and orchestrates the installation, upgrade, and removal of services defined in a simple, declarative YAML configuration file.
