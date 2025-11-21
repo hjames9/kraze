@@ -1,9 +1,13 @@
 # Binaries
 kraze
+!cmd/kraze/
 *.exe
 *.dll
 *.so
 *.dylib
+
+# Build directory
+build
 
 # Test binaries
 *.test
