@@ -175,6 +175,50 @@ func (im *ImageManager) GetImageInfo(ctx context.Context, imageName string) (*Im
 	return info, nil
 }
 
+// GetClusterImageHash retrieves the SHA256 hash of an image loaded in the cluster
+// Returns empty string if image is not found in the cluster
+func (im *ImageManager) GetClusterImageHash(ctx context.Context, clusterName, imageName string) (string, error) {
+	// Normalize image name for cluster lookup
+	// crictl uses docker.io/ prefix for Docker Hub images
+	ref := ParseImageReference(imageName)
+	clusterImageName := imageName
+
+	// Add docker.io prefix if it's a Docker Hub image without explicit registry
+	if ref.IsDockerHub() && !strings.HasPrefix(imageName, "docker.io/") {
+		// If it's library/* (official images), use docker.io/library/
+		if !strings.Contains(imageName, "/") {
+			clusterImageName = "docker.io/library/" + imageName
+		} else {
+			clusterImageName = "docker.io/" + imageName
+		}
+	}
+
+	// Get the control plane container name
+	containerName := clusterName + "-control-plane"
+
+	// Check if image exists in cluster using crictl
+	cmd := osexec.CommandContext(ctx, "docker", "exec", containerName, "crictl", "inspecti", clusterImageName)
+	output, err := cmd.Output()
+
+	if err != nil {
+		// Image doesn't exist in cluster
+		return "", nil
+	}
+
+	// Parse crictl inspect output to get image ID
+	var inspectData struct {
+		Status struct {
+			ID string `json:"id"`
+		} `json:"status"`
+	}
+
+	if err := json.Unmarshal(output, &inspectData); err != nil {
+		return "", fmt.Errorf("failed to parse crictl inspect output: %w", err)
+	}
+
+	return inspectData.Status.ID, nil
+}
+
 // ExtractImagesFromValues extracts image references from a Helm values file
 // Looks for common patterns like:
 //

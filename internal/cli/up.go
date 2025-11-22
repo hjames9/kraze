@@ -220,11 +220,41 @@ func runUp(cmd *cobra.Command, args []string) error {
 				imgInfo, _ := imgMgr.GetImageInfo(ctx, img)
 
 				if imgInfo != nil && imgInfo.IsLocal {
-					// Image is local - check if it changed
-					if st.HasImageHashChanged(svc.Name, img, currentHash) {
-						imagesToLoad = append(imagesToLoad, img)
+					// Image is local - check if it needs to be loaded into cluster
+					// For external clusters, fall back to state file comparison (can't inspect cluster directly)
+					// For kind clusters, compare with actual cluster image hash
+					needsLoad := false
+					if cfg.Cluster.IsExternal() {
+						// External cluster - use state file comparison
+						needsLoad = st.HasImageHashChanged(svc.Name, img, currentHash)
+						if needsLoad {
+							Verbose("Image '%s' changed (state file), but external cluster - skipping auto-load", img)
+							needsLoad = false // Can't auto-load to external clusters
+						} else {
+							Verbose("Image '%s' unchanged (hash matches state), skipping", img)
+						}
 					} else {
-						Verbose("Image '%s' unchanged (hash matches), skipping load", img)
+						// Kind cluster - compare with actual cluster
+						clusterHash, err := imgMgr.GetClusterImageHash(ctx, cfg.Cluster.Name, img)
+						if err != nil {
+							Verbose("Warning: failed to get cluster image hash for '%s': %v", img, err)
+							// On error, load to be safe
+							needsLoad = true
+						} else if clusterHash == "" {
+							// Image not in cluster yet
+							Verbose("Image '%s' not found in cluster, will load", img)
+							needsLoad = true
+						} else if clusterHash != currentHash {
+							// Image exists but hash differs - needs reload
+							Verbose("Image '%s' changed (cluster: %s, local: %s), will reload", img, clusterHash[:12], currentHash[:12])
+							needsLoad = true
+						} else {
+							Verbose("Image '%s' unchanged (hash matches cluster), skipping load", img)
+						}
+					}
+
+					if needsLoad {
+						imagesToLoad = append(imagesToLoad, img)
 					}
 				} else {
 					// Image is not local - need to pull it first
