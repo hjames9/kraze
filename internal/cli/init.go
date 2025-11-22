@@ -80,6 +80,11 @@ For external clusters (cluster.external.enabled: true):
 				if cfg.Cluster.Version != "" {
 					fmt.Printf("  Kubernetes version: %s\n", cfg.Cluster.Version)
 				}
+				if cfg.Cluster.NodeImage != "" {
+					fmt.Printf("  Node image: %s\n", cfg.Cluster.NodeImage)
+				} else if cfg.Cluster.Version != "" {
+					fmt.Printf("  Node image: kindest/node:v%s\n", cfg.Cluster.Version)
+				}
 				fmt.Printf("  Nodes: %d\n", len(cfg.Cluster.Config))
 				return nil
 			}

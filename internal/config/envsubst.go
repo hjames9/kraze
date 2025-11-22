@@ -97,6 +97,7 @@ func ExpandEnvVarsInConfig(cfg *Config) {
 	// Expand cluster config
 	cfg.Cluster.Name = ExpandEnvVars(cfg.Cluster.Name)
 	cfg.Cluster.Version = ExpandEnvVars(cfg.Cluster.Version)
+	cfg.Cluster.NodeImage = ExpandEnvVars(cfg.Cluster.NodeImage)
 
 	// Expand networking config
 	if cfg.Cluster.Networking != nil {

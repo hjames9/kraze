@@ -239,6 +239,23 @@ func (kind *KindManager) WaitForClusterReady(ctx context.Context, clusterName st
 	return fmt.Errorf("cluster API server not ready after %v", timeout)
 }
 
+// getNodeImage determines which node image to use based on configuration
+// Priority: node_image > version > default (empty string, let kind decide)
+func (kind *KindManager) getNodeImage(cfg *config.ClusterConfig) string {
+	// Priority 1: If node_image is explicitly specified, use it
+	if cfg.NodeImage != "" {
+		return cfg.NodeImage
+	}
+
+	// Priority 2: If version is specified, construct the image name
+	if cfg.Version != "" {
+		return fmt.Sprintf("kindest/node:v%s", cfg.Version)
+	}
+
+	// Priority 3: Return empty string to let kind use its default
+	return ""
+}
+
 // buildKindConfig converts kraze cluster config to kind v1alpha4 config
 func (kind *KindManager) buildKindConfig(cfg *config.ClusterConfig) *v1alpha4.Cluster {
 	kindCfg := &v1alpha4.Cluster{
@@ -259,17 +276,29 @@ func (kind *KindManager) buildKindConfig(cfg *config.ClusterConfig) *v1alpha4.Cl
 		}
 	}
 
+	// Determine which node image to use
+	nodeImage := kind.getNodeImage(cfg)
+
 	// If no nodes specified in config, create a default control-plane node
 	if len(cfg.Config) == 0 {
-		kindCfg.Nodes = append(kindCfg.Nodes, v1alpha4.Node{
+		node := v1alpha4.Node{
 			Role: v1alpha4.ControlPlaneRole,
-		})
+		}
+		if nodeImage != "" {
+			node.Image = nodeImage
+		}
+		kindCfg.Nodes = append(kindCfg.Nodes, node)
 		return kindCfg
 	}
 
 	// Convert kraze nodes to kind nodes
 	for _, node := range cfg.Config {
 		kindNode := kind.buildKindNode(node)
+
+		// Set the node image if specified
+		if nodeImage != "" {
+			kindNode.Image = nodeImage
+		}
 
 		// Handle replicas for worker nodes
 		if node.Replicas > 0 {

@@ -27,6 +27,9 @@ var validateCmd = &cobra.Command{
 		if cfg.Cluster.Version != "" {
 			fmt.Printf("Kubernetes version: %s\n", cfg.Cluster.Version)
 		}
+		if cfg.Cluster.NodeImage != "" {
+			fmt.Printf("Node image: %s\n", cfg.Cluster.NodeImage)
+		}
 		fmt.Printf("Services: %d\n", len(cfg.Services))
 
 		if verbose {

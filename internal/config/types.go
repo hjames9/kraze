@@ -10,12 +10,13 @@ type Config struct {
 
 // ClusterConfig represents the cluster configuration
 type ClusterConfig struct {
-	Name          string                  `yaml:"name"`
-	Version       string                  `yaml:"version,omitempty"`
-	Config        []KindNode              `yaml:"config,omitempty"`
-	Networking    *NetworkingConfig       `yaml:"networking,omitempty"`
-	PreloadImages []string                `yaml:"preload_images,omitempty"`
-	External      *ExternalClusterConfig  `yaml:"external,omitempty"`
+	Name          string                 `yaml:"name"`
+	Version       string                 `yaml:"version,omitempty"`
+	NodeImage     string                 `yaml:"node_image,omitempty"`
+	Config        []KindNode             `yaml:"config,omitempty"`
+	Networking    *NetworkingConfig      `yaml:"networking,omitempty"`
+	PreloadImages []string               `yaml:"preload_images,omitempty"`
+	External      *ExternalClusterConfig `yaml:"external,omitempty"`
 }
 
 // KindNode represents a kind node configuration

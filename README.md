@@ -71,7 +71,7 @@ Create a `kraze.yml` file in your project:
 ```yaml
 cluster:
   name: dev-cluster
-  kubernetes_version: "1.34.0"
+  version: "1.34.0"
   config:
     - role: control-plane
       extraPortMappings:
@@ -238,7 +238,7 @@ The `kraze.yml` file defines your cluster and services:
 # Cluster configuration
 cluster:
   name: my-cluster                    # Name of the kind cluster
-  kubernetes_version: "1.34.0"        # Kubernetes version (optional)
+  version: "1.34.0"                   # Kubernetes version (optional)
   config:                             # kind cluster configuration
     - role: control-plane
       extraPortMappings:              # Expose ports from cluster
