@@ -14,10 +14,17 @@ import (
 
 var destroyCmd = &cobra.Command{
 	Use:   "destroy",
-	Short: "Delete the kind cluster and clean up state",
-	Long: `Completely remove the kind cluster and delete all associated state.
+	Short: "Delete the cluster and clean up state",
+	Long: `Completely remove the cluster and delete all associated state.
 
-WARNING: This will permanently delete the cluster and all data in it.
+For kind clusters (default):
+  - Permanently delete the cluster and all data in it
+  - Delete the state file
+
+For external clusters (cluster.external.enabled: true):
+  - Only delete the state file (preserves the external cluster)
+
+WARNING: For kind clusters, this will permanently delete the cluster and all data.
 Services do not need to be uninstalled first - the entire cluster is removed.`,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		ctx := context.Background()
@@ -31,22 +38,34 @@ Services do not need to be uninstalled first - the entire cluster is removed.`,
 			return fmt.Errorf("failed to parse config: %w", err)
 		}
 
+		isExternal := cfg.Cluster.IsExternal()
+
 		if dryRun {
-			fmt.Printf("[DRY RUN] Would destroy kind cluster '%s' and state\n", cfg.Cluster.Name)
+			if isExternal {
+				fmt.Printf("[DRY RUN] Would delete state for external cluster '%s' (cluster preserved)\n", cfg.Cluster.Name)
+			} else {
+				fmt.Printf("[DRY RUN] Would destroy kind cluster '%s' and state\n", cfg.Cluster.Name)
+			}
 			return nil
 		}
 
-		// Check if Docker is available
-		Verbose("Checking Docker availability...")
-		if err := cluster.CheckDockerAvailable(ctx); err != nil {
-			return err
-		}
+		if isExternal {
+			// External cluster - only delete state
+			fmt.Printf("External cluster '%s' - preserving cluster, deleting state only\n", cfg.Cluster.Name)
+		} else {
+			// Kind cluster - delete the cluster
+			// Check if Docker is available
+			Verbose("Checking Docker availability...")
+			if err := cluster.CheckDockerAvailable(ctx); err != nil {
+				return err
+			}
 
-		// Delete kind cluster
-		Verbose("Deleting kind cluster...")
-		kindMgr := cluster.NewKindManager()
-		if err := kindMgr.DeleteCluster(cfg.Cluster.Name); err != nil {
-			return fmt.Errorf("failed to delete cluster: %w", err)
+			// Delete kind cluster
+			Verbose("Deleting kind cluster...")
+			kindMgr := cluster.NewKindManager()
+			if err := kindMgr.DeleteCluster(cfg.Cluster.Name); err != nil {
+				return fmt.Errorf("failed to delete cluster: %w", err)
+			}
 		}
 
 		// Delete state file
@@ -62,7 +81,11 @@ Services do not need to be uninstalled first - the entire cluster is removed.`,
 
 		// TODO: Clean up cache (Helm chart cache, etc.)
 
-		fmt.Printf("\n%s Cluster destroyed successfully\n", color.Checkmark())
+		if isExternal {
+			fmt.Printf("\n%s State deleted successfully (external cluster preserved)\n", color.Checkmark())
+		} else {
+			fmt.Printf("\n%s Cluster destroyed successfully\n", color.Checkmark())
+		}
 		return nil
 	},
 }

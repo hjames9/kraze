@@ -17,6 +17,7 @@ var (
 	upWait    bool
 	upTimeout string
 	upNoWait  bool
+	upLabels  []string
 )
 
 var upCmd = &cobra.Command{
@@ -25,7 +26,12 @@ var upCmd = &cobra.Command{
 	Long: `Install and start one or more services defined in kraze.yml.
 
 If no services are specified, all services will be installed.
-Services will be installed in dependency order automatically.`,
+Services will be installed in dependency order automatically.
+
+You can filter services by name or by labels:
+  kraze up service1 service2      # Install specific services
+  kraze up --label env=dev        # Install services with label env=dev
+  kraze up --label tier=backend   # Install services with label tier=backend`,
 	RunE: runUp,
 }
 
@@ -42,7 +48,23 @@ func runUp(cmd *cobra.Command, args []string) error {
 
 	// Filter services if specified (including dependencies)
 	requestedServices := args
-	if len(requestedServices) > 0 {
+
+	// Check if both service names and labels are specified
+	if len(requestedServices) > 0 && len(upLabels) > 0 {
+		return fmt.Errorf("cannot specify both service names and labels, use one or the other")
+	}
+
+	if len(upLabels) > 0 {
+		// Filter by labels
+		Verbose("Filtering services by labels: %v", upLabels)
+		filteredServices, err := cfg.FilterServicesByLabelsWithDependencies(upLabels)
+		if err != nil {
+			return fmt.Errorf("failed to filter services by labels: %w", err)
+		}
+		cfg.Services = filteredServices
+		Verbose("Found %d service(s) matching labels (including dependencies)", len(filteredServices))
+	} else if len(requestedServices) > 0 {
+		// Filter by service names
 		Verbose("Services to install: %v", requestedServices)
 		filteredServices, err := cfg.FilterServicesWithDependencies(requestedServices)
 		if err != nil {
@@ -109,14 +131,14 @@ func runUp(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("failed to load state: %w", err)
 	}
 	if st == nil {
-		st = state.New(cfg.Cluster.Name)
+		st = state.New(cfg.Cluster.Name, cfg.Cluster.IsExternal())
 	}
 
-	// Determine wait behavior
-	shouldWait := upWait && !upNoWait
-	timeout := upTimeout
+	// Determine global wait behavior from CLI flags
+	globalWait := upWait && !upNoWait
+	globalTimeout := upTimeout
 	if upNoWait {
-		shouldWait = false
+		globalWait = false
 	}
 
 	// Create image manager for automatic image loading
@@ -126,12 +148,26 @@ func runUp(cmd *cobra.Command, args []string) error {
 	for itr, svc := range orderedServices {
 		fmt.Printf("\n[%d/%d] Installing '%s' (%s)...\n", itr+1, len(orderedServices), svc.Name, svc.Type)
 
+		// Determine wait behavior for this service (precedence: service config > CLI flag)
+		serviceWait := globalWait
+		if svc.Wait != nil {
+			serviceWait = *svc.Wait
+			Verbose("Service '%s' has wait=%v configured", svc.Name, serviceWait)
+		}
+
+		// Determine timeout for this service (precedence: service config > CLI flag)
+		serviceTimeout := globalTimeout
+		if svc.WaitTimeout != "" {
+			serviceTimeout = svc.WaitTimeout
+			Verbose("Service '%s' has wait_timeout=%s configured", svc.Name, serviceTimeout)
+		}
+
 		// Create provider options
 		providerOpts := &providers.ProviderOptions{
 			ClusterName: cfg.Cluster.Name,
 			KubeConfig:  kubeconfig,
-			Wait:        shouldWait,
-			Timeout:     timeout,
+			Wait:        serviceWait,
+			Timeout:     serviceTimeout,
 			Verbose:     verbose,
 		}
 
@@ -293,4 +329,5 @@ func init() {
 	upCmd.Flags().BoolVar(&upWait, "wait", true, "Wait for services to be ready")
 	upCmd.Flags().BoolVar(&upNoWait, "no-wait", false, "Don't wait for services to be ready")
 	upCmd.Flags().StringVar(&upTimeout, "timeout", "10m", "Timeout for wait operations")
+	upCmd.Flags().StringSliceVarP(&upLabels, "label", "l", []string{}, "Filter services by label (format: key=value, can be specified multiple times)")
 }

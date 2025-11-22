@@ -46,15 +46,14 @@ services:
           memory: "64Mi"
           cpu: "50m"
 
-  # 3. Local Chart
-  # Chart stored in local directory
+  # 3. Local Chart with Multiple Values Files
+  # Demonstrates values file merging: base + overrides
+  # Later files override earlier ones (deep merge)
   myapp:
     type: helm
     path: ./myapp
     namespace: apps
     create_namespace: true
-    values_inline: |
-      replicaCount: 1
-      image:
-        repository: nginx
-        tag: "1.25"
+    values:
+      - ./values-base.yaml      # Base configuration
+      - ./values-prod.yaml      # Production overrides

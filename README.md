@@ -246,6 +246,12 @@ cluster:
           hostPort: 8080
           protocol: TCP
 
+  # Optional: Use existing cluster (Docker Desktop, Minikube, remote)
+  # external:
+  #   enabled: true
+  #   kubeconfig: ~/.kube/config      # Optional - default: ~/.kube/config
+  #   context: docker-desktop         # Optional - default: current-context
+
 # Services to deploy
 services:
   # Helm chart from OCI registry
@@ -256,9 +262,15 @@ services:
     version: 23.2.6              # Optional - defaults to latest
     namespace: data
     create_namespace: true       # Defaults to true
-    values: values.yml           # Path to Helm values file
+    values: values.yml           # Single values file
+    # OR multiple values files (merged in order, later overrides earlier):
+    # values:
+    #   - base-values.yml
+    #   - prod-values.yml
     depends_on:                  # Optional - list of dependencies
       - other-service
+    wait: true                   # Wait for resources to be ready (defaults to CLI flag)
+    wait_timeout: "15m"          # Timeout for wait operations (defaults to CLI timeout)
 
   # Helm chart from HTTP repository
   another-service:
@@ -295,6 +307,72 @@ services:
     namespace: ${NAMESPACE:-default}
 ```
 
+### Wait Behavior and Dependencies
+
+kraze automatically handles service dependencies and ensures services are ready before starting dependent services.
+
+#### CLI Flags
+
+- `--wait` (default: `true`) - Wait for all resources to be ready before proceeding
+- `--no-wait` - Skip waiting for resources to be ready
+- `--timeout <duration>` (default: `10m`) - Global timeout for wait operations
+
+#### Per-Service Configuration
+
+You can override wait behavior for individual services:
+
+```yaml
+services:
+  rabbitmq:
+    type: helm
+    chart: rabbitmq
+    repo: oci://registry-1.docker.io/bitnamicharts
+    namespace: messaging
+    wait: true           # Ensure RabbitMQ is fully ready
+    wait_timeout: "15m"  # Give it 15 minutes to start
+
+  rabbitmq-migrator:
+    type: helm
+    chart: ./migrations
+    namespace: messaging
+    depends_on:
+      - rabbitmq         # Will only start after rabbitmq is ready
+    wait_timeout: "5m"   # Migrations are usually quick
+```
+
+**Configuration Precedence:**
+1. Service-specific `wait` and `wait_timeout` (highest priority)
+2. CLI flags `--wait`, `--timeout`
+3. Defaults: `wait=true`, `timeout="10m"`
+
+**What "ready" means:**
+
+*For Helm charts:*
+- Helm's built-in wait functionality monitors all resources
+- Deployments: `status.availableReplicas == spec.replicas`
+- StatefulSets: `status.readyReplicas == spec.replicas`
+- DaemonSets: `status.numberReady == status.desiredNumberScheduled`
+- Jobs: `status.succeeded > 0` or conditions show Complete
+- All readiness probes must pass
+
+*For Manifests:*
+- kraze polls each applied resource until ready
+- Same readiness checks as Helm
+- For CRDs (like RabbitmqCluster): Checks `status.conditions` for Ready=True
+- Polls every 2 seconds until ready or timeout
+
+**Example workflow:**
+```bash
+# Use defaults (wait=true, timeout=10m)
+kraze up
+
+# Override globally
+kraze up --wait --timeout 20m
+
+# Skip waiting entirely (fast but risky)
+kraze up --no-wait
+```
+
 ### Global Flags
 
 - `-f, --file` - Path to configuration file (default: `kraze.yml`)
@@ -309,6 +387,8 @@ See the [examples/](./examples) directory for complete working examples:
 - **[charts/](./examples/charts)** - All Helm chart sources (OCI, HTTPS, local)
 - **[manifests/](./examples/manifests)** - All manifest sources (local files, directories, remote URLs)
 - **[dependencies/](./examples/dependencies)** - Multi-service with dependency management
+- **[external-cluster/](./examples/external-cluster)** - Use existing clusters (Docker Desktop, Minikube, remote)
+- **[labels/](./examples/labels)** - Filter services by labels (env, tier, team)
 
 Validate all examples:
 ```bash

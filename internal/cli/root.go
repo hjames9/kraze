@@ -52,6 +52,7 @@ func init() {
 	rootCmd.AddCommand(versionCmd)
 	rootCmd.AddCommand(validateCmd)
 	rootCmd.AddCommand(loadImageCmd)
+	rootCmd.AddCommand(portForwardCmd)
 }
 
 // SetVersionInfo sets the version information for the CLI

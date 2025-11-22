@@ -2,11 +2,13 @@ package cluster
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
 
 	"github.com/hjames9/kraze/internal/config"
+	"gopkg.in/yaml.v3"
 )
 
 func TestParseImageReference(test *testing.T) {
@@ -569,12 +571,18 @@ database:
 		test.Fatalf("Failed to create values file: %v", err)
 	}
 
+	// Create ValuesField from the file path
+	valuesField := config.ValuesField{}
+	if err := yaml.Unmarshal([]byte(fmt.Sprintf("\"%s\"", valuesFile)), &valuesField); err != nil {
+		test.Fatalf("Failed to create ValuesField: %v", err)
+	}
+
 	svc := &config.ServiceConfig{
 		Name:      "myapp",
 		Type:      "helm",
 		Chart:     "myapp",
 		Repo:      "https://charts.example.com",
-		Values:    valuesFile,
+		Values:    valuesField,
 		Namespace: "default",
 	}
 

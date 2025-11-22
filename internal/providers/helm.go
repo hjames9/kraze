@@ -104,8 +104,10 @@ func (helm *HelmProvider) Install(ctx context.Context, service *config.ServiceCo
 	client.ReleaseName = service.Name
 	client.Namespace = service.GetNamespace()
 	client.CreateNamespace = service.ShouldCreateNamespace()
-	client.Wait = helm.opts.Wait
-	client.WaitForJobs = helm.opts.Wait
+
+	// Disable Helm's built-in wait for consistency with manifests type
+	client.Wait = false
+	client.WaitForJobs = false
 
 	if helm.opts.Timeout != "" {
 		timeout, err := time.ParseDuration(helm.opts.Timeout)
@@ -138,12 +140,21 @@ func (helm *HelmProvider) Install(ctx context.Context, service *config.ServiceCo
 
 	// Install the chart
 	fmt.Printf("Installing Helm chart '%s' in namespace '%s'...\n", service.Name, service.GetNamespace())
-	_, err = client.RunWithContext(ctx, chart, values)
+	rel, err := client.RunWithContext(ctx, chart, values)
 	if err != nil {
 		return fmt.Errorf("failed to install chart: %w", err)
 	}
 
 	fmt.Printf("%s Chart '%s' installed successfully\n", color.Checkmark(), service.Name)
+
+	// Wait for resources to be ready using our shared wait logic
+	if helm.opts.Wait && rel != nil && rel.Manifest != "" {
+		// Use WaitForManifestsInNamespace to apply the release namespace to resources
+		if err := WaitForManifestsInNamespace(ctx, helm.opts.KubeConfig, rel.Manifest, service.GetNamespace(), helm.opts); err != nil {
+			return fmt.Errorf("failed waiting for resources: %w", err)
+		}
+	}
+
 	return nil
 }
 
@@ -297,7 +308,12 @@ func (helm *HelmProvider) getChartPath(ctx context.Context, service *config.Serv
 	if service.IsRemoteChart() {
 		// For OCI registries, use LocateChart (it handles OCI natively)
 		if config.IsOCIURL(service.Repo) {
-			actionConfig := new(action.Configuration)
+			// Get properly initialized action config with registry client
+			actionConfig, err := helm.getActionConfig(service.GetNamespace())
+			if err != nil {
+				return "", fmt.Errorf("failed to get action config for OCI chart: %w", err)
+			}
+
 			client := action.NewInstall(actionConfig)
 			if service.Version != "" {
 				client.Version = service.Version
@@ -337,6 +353,17 @@ func (helm *HelmProvider) pullHTTPChart(service *config.ServiceConfig) (string, 
 
 	// Create Pull action
 	actionConfig := new(action.Configuration)
+
+	// Initialize registry client for OCI support (for consistency)
+	registryClient, err := registry.NewClient(
+		registry.ClientOptDebug(helm.opts.Verbose),
+		registry.ClientOptCredentialsFile(helm.settings.RegistryConfig),
+	)
+	if err != nil {
+		return "", fmt.Errorf("failed to create registry client: %w", err)
+	}
+	actionConfig.RegistryClient = registryClient
+
 	pull := action.NewPullWithOpts(action.WithConfig(actionConfig))
 	pull.Settings = helm.settings
 	pull.DestDir = tmpDir
@@ -485,7 +512,36 @@ func generateRepoName(repoURL string) string {
 	return name
 }
 
-// loadValues loads values from the values file or inline values
+// mergeMaps performs a deep merge of two maps, with override values taking precedence
+func mergeMaps(base, override map[string]interface{}) map[string]interface{} {
+	result := make(map[string]interface{})
+
+	// Copy all values from base
+	for key, value := range base {
+		result[key] = value
+	}
+
+	// Merge override values
+	for key, overrideValue := range override {
+		if baseValue, exists := result[key]; exists {
+			// If both values are maps, merge them recursively
+			baseMap, baseIsMap := baseValue.(map[string]interface{})
+			overrideMap, overrideIsMap := overrideValue.(map[string]interface{})
+
+			if baseIsMap && overrideIsMap {
+				result[key] = mergeMaps(baseMap, overrideMap)
+				continue
+			}
+		}
+
+		// Otherwise, override the value
+		result[key] = overrideValue
+	}
+
+	return result
+}
+
+// loadValues loads values from the values file(s) or inline values
 func (helm *HelmProvider) loadValues(service *config.ServiceConfig) (map[string]interface{}, error) {
 	values := make(map[string]interface{})
 
@@ -507,25 +563,45 @@ func (helm *HelmProvider) loadValues(service *config.ServiceConfig) (map[string]
 		return values, nil
 	}
 
-	// Priority 2: Values file
-	if service.Values != "" {
-		if helm.opts.Verbose {
-			fmt.Printf("Loading values from: %s\n", service.Values)
-		}
-
-		// Read the values file
-		data, err := os.ReadFile(service.Values)
-		if err != nil {
-			return nil, fmt.Errorf("failed to read values file %s: %w", service.Values, err)
-		}
-
-		// Parse YAML
-		if err := yaml.Unmarshal(data, &values); err != nil {
-			return nil, fmt.Errorf("failed to parse values file %s: %w", service.Values, err)
-		}
+	// Priority 2: Values file(s) - merge in order
+	if !service.Values.IsEmpty() {
+		files := service.Values.Files()
 
 		if helm.opts.Verbose {
-			fmt.Printf("Loaded %d value(s) from %s\n", len(values), service.Values)
+			if len(files) == 1 {
+				fmt.Printf("Loading values from: %s\n", files[0])
+			} else {
+				fmt.Printf("Loading and merging values from %d file(s)...\n", len(files))
+			}
+		}
+
+		for i, valuesFile := range files {
+			if helm.opts.Verbose && len(files) > 1 {
+				fmt.Printf("  [%d/%d] %s\n", i+1, len(files), valuesFile)
+			}
+
+			// Read the values file
+			data, err := os.ReadFile(valuesFile)
+			if err != nil {
+				return nil, fmt.Errorf("failed to read values file %s: %w", valuesFile, err)
+			}
+
+			// Parse YAML
+			var fileValues map[string]interface{}
+			if err := yaml.Unmarshal(data, &fileValues); err != nil {
+				return nil, fmt.Errorf("failed to parse values file %s: %w", valuesFile, err)
+			}
+
+			// Merge into existing values (later files override earlier ones)
+			values = mergeMaps(values, fileValues)
+		}
+
+		if helm.opts.Verbose {
+			if len(files) == 1 {
+				fmt.Printf("Loaded %d value(s) from %s\n", len(values), files[0])
+			} else {
+				fmt.Printf("Loaded and merged %d total value(s) from %d file(s)\n", len(values), len(files))
+			}
 		}
 
 		return values, nil

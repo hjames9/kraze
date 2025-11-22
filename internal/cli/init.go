@@ -14,25 +14,21 @@ import (
 
 var initCmd = &cobra.Command{
 	Use:   "init",
-	Short: "Create and initialize the kind cluster",
-	Long: `Create a new kind (Kubernetes in Docker) cluster based on the cluster
-configuration defined in kraze.yml.
+	Short: "Initialize the cluster configuration",
+	Long: `Initialize the cluster configuration defined in kraze.yml.
 
-This command will:
+For kind clusters (default):
   - Check if Docker is running
   - Create a kind cluster with the specified configuration
+  - Initialize the state file
+
+For external clusters (cluster.external.enabled: true):
+  - Verify the cluster is accessible
   - Initialize the state file`,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		ctx := context.Background()
 
 		Verbose("Initializing cluster from config file: %s", configFile)
-
-		// Check Docker availability
-		Verbose("Checking Docker availability...")
-		if err := cluster.CheckDockerAvailable(ctx); err != nil {
-			return err
-		}
-		Verbose("Docker is available")
 
 		// Parse config file
 		Verbose("Parsing configuration...")
@@ -42,20 +38,56 @@ This command will:
 		}
 		Verbose("Configuration parsed successfully")
 
-		if dryRun {
-			fmt.Printf("[DRY RUN] Would create kind cluster '%s'\n", cfg.Cluster.Name)
-			if cfg.Cluster.Version != "" {
-				fmt.Printf("  Kubernetes version: %s\n", cfg.Cluster.Version)
-			}
-			fmt.Printf("  Nodes: %d\n", len(cfg.Cluster.Config))
-			return nil
-		}
-
-		// Create kind cluster
-		Verbose("Creating kind cluster...")
+		isExternal := cfg.Cluster.IsExternal()
 		kindMgr := cluster.NewKindManager()
-		if err := kindMgr.CreateCluster(ctx, &cfg.Cluster); err != nil {
-			return fmt.Errorf("failed to create cluster: %w", err)
+
+		if isExternal {
+			// External cluster mode
+			fmt.Printf("Using external cluster '%s'\n", cfg.Cluster.Name)
+			Verbose("External cluster mode - skipping cluster creation")
+
+			if dryRun {
+				fmt.Printf("[DRY RUN] Would verify external cluster '%s' is accessible\n", cfg.Cluster.Name)
+				return nil
+			}
+
+			// Verify cluster is accessible
+			kubeconfig, err := kindMgr.GetKubeconfigForExternalCluster(&cfg.Cluster)
+			if err != nil {
+				return fmt.Errorf("failed to get kubeconfig for external cluster: %w", err)
+			}
+
+			// Test cluster connectivity
+			Verbose("Verifying cluster connectivity...")
+			if err := kindMgr.VerifyClusterAccess(ctx, kubeconfig); err != nil {
+				return fmt.Errorf("failed to access external cluster '%s': %w", cfg.Cluster.Name, err)
+			}
+
+			fmt.Printf("%s External cluster is accessible\n", color.Checkmark())
+		} else {
+			// Kind cluster mode (default)
+			Verbose("Creating kind cluster...")
+
+			// Check Docker availability
+			Verbose("Checking Docker availability...")
+			if err := cluster.CheckDockerAvailable(ctx); err != nil {
+				return err
+			}
+			Verbose("Docker is available")
+
+			if dryRun {
+				fmt.Printf("[DRY RUN] Would create kind cluster '%s'\n", cfg.Cluster.Name)
+				if cfg.Cluster.Version != "" {
+					fmt.Printf("  Kubernetes version: %s\n", cfg.Cluster.Version)
+				}
+				fmt.Printf("  Nodes: %d\n", len(cfg.Cluster.Config))
+				return nil
+			}
+
+			// Create kind cluster
+			if err := kindMgr.CreateCluster(ctx, &cfg.Cluster); err != nil {
+				return fmt.Errorf("failed to create cluster: %w", err)
+			}
 		}
 
 		// Preload images if specified
@@ -82,13 +114,17 @@ This command will:
 		configDir := filepath.Dir(configFile)
 		stateFilePath := state.GetStateFilePath(configDir)
 
-		st := state.New(cfg.Cluster.Name)
+		st := state.New(cfg.Cluster.Name, isExternal)
 		if err := st.Save(stateFilePath); err != nil {
 			return fmt.Errorf("failed to save state: %w", err)
 		}
 		Verbose("State file created: %s", stateFilePath)
 
-		fmt.Printf("\n%s Cluster initialized successfully\n", color.Checkmark())
+		if isExternal {
+			fmt.Printf("\n%s External cluster initialized successfully\n", color.Checkmark())
+		} else {
+			fmt.Printf("\n%s Cluster initialized successfully\n", color.Checkmark())
+		}
 		fmt.Printf("\nTo start services, run: kraze up\n")
 		return nil
 	},

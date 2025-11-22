@@ -1,5 +1,7 @@
 package config
 
+import "fmt"
+
 // Config represents the complete kraze.yml structure
 type Config struct {
 	Cluster  ClusterConfig            `yaml:"cluster"`
@@ -8,12 +10,12 @@ type Config struct {
 
 // ClusterConfig represents the cluster configuration
 type ClusterConfig struct {
-	Name          string            `yaml:"name"`
-	Version       string            `yaml:"version,omitempty"`
-	Config        []KindNode        `yaml:"config,omitempty"`
-	Networking    *NetworkingConfig `yaml:"networking,omitempty"`
-	PreloadImages []string          `yaml:"preload_images,omitempty"`
-	// External *ExternalClusterConfig `yaml:"external,omitempty"`
+	Name          string                  `yaml:"name"`
+	Version       string                  `yaml:"version,omitempty"`
+	Config        []KindNode              `yaml:"config,omitempty"`
+	Networking    *NetworkingConfig       `yaml:"networking,omitempty"`
+	PreloadImages []string                `yaml:"preload_images,omitempty"`
+	External      *ExternalClusterConfig  `yaml:"external,omitempty"`
 }
 
 // KindNode represents a kind node configuration
@@ -47,6 +49,66 @@ type NetworkingConfig struct {
 	ServiceSubnet     string `yaml:"serviceSubnet,omitempty"`
 }
 
+// ExternalClusterConfig represents configuration for using an existing cluster
+type ExternalClusterConfig struct {
+	Enabled    bool   `yaml:"enabled"`              // Use external cluster instead of creating one
+	Kubeconfig string `yaml:"kubeconfig,omitempty"` // Path to kubeconfig (default: ~/.kube/config)
+	Context    string `yaml:"context,omitempty"`    // Kubernetes context to use (default: current-context)
+}
+
+// IsExternal returns true if this cluster configuration is for an external cluster
+func (c *ClusterConfig) IsExternal() bool {
+	return c.External != nil && c.External.Enabled
+}
+
+// ValuesField represents a values file or array of values files
+// Supports both: values: "single.yaml" and values: ["base.yaml", "override.yaml"]
+type ValuesField struct {
+	files []string
+}
+
+// UnmarshalYAML implements custom unmarshaling for string or []string
+func (v *ValuesField) UnmarshalYAML(unmarshal func(interface{}) error) error {
+	// Try unmarshaling as a string first
+	var single string
+	if err := unmarshal(&single); err == nil {
+		if single != "" {
+			v.files = []string{single}
+		}
+		return nil
+	}
+
+	// Try unmarshaling as []string
+	var multiple []string
+	if err := unmarshal(&multiple); err == nil {
+		v.files = multiple
+		return nil
+	}
+
+	return fmt.Errorf("values must be a string or array of strings")
+}
+
+// MarshalYAML implements custom marshaling
+func (v ValuesField) MarshalYAML() (interface{}, error) {
+	if len(v.files) == 0 {
+		return nil, nil
+	}
+	if len(v.files) == 1 {
+		return v.files[0], nil
+	}
+	return v.files, nil
+}
+
+// Files returns the values files as a slice
+func (v ValuesField) Files() []string {
+	return v.files
+}
+
+// IsEmpty returns true if no values files are specified
+func (v ValuesField) IsEmpty() bool {
+	return len(v.files) == 0
+}
+
 // ServiceConfig represents a service definition
 type ServiceConfig struct {
 	Name      string   `yaml:"-"`    // Set from map key
@@ -57,14 +119,16 @@ type ServiceConfig struct {
 	// Common fields
 	CreateNamespace *bool             `yaml:"create_namespace,omitempty"` // Defaults to true
 	Labels          map[string]string `yaml:"labels,omitempty"`
+	Wait            *bool             `yaml:"wait,omitempty"`         // Wait for resources to be ready (defaults to CLI flag)
+	WaitTimeout     string            `yaml:"wait_timeout,omitempty"` // Timeout for wait operations (e.g., "10m", "5m")
 
 	// Helm-specific fields
-	Repo         string `yaml:"repo,omitempty"`          // Remote Helm repo URL
-	Chart        string `yaml:"chart,omitempty"`         // Chart name
-	Version      string `yaml:"version,omitempty"`       // Chart version
-	Values       string `yaml:"values,omitempty"`        // Values file path
-	ValuesInline string `yaml:"values_inline,omitempty"` // Inline YAML values
-	KeepCRDs     *bool  `yaml:"keep_crds,omitempty"`     // Keep CRDs on uninstall (nil = use default)
+	Repo         string      `yaml:"repo,omitempty"`          // Remote Helm repo URL
+	Chart        string      `yaml:"chart,omitempty"`         // Chart name
+	Version      string      `yaml:"version,omitempty"`       // Chart version
+	Values       ValuesField `yaml:"values,omitempty"`        // Values file path(s) - string or []string
+	ValuesInline string      `yaml:"values_inline,omitempty"` // Inline YAML values
+	KeepCRDs     *bool       `yaml:"keep_crds,omitempty"`     // Keep CRDs on uninstall (nil = use default)
 
 	// Path field used by both Helm (local chart) and Manifests (single file/dir)
 	Path  string   `yaml:"path,omitempty"`  // Local chart path (Helm) or manifest file/directory (Manifests)
@@ -131,6 +195,11 @@ func (srv *ServiceConfig) Validate() error {
 		}
 		if srv.IsRemoteChart() && srv.Chart == "" {
 			return &ValidationError{Field: "chart", Message: "chart name is required for remote helm chart"}
+		}
+
+		// Values validation
+		if !srv.Values.IsEmpty() && srv.ValuesInline != "" {
+			return &ValidationError{Field: "values", Message: "cannot specify both 'values' and 'values_inline'"}
 		}
 	}
 

@@ -116,7 +116,15 @@ func ExpandEnvVarsInConfig(cfg *Config) {
 		svc.Chart = ExpandEnvVars(svc.Chart)
 		svc.Version = ExpandEnvVars(svc.Version)
 		svc.Path = ExpandEnvVars(svc.Path)
-		svc.Values = ExpandEnvVars(svc.Values)
+
+		// Expand values files
+		if !svc.Values.IsEmpty() {
+			expandedFiles := make([]string, 0, len(svc.Values.Files()))
+			for _, valuesFile := range svc.Values.Files() {
+				expandedFiles = append(expandedFiles, ExpandEnvVars(valuesFile))
+			}
+			svc.Values = ValuesField{files: expandedFiles}
+		}
 
 		// Expand paths array
 		for itr := range svc.Paths {

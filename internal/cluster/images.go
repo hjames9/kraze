@@ -17,6 +17,7 @@ import (
 	"helm.sh/helm/v3/pkg/chartutil"
 	"helm.sh/helm/v3/pkg/cli"
 	"helm.sh/helm/v3/pkg/engine"
+	"helm.sh/helm/v3/pkg/registry"
 )
 
 // ImageReference represents a parsed Docker image reference
@@ -282,6 +283,16 @@ func (im *ImageManager) ExtractImagesFromHelmChart(ctx context.Context, svc *con
 		return nil, fmt.Errorf("failed to initialize helm config: %w", err)
 	}
 
+	// Initialize registry client for OCI support
+	registryClient, err := registry.NewClient(
+		registry.ClientOptDebug(im.verbose),
+		registry.ClientOptCredentialsFile(settings.RegistryConfig),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create registry client: %w", err)
+	}
+	actionConfig.RegistryClient = registryClient
+
 	// For local charts
 	if svc.IsLocalChart() {
 		return im.extractImagesFromLocalChart(svc)
@@ -314,13 +325,20 @@ func (im *ImageManager) ExtractImagesFromHelmChart(ctx context.Context, svc *con
 
 	// Load values if specified
 	vals := make(map[string]interface{})
-	if svc.Values != "" {
-		valuesData, err := os.ReadFile(svc.Values)
-		if err != nil {
-			return nil, fmt.Errorf("failed to read values file: %w", err)
-		}
-		if err := yaml.Unmarshal(valuesData, &vals); err != nil {
-			return nil, fmt.Errorf("failed to parse values file: %w", err)
+	if !svc.Values.IsEmpty() {
+		for _, valuesFile := range svc.Values.Files() {
+			valuesData, err := os.ReadFile(valuesFile)
+			if err != nil {
+				return nil, fmt.Errorf("failed to read values file %s: %w", valuesFile, err)
+			}
+			var fileVals map[string]interface{}
+			if err := yaml.Unmarshal(valuesData, &fileVals); err != nil {
+				return nil, fmt.Errorf("failed to parse values file %s: %w", valuesFile, err)
+			}
+			// Merge values (simple merge for now - could use helm's merge logic)
+			for k, v := range fileVals {
+				vals[k] = v
+			}
 		}
 	}
 
@@ -351,6 +369,16 @@ func (im *ImageManager) extractImagesFromRemoteChart(ctx context.Context, svc *c
 
 	// Create action configuration (minimal, no K8s connection needed for pull/template)
 	actionConfig := new(action.Configuration)
+
+	// Initialize registry client for OCI support
+	registryClient, err := registry.NewClient(
+		registry.ClientOptDebug(im.verbose),
+		registry.ClientOptCredentialsFile(settings.RegistryConfig),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create registry client: %w", err)
+	}
+	actionConfig.RegistryClient = registryClient
 
 	// Create pull action
 	pull := action.NewPullWithOpts(action.WithConfig(actionConfig))
@@ -448,15 +476,17 @@ func (im *ImageManager) extractImagesFromRemoteChart(ctx context.Context, svc *c
 func (im *ImageManager) extractImagesFromLocalChart(svc *config.ServiceConfig) ([]string, error) {
 	images := make([]string, 0)
 
-	// Try to extract from values file if specified
-	if svc.Values != "" {
-		valuesImages, err := im.ExtractImagesFromValues(svc.Values)
-		if err != nil {
-			if im.verbose {
-				fmt.Printf("Warning: Failed to extract images from values: %v\n", err)
+	// Try to extract from values files if specified
+	if !svc.Values.IsEmpty() {
+		for _, valuesFile := range svc.Values.Files() {
+			valuesImages, err := im.ExtractImagesFromValues(valuesFile)
+			if err != nil {
+				if im.verbose {
+					fmt.Printf("Warning: Failed to extract images from values file %s: %v\n", valuesFile, err)
+				}
+			} else {
+				images = append(images, valuesImages...)
 			}
-		} else {
-			images = append(images, valuesImages...)
 		}
 	}
 
@@ -595,15 +625,17 @@ func (im *ImageManager) GetImagesForService(ctx context.Context, svc *config.Ser
 			}
 		}
 
-		// Method 2: Extract from values file
-		if svc.Values != "" {
-			valuesImages, err := im.ExtractImagesFromValues(svc.Values)
-			if err != nil {
-				if im.verbose {
-					fmt.Printf("Warning: Failed to extract images from values: %v\n", err)
+		// Method 2: Extract from values files
+		if !svc.Values.IsEmpty() {
+			for _, valuesFile := range svc.Values.Files() {
+				valuesImages, err := im.ExtractImagesFromValues(valuesFile)
+				if err != nil {
+					if im.verbose {
+						fmt.Printf("Warning: Failed to extract images from values file %s: %v\n", valuesFile, err)
+					}
+				} else {
+					images = append(images, valuesImages...)
 				}
-			} else {
-				images = append(images, valuesImages...)
 			}
 		}
 

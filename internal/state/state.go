@@ -16,6 +16,7 @@ const (
 // State represents the state of deployed services
 type State struct {
 	ClusterName string                  `json:"cluster_name"`
+	IsExternal  bool                    `json:"is_external"`  // Whether this is an external cluster
 	Services    map[string]ServiceState `json:"services"`
 	LastUpdated time.Time               `json:"last_updated"`
 }
@@ -31,9 +32,10 @@ type ServiceState struct {
 }
 
 // New creates a new empty state
-func New(clusterName string) *State {
+func New(clusterName string, isExternal bool) *State {
 	return &State{
 		ClusterName: clusterName,
+		IsExternal:  isExternal,
 		Services:    make(map[string]ServiceState),
 		LastUpdated: time.Now(),
 	}

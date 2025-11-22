@@ -81,9 +81,17 @@ func (cfg *Config) ResolvePaths(configPath string) error {
 	configDir := filepath.Dir(configPath)
 
 	for name, svc := range cfg.Services {
-		// Resolve Helm values file path
-		if svc.Values != "" && !filepath.IsAbs(svc.Values) {
-			svc.Values = filepath.Join(configDir, svc.Values)
+		// Resolve Helm values file paths
+		if !svc.Values.IsEmpty() {
+			resolvedFiles := make([]string, 0, len(svc.Values.Files()))
+			for _, valuesFile := range svc.Values.Files() {
+				if !filepath.IsAbs(valuesFile) {
+					resolvedFiles = append(resolvedFiles, filepath.Join(configDir, valuesFile))
+				} else {
+					resolvedFiles = append(resolvedFiles, valuesFile)
+				}
+			}
+			svc.Values = ValuesField{files: resolvedFiles}
 		}
 
 		// Resolve path (used by both Helm local charts and manifests)
@@ -183,6 +191,68 @@ func (cfg *Config) FilterServicesWithDependencies(names []string) (map[string]Se
 	}
 
 	return filtered, nil
+}
+
+// FilterServicesByLabels returns services that match all the given label selectors
+// Label selectors are in the format "key=value"
+// If no labels provided, returns all services
+func (cfg *Config) FilterServicesByLabels(labelSelectors []string) (map[string]ServiceConfig, error) {
+	if len(labelSelectors) == 0 {
+		return cfg.Services, nil
+	}
+
+	// Parse label selectors
+	requiredLabels := make(map[string]string)
+	for _, selector := range labelSelectors {
+		parts := strings.SplitN(selector, "=", 2)
+		if len(parts) != 2 {
+			return nil, fmt.Errorf("invalid label selector '%s': must be in format 'key=value'", selector)
+		}
+		requiredLabels[parts[0]] = parts[1]
+	}
+
+	// Filter services that match all required labels
+	filtered := make(map[string]ServiceConfig)
+	for name, svc := range cfg.Services {
+		if matchesLabels(svc.Labels, requiredLabels) {
+			filtered[name] = svc
+		}
+	}
+
+	if len(filtered) == 0 {
+		return nil, fmt.Errorf("no services found matching label selectors: %v", labelSelectors)
+	}
+
+	return filtered, nil
+}
+
+// FilterServicesByLabelsWithDependencies returns services matching labels plus all their dependencies
+func (cfg *Config) FilterServicesByLabelsWithDependencies(labelSelectors []string) (map[string]ServiceConfig, error) {
+	// First get services matching labels
+	matchingServices, err := cfg.FilterServicesByLabels(labelSelectors)
+	if err != nil {
+		return nil, err
+	}
+
+	// Get the names of matching services
+	names := make([]string, 0, len(matchingServices))
+	for name := range matchingServices {
+		names = append(names, name)
+	}
+
+	// Use existing function to get services with dependencies
+	return cfg.FilterServicesWithDependencies(names)
+}
+
+// matchesLabels checks if serviceLabels contains all requiredLabels with matching values
+func matchesLabels(serviceLabels, requiredLabels map[string]string) bool {
+	for key, requiredValue := range requiredLabels {
+		serviceValue, exists := serviceLabels[key]
+		if !exists || serviceValue != requiredValue {
+			return false
+		}
+	}
+	return true
 }
 
 // IsHTTPURL checks if a path is an HTTP or HTTPS URL

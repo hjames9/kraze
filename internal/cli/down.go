@@ -15,6 +15,7 @@ import (
 
 var (
 	downKeepCRDs bool
+	downLabels   []string
 )
 
 var downCmd = &cobra.Command{
@@ -23,7 +24,12 @@ var downCmd = &cobra.Command{
 	Long: `Uninstall one or more services.
 
 If no services are specified, all services will be uninstalled.
-Services will be uninstalled in reverse dependency order.`,
+Services will be uninstalled in reverse dependency order.
+
+You can filter services by name or by labels:
+  kraze down service1 service2    # Uninstall specific services
+  kraze down --label env=dev      # Uninstall services with label env=dev
+  kraze down --label tier=backend # Uninstall services with label tier=backend`,
 	RunE: runDown,
 }
 
@@ -40,9 +46,23 @@ func runDown(cmd *cobra.Command, args []string) error {
 
 	// Filter services if specified
 	requestedServices := args
-	specificServicesRequested := len(requestedServices) > 0
+	specificServicesRequested := len(requestedServices) > 0 || len(downLabels) > 0
 
-	if specificServicesRequested {
+	// Check if both service names and labels are specified
+	if len(requestedServices) > 0 && len(downLabels) > 0 {
+		return fmt.Errorf("cannot specify both service names and labels, use one or the other")
+	}
+
+	if len(downLabels) > 0 {
+		// Filter by labels (note: down doesn't include dependencies, just the services themselves)
+		Verbose("Filtering services by labels: %v", downLabels)
+		filteredServices, err := cfg.FilterServicesByLabels(downLabels)
+		if err != nil {
+			return fmt.Errorf("failed to filter services by labels: %w", err)
+		}
+		cfg.Services = filteredServices
+		Verbose("Found %d service(s) matching labels", len(filteredServices))
+	} else if len(requestedServices) > 0 {
 		Verbose("Services to uninstall: %v", requestedServices)
 		filteredServices, err := cfg.FilterServices(requestedServices)
 		if err != nil {
@@ -67,9 +87,19 @@ func runDown(cmd *cobra.Command, args []string) error {
 		// When specific services are requested, uninstall them in the order specified
 		// (no dependency resolution needed - just uninstall what was asked)
 		fmt.Printf("Uninstalling %d service(s)...\n", len(cfg.Services))
-		for _, name := range requestedServices {
-			if svc, ok := cfg.Services[name]; ok {
-				orderedServices = append(orderedServices, &svc)
+		if len(downLabels) > 0 {
+			// Labels: iterate over filtered services
+			for name, svc := range cfg.Services {
+				_ = name // use name to avoid unused variable error
+				svcCopy := svc
+				orderedServices = append(orderedServices, &svcCopy)
+			}
+		} else {
+			// Service names: iterate in the order specified
+			for _, name := range requestedServices {
+				if svc, ok := cfg.Services[name]; ok {
+					orderedServices = append(orderedServices, &svc)
+				}
 			}
 		}
 	} else {
@@ -94,7 +124,7 @@ func runDown(cmd *cobra.Command, args []string) error {
 	st, err := state.Load(stateFilePath)
 	if err != nil {
 		Verbose("Warning: failed to load state: %v", err)
-		st = state.New(cfg.Cluster.Name)
+		st = state.New(cfg.Cluster.Name, cfg.Cluster.IsExternal())
 	}
 
 	// Collect namespaces to clean up BEFORE uninstalling (since uninstall removes from state)
@@ -234,4 +264,5 @@ func runDown(cmd *cobra.Command, args []string) error {
 
 func init() {
 	downCmd.Flags().BoolVar(&downKeepCRDs, "keep-crds", false, "Keep CRDs when uninstalling Helm charts")
+	downCmd.Flags().StringSliceVarP(&downLabels, "label", "l", []string{}, "Filter services by label (format: key=value, can be specified multiple times)")
 }

@@ -11,12 +11,21 @@ import (
 	"github.com/spf13/cobra"
 )
 
+var (
+	statusLabels []string
+)
+
 var statusCmd = &cobra.Command{
-	Use:     "status",
+	Use:     "status [services...]",
 	Aliases: []string{"ps"},
 	Short:   "Show status of services",
-	Long:    `Display the current status of all services defined in kraze.yml.`,
-	RunE:    runStatus,
+	Long: `Display the current status of all services defined in kraze.yml.
+
+You can filter services by name or by labels:
+  kraze status service1 service2    # Show status of specific services
+  kraze status --label env=dev      # Show status of services with label env=dev
+  kraze status --label tier=backend # Show status of services with label tier=backend`,
+	RunE: runStatus,
 }
 
 func runStatus(cmd *cobra.Command, args []string) error {
@@ -28,6 +37,33 @@ func runStatus(cmd *cobra.Command, args []string) error {
 	cfg, err := config.Parse(configFile)
 	if err != nil {
 		return fmt.Errorf("failed to parse config: %w", err)
+	}
+
+	// Filter services if specified
+	requestedServices := args
+
+	// Check if both service names and labels are specified
+	if len(requestedServices) > 0 && len(statusLabels) > 0 {
+		return fmt.Errorf("cannot specify both service names and labels, use one or the other")
+	}
+
+	if len(statusLabels) > 0 {
+		// Filter by labels
+		Verbose("Filtering services by labels: %v", statusLabels)
+		filteredServices, err := cfg.FilterServicesByLabels(statusLabels)
+		if err != nil {
+			return fmt.Errorf("failed to filter services by labels: %w", err)
+		}
+		cfg.Services = filteredServices
+		Verbose("Found %d service(s) matching labels", len(filteredServices))
+	} else if len(requestedServices) > 0 {
+		// Filter by service names
+		Verbose("Filtering services: %v", requestedServices)
+		filteredServices, err := cfg.FilterServices(requestedServices)
+		if err != nil {
+			return fmt.Errorf("failed to filter services: %w", err)
+		}
+		cfg.Services = filteredServices
 	}
 
 	// Check if cluster exists
@@ -55,7 +91,7 @@ func runStatus(cmd *cobra.Command, args []string) error {
 	st, err := state.Load(stateFilePath)
 	if err != nil {
 		Verbose("Warning: failed to load state: %v", err)
-		st = state.New(cfg.Cluster.Name)
+		st = state.New(cfg.Cluster.Name, cfg.Cluster.IsExternal())
 	}
 
 	fmt.Printf("Cluster: %s\n\n", cfg.Cluster.Name)
@@ -117,4 +153,8 @@ func runStatus(cmd *cobra.Command, args []string) error {
 	fmt.Printf("Summary: %d/%d services installed\n", len(installedServices), len(cfg.Services))
 
 	return nil
+}
+
+func init() {
+	statusCmd.Flags().StringSliceVarP(&statusLabels, "label", "l", []string{}, "Filter services by label (format: key=value, can be specified multiple times)")
 }

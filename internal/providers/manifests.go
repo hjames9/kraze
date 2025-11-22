@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/hjames9/kraze/internal/color"
 	"github.com/hjames9/kraze/internal/config"
@@ -90,6 +91,9 @@ func (manifest *ManifestsProvider) Install(ctx context.Context, service *config.
 
 	fmt.Printf("Applying %d manifest(s) for service '%s'...\n", len(manifests), service.Name)
 
+	// Track applied resources with their fully resolved state (including namespace)
+	var appliedObjects []*unstructured.Unstructured
+
 	// Apply each manifest
 	for itr, manifestContent := range manifests {
 		// Parse manifest
@@ -120,9 +124,20 @@ func (manifest *ManifestsProvider) Install(ctx context.Context, service *config.
 		if manifest.opts.Verbose {
 			fmt.Printf("  %s Applied %s/%s\n", color.Checkmark(), obj.GetKind(), obj.GetName())
 		}
+
+		// Track the fully resolved object for waiting
+		appliedObjects = append(appliedObjects, obj.DeepCopy())
 	}
 
 	fmt.Printf("%s Manifests applied successfully for '%s'\n", color.Checkmark(), service.Name)
+
+	// Wait for resources to be ready using shared wait logic
+	if manifest.opts.Wait {
+		if err := manifest.waitForAppliedResources(ctx, appliedObjects); err != nil {
+			return fmt.Errorf("failed waiting for resources: %w", err)
+		}
+	}
+
 	return nil
 }
 
@@ -532,6 +547,52 @@ func (manifest *ManifestsProvider) getGVR(obj *unstructured.Unstructured) (schem
 	}
 
 	return mapping.Resource, nil
+}
+
+// waitForAppliedResources waits for already-parsed and applied resources to be ready
+func (manifest *ManifestsProvider) waitForAppliedResources(ctx context.Context, resources []*unstructured.Unstructured) error {
+	// Parse timeout
+	timeout := 10 * time.Minute // default
+	if manifest.opts.Timeout != "" {
+		parsedTimeout, err := time.ParseDuration(manifest.opts.Timeout)
+		if err == nil {
+			timeout = parsedTimeout
+		}
+	}
+
+	fmt.Printf("Waiting for resources to be ready (timeout: %v)...\n", timeout)
+
+	// Create context with timeout
+	waitCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
+	// Wait for each resource
+	for _, obj := range resources {
+		kind := obj.GetKind()
+		name := obj.GetName()
+
+		// Only wait for resources that have a meaningful ready state
+		if !shouldWaitForResource(kind) {
+			if manifest.opts.Verbose {
+				fmt.Printf("  Skipping wait for %s/%s (not a waitable resource)\n", kind, name)
+			}
+			continue
+		}
+
+		fmt.Printf("  Waiting for %s/%s to be ready...\n", kind, name)
+
+		if err := waitForResourceReady(waitCtx, manifest.dynamicClient, manifest.mapper, obj, manifest.opts.Verbose); err != nil {
+			if waitCtx.Err() == context.DeadlineExceeded {
+				return fmt.Errorf("timeout waiting for %s/%s to be ready", kind, name)
+			}
+			return fmt.Errorf("error waiting for %s/%s: %w", kind, name, err)
+		}
+
+		fmt.Printf("  %s %s/%s is ready\n", color.Checkmark(), kind, name)
+	}
+
+	fmt.Printf("%s All resources are ready\n", color.Checkmark())
+	return nil
 }
 
 // ensureNamespace creates a namespace if it doesn't exist

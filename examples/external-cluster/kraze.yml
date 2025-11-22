@@ -1,0 +1,44 @@
+# External Cluster Example
+#
+# Use kraze with an existing Kubernetes cluster instead of creating a new kind cluster.
+# Works with: Docker Desktop, Minikube, existing kind clusters, remote clusters, etc.
+#
+# Usage:
+#   kraze init             # Verify cluster access (doesn't create cluster)
+#   kraze up               # Deploy services to external cluster
+#   kraze status           # Check status
+#   kraze down             # Remove services (preserves cluster)
+#   kraze destroy          # Delete state only (preserves cluster)
+
+cluster:
+  name: docker-desktop    # Must match cluster name in kubeconfig
+  external:
+    enabled: true                      # Use external cluster
+    # kubeconfig: ~/.kube/config       # Optional: custom kubeconfig path (default: ~/.kube/config)
+    # context: docker-desktop          # Optional: specific context (default: current-context)
+
+services:
+  # Example: Deploy Redis using Helm
+  redis:
+    type: helm
+    repo: oci://registry-1.docker.io/bitnamicharts
+    chart: redis
+    version: 20.2.1
+    namespace: data
+    create_namespace: true
+    values_inline: |
+      master:
+        resources:
+          requests:
+            memory: "128Mi"
+            cpu: "100m"
+      replica:
+        replicaCount: 1
+
+  # Example: Deploy custom manifests
+  myapp:
+    type: manifests
+    path: ./k8s/app.yaml
+    namespace: apps
+    depends_on:
+      - redis

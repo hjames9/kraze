@@ -1,0 +1,84 @@
+# Label-based Service Selection Example
+#
+# This example demonstrates how to use labels to organize and filter services.
+# Labels allow you to group services by environment, tier, team, or any custom criteria.
+#
+# Usage:
+#   kraze up --label env=dev          # Deploy only dev environment services
+#   kraze up --label tier=backend     # Deploy only backend services
+#   kraze up --label env=dev --label tier=frontend  # Multiple labels (AND logic)
+#   kraze down --label env=staging    # Remove only staging services
+#   kraze status --label team=platform  # Check status of platform team services
+
+cluster:
+  name: labels-demo
+
+services:
+  # Frontend Services
+  web-dev:
+    type: helm
+    repo: oci://registry-1.docker.io/bitnamicharts
+    chart: nginx
+    version: 18.2.5
+    namespace: frontend
+    labels:
+      env: dev
+      tier: frontend
+      team: web
+
+  web-staging:
+    type: helm
+    repo: oci://registry-1.docker.io/bitnamicharts
+    chart: nginx
+    version: 18.2.5
+    namespace: frontend
+    labels:
+      env: staging
+      tier: frontend
+      team: web
+
+  # Backend Services
+  api-dev:
+    type: helm
+    repo: oci://registry-1.docker.io/bitnamicharts
+    chart: redis
+    version: 20.2.1
+    namespace: backend
+    labels:
+      env: dev
+      tier: backend
+      team: platform
+
+  api-staging:
+    type: helm
+    repo: oci://registry-1.docker.io/bitnamicharts
+    chart: redis
+    version: 20.2.1
+    namespace: backend
+    labels:
+      env: staging
+      tier: backend
+      team: platform
+
+  # Data Services
+  database-dev:
+    type: helm
+    repo: oci://registry-1.docker.io/bitnamicharts
+    chart: postgresql
+    version: 16.2.4
+    namespace: data
+    labels:
+      env: dev
+      tier: data
+      team: platform
+
+  database-staging:
+    type: helm
+    repo: oci://registry-1.docker.io/bitnamicharts
+    chart: postgresql
+    version: 16.2.4
+    namespace: data
+    labels:
+      env: staging
+      tier: data
+      team: platform

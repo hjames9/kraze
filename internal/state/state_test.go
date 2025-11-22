@@ -8,7 +8,7 @@ import (
 )
 
 func TestNew(test *testing.T) {
-	st := New("test-cluster")
+	st := New("test-cluster", false)
 
 	if st.ClusterName != "test-cluster" {
 		test.Errorf("Expected cluster name 'test-cluster', got '%s'", st.ClusterName)
@@ -28,7 +28,7 @@ func TestSaveAndLoad(test *testing.T) {
 	stateFile := filepath.Join(tmpDir, StateFileName)
 
 	// Create and save state
-	st := New("test-cluster")
+	st := New("test-cluster", false)
 	st.MarkServiceInstalled("redis")
 	st.MarkServiceInstalled("postgres")
 
@@ -97,7 +97,7 @@ func TestDelete(test *testing.T) {
 	stateFile := filepath.Join(tmpDir, StateFileName)
 
 	// Create state file
-	st := New("test-cluster")
+	st := New("test-cluster", false)
 	if err := st.Save(stateFile); err != nil {
 		test.Fatalf("Failed to save state: %v", err)
 	}
@@ -119,7 +119,7 @@ func TestDelete(test *testing.T) {
 }
 
 func TestMarkServiceInstalled(test *testing.T) {
-	st := New("test-cluster")
+	st := New("test-cluster", false)
 
 	st.MarkServiceInstalled("redis")
 
@@ -146,7 +146,7 @@ func TestMarkServiceInstalled(test *testing.T) {
 }
 
 func TestMarkServiceUninstalled(test *testing.T) {
-	st := New("test-cluster")
+	st := New("test-cluster", false)
 
 	st.MarkServiceInstalled("redis")
 	if !st.IsServiceInstalled("redis") {
@@ -164,7 +164,7 @@ func TestMarkServiceUninstalled(test *testing.T) {
 }
 
 func TestIsServiceInstalled(test *testing.T) {
-	st := New("test-cluster")
+	st := New("test-cluster", false)
 
 	if st.IsServiceInstalled("redis") {
 		test.Error("Expected redis to not be installed initially")
@@ -178,7 +178,7 @@ func TestIsServiceInstalled(test *testing.T) {
 }
 
 func TestGetInstalledServices(test *testing.T) {
-	st := New("test-cluster")
+	st := New("test-cluster", false)
 
 	st.MarkServiceInstalled("redis")
 	st.MarkServiceInstalled("postgres")
@@ -216,7 +216,7 @@ func TestSaveUpdatesTimestamp(test *testing.T) {
 	tmpDir := test.TempDir()
 	stateFile := filepath.Join(tmpDir, StateFileName)
 
-	st := New("test-cluster")
+	st := New("test-cluster", false)
 	originalTime := st.LastUpdated
 
 	// Wait a bit to ensure timestamp difference

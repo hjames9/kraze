@@ -534,3 +534,60 @@ func (kind *KindManager) getCurrentContainerNetworks() []string {
 
 	return filtered
 }
+
+// GetKubeconfigForExternalCluster returns the kubeconfig path for an external cluster
+func (kind *KindManager) GetKubeconfigForExternalCluster(cfg *config.ClusterConfig) (string, error) {
+	if cfg.External == nil || !cfg.External.Enabled {
+		return "", fmt.Errorf("cluster is not configured as external")
+	}
+
+	// Use specified kubeconfig or default
+	kubeconfigPath := cfg.External.Kubeconfig
+	if kubeconfigPath == "" {
+		// Use default kubeconfig location
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return "", fmt.Errorf("failed to get user home directory: %w", err)
+		}
+		kubeconfigPath = filepath.Join(home, ".kube", "config")
+	} else {
+		// Expand ~ if present
+		if strings.HasPrefix(kubeconfigPath, "~/") {
+			home, err := os.UserHomeDir()
+			if err != nil {
+				return "", fmt.Errorf("failed to get user home directory: %w", err)
+			}
+			kubeconfigPath = filepath.Join(home, kubeconfigPath[2:])
+		}
+	}
+
+	// Verify kubeconfig file exists
+	if _, err := os.Stat(kubeconfigPath); err != nil {
+		return "", fmt.Errorf("kubeconfig file not found: %s", kubeconfigPath)
+	}
+
+	return kubeconfigPath, nil
+}
+
+// VerifyClusterAccess verifies that the external cluster is accessible
+func (kind *KindManager) VerifyClusterAccess(ctx context.Context, kubeconfigPath string) error {
+	// Load kubeconfig
+	config, err := clientcmd.BuildConfigFromFlags("", kubeconfigPath)
+	if err != nil {
+		return fmt.Errorf("failed to load kubeconfig: %w", err)
+	}
+
+	// Create Kubernetes client
+	clientset, err := kubernetes.NewForConfig(config)
+	if err != nil {
+		return fmt.Errorf("failed to create Kubernetes client: %w", err)
+	}
+
+	// Try to get server version to verify connectivity
+	_, err = clientset.Discovery().ServerVersion()
+	if err != nil {
+		return fmt.Errorf("failed to connect to cluster: %w", err)
+	}
+
+	return nil
+}

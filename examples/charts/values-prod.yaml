@@ -1,0 +1,16 @@
+# Production overrides - merged with base values
+# Later files override earlier ones
+replicaCount: 3
+
+# Only override specific nested values
+resources:
+  requests:
+    memory: "128Mi"
+    cpu: "100m"
+  limits:
+    memory: "256Mi"
+    cpu: "200m"
+
+# This is merged - image.repository and image.pullPolicy come from base
+image:
+  tag: "1.26"
