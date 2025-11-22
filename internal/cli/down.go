@@ -128,7 +128,14 @@ func runDown(cmd *cobra.Command, args []string) error {
 	}
 
 	// Collect namespaces to clean up BEFORE uninstalling (since uninstall removes from state)
-	namespacesToCleanup := st.GetCreatedNamespaces()
+	// When uninstalling all services, clean up ALL namespaces used by kraze (not just created ones)
+	// When uninstalling specific services, only clean up namespaces we created (be conservative)
+	var namespacesToCleanup map[string]int
+	if specificServicesRequested {
+		namespacesToCleanup = st.GetCreatedNamespaces()
+	} else {
+		namespacesToCleanup = st.GetAllNamespacesUsed()
+	}
 
 	// Verify cluster exists
 	kindMgr := cluster.NewKindManager()

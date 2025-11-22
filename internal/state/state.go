@@ -173,6 +173,19 @@ func (state *State) GetCreatedNamespaces() map[string]int {
 	return namespaces
 }
 
+// GetAllNamespacesUsed returns a map of all namespaces used by services
+// The map key is namespace name, value is count of services using it
+// This includes namespaces we created AND namespaces that existed before
+func (state *State) GetAllNamespacesUsed() map[string]int {
+	namespaces := make(map[string]int)
+	for _, svc := range state.Services {
+		if svc.Namespace != "" {
+			namespaces[svc.Namespace]++
+		}
+	}
+	return namespaces
+}
+
 // GetImageHashes returns the stored image hashes for a service
 func (state *State) GetImageHashes(serviceName string) map[string]string {
 	if svc, exists := state.Services[serviceName]; exists {
