@@ -1,4 +1,4 @@
-.PHONY: all build test clean install fmt vet lint help run-tests coverage validate-examples
+.PHONY: all build test clean install fmt vet lint help run-tests coverage validate-examples release
 
 BINARY_NAME=kraze
 VERSION?=dev
@@ -34,6 +34,29 @@ build-all:
 	GOOS=darwin GOARCH=amd64 $(GOBUILD) $(LDFLAGS) -o $(BUILD_DIR)/$(BINARY_NAME)-darwin-amd64 $(CMD_DIR)
 	GOOS=darwin GOARCH=arm64 $(GOBUILD) $(LDFLAGS) -o $(BUILD_DIR)/$(BINARY_NAME)-darwin-arm64 $(CMD_DIR)
 	@echo "Cross-compilation complete"
+
+release:
+	@echo "Building release $(VERSION)..."
+	@if [ "$(VERSION)" = "dev" ]; then \
+		echo "Error: VERSION must be set (e.g., make release VERSION=v0.1.0)"; \
+		exit 1; \
+	fi
+	@mkdir -p $(BUILD_DIR)
+	@echo "Building binaries..."
+	GOOS=linux GOARCH=amd64 $(GOBUILD) $(LDFLAGS) -o $(BUILD_DIR)/$(BINARY_NAME)-$(VERSION)-linux-amd64 $(CMD_DIR)
+	GOOS=linux GOARCH=arm64 $(GOBUILD) $(LDFLAGS) -o $(BUILD_DIR)/$(BINARY_NAME)-$(VERSION)-linux-arm64 $(CMD_DIR)
+	GOOS=darwin GOARCH=amd64 $(GOBUILD) $(LDFLAGS) -o $(BUILD_DIR)/$(BINARY_NAME)-$(VERSION)-darwin-amd64 $(CMD_DIR)
+	GOOS=darwin GOARCH=arm64 $(GOBUILD) $(LDFLAGS) -o $(BUILD_DIR)/$(BINARY_NAME)-$(VERSION)-darwin-arm64 $(CMD_DIR)
+	@echo "Generating checksums..."
+	@cd $(BUILD_DIR) && sha256sum $(BINARY_NAME)-$(VERSION)-* > $(BINARY_NAME)-$(VERSION)-checksums.txt
+	@echo ""
+	@echo "Release $(VERSION) built successfully!"
+	@echo ""
+	@echo "Files:"
+	@ls -lh $(BUILD_DIR)/$(BINARY_NAME)-$(VERSION)-*
+	@echo ""
+	@echo "To create a GitHub release, run:"
+	@echo "  gh release create $(VERSION) --title '$(VERSION)' --generate-notes $(BUILD_DIR)/$(BINARY_NAME)-$(VERSION)-*"
 
 test:
 	@echo "Running tests..."
