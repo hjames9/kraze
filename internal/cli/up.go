@@ -177,18 +177,6 @@ func runUp(cmd *cobra.Command, args []string) error {
 			return fmt.Errorf("failed to create provider for '%s': %w", svc.Name, err)
 		}
 
-		// Check if already installed
-		installed, err := provider.IsInstalled(ctx, svc)
-		if err != nil {
-			Verbose("Warning: failed to check if '%s' is installed: %v", svc.Name, err)
-			installed = false
-		}
-
-		if installed {
-			fmt.Printf("Service '%s' is already installed, skipping...\n", svc.Name)
-			continue
-		}
-
 		// Extract images from service configuration
 		serviceImages, err := imgMgr.GetImagesForService(ctx, svc, kubeconfig)
 		if err != nil {

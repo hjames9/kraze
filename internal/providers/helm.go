@@ -90,7 +90,7 @@ func (helm *HelmProvider) getActionConfig(namespace string) (*action.Configurati
 	return actionConfig, nil
 }
 
-// Install installs a Helm chart
+// Install installs or upgrades a Helm chart (idempotent)
 func (helm *HelmProvider) Install(ctx context.Context, service *config.ServiceConfig) error {
 	// Get action config for this service's namespace
 	actionConfig, err := helm.getActionConfig(service.GetNamespace())
@@ -98,28 +98,11 @@ func (helm *HelmProvider) Install(ctx context.Context, service *config.ServiceCo
 		return err
 	}
 
-	client := action.NewInstall(actionConfig)
-
-	// Configure installation
-	client.ReleaseName = service.Name
-	client.Namespace = service.GetNamespace()
-	client.CreateNamespace = service.ShouldCreateNamespace()
-
-	// Disable Helm's built-in wait for consistency with manifests type
-	client.Wait = false
-	client.WaitForJobs = false
-
-	if helm.opts.Timeout != "" {
-		timeout, err := time.ParseDuration(helm.opts.Timeout)
-		if err == nil {
-			client.Timeout = timeout
-		}
-	}
-
-	// Set version if specified
-	if service.Version != "" {
-		client.Version = service.Version
-	}
+	// Check if release already exists
+	histClient := action.NewHistory(actionConfig)
+	histClient.Max = 1
+	_, err = histClient.Run(service.Name)
+	releaseExists := err == nil
 
 	// Get chart path - download if remote
 	chartPath, err := helm.getChartPath(ctx, service)
@@ -138,14 +121,59 @@ func (helm *HelmProvider) Install(ctx context.Context, service *config.ServiceCo
 		return fmt.Errorf("failed to load values: %w", err)
 	}
 
-	// Install the chart
-	fmt.Printf("Installing Helm chart '%s' in namespace '%s'...\n", service.Name, service.GetNamespace())
-	rel, err := client.RunWithContext(ctx, chart, values)
-	if err != nil {
-		return fmt.Errorf("failed to install chart: %w", err)
-	}
+	var rel *release.Release
 
-	fmt.Printf("%s Chart '%s' installed successfully\n", color.Checkmark(), service.Name)
+	if releaseExists {
+		// Upgrade existing release
+		upgradeClient := action.NewUpgrade(actionConfig)
+		upgradeClient.Namespace = service.GetNamespace()
+		upgradeClient.Wait = false
+		upgradeClient.WaitForJobs = false
+
+		if helm.opts.Timeout != "" {
+			timeout, err := time.ParseDuration(helm.opts.Timeout)
+			if err == nil {
+				upgradeClient.Timeout = timeout
+			}
+		}
+
+		if service.Version != "" {
+			upgradeClient.Version = service.Version
+		}
+
+		fmt.Printf("Upgrading Helm chart '%s' in namespace '%s'...\n", service.Name, service.GetNamespace())
+		rel, err = upgradeClient.RunWithContext(ctx, service.Name, chart, values)
+		if err != nil {
+			return fmt.Errorf("failed to upgrade chart: %w", err)
+		}
+		fmt.Printf("%s Chart '%s' upgraded successfully\n", color.Checkmark(), service.Name)
+	} else {
+		// Install new release
+		installClient := action.NewInstall(actionConfig)
+		installClient.ReleaseName = service.Name
+		installClient.Namespace = service.GetNamespace()
+		installClient.CreateNamespace = service.ShouldCreateNamespace()
+		installClient.Wait = false
+		installClient.WaitForJobs = false
+
+		if helm.opts.Timeout != "" {
+			timeout, err := time.ParseDuration(helm.opts.Timeout)
+			if err == nil {
+				installClient.Timeout = timeout
+			}
+		}
+
+		if service.Version != "" {
+			installClient.Version = service.Version
+		}
+
+		fmt.Printf("Installing Helm chart '%s' in namespace '%s'...\n", service.Name, service.GetNamespace())
+		rel, err = installClient.RunWithContext(ctx, chart, values)
+		if err != nil {
+			return fmt.Errorf("failed to install chart: %w", err)
+		}
+		fmt.Printf("%s Chart '%s' installed successfully\n", color.Checkmark(), service.Name)
+	}
 
 	// Wait for resources to be ready using our shared wait logic
 	if helm.opts.Wait && rel != nil && rel.Manifest != "" {

@@ -430,7 +430,7 @@ func (manifest *ManifestsProvider) applyResource(ctx context.Context, obj *unstr
 	}
 
 	// Try to get existing resource
-	_, err = client.Get(ctx, name, metav1.GetOptions{})
+	existing, err := client.Get(ctx, name, metav1.GetOptions{})
 	if err != nil {
 		// Only create if resource doesn't exist; return other errors
 		if errors.IsNotFound(err) {
@@ -446,6 +446,8 @@ func (manifest *ManifestsProvider) applyResource(ctx context.Context, obj *unstr
 	}
 
 	// Resource exists, update it
+	// Preserve the resourceVersion for optimistic concurrency control
+	obj.SetResourceVersion(existing.GetResourceVersion())
 	_, err = client.Update(ctx, obj, metav1.UpdateOptions{})
 	return err
 }
