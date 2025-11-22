@@ -117,6 +117,7 @@ func ExpandEnvVarsInConfig(cfg *Config) {
 		svc.Chart = ExpandEnvVars(svc.Chart)
 		svc.Version = ExpandEnvVars(svc.Version)
 		svc.Path = ExpandEnvVars(svc.Path)
+		svc.PostReadyDelay = ExpandEnvVars(svc.PostReadyDelay)
 
 		// Expand values files
 		if !svc.Values.IsEmpty() {

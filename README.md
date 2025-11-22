@@ -271,6 +271,7 @@ services:
       - other-service
     wait: true                   # Wait for resources to be ready (defaults to CLI flag)
     wait_timeout: "15m"          # Timeout for wait operations (defaults to CLI timeout)
+    post_ready_delay: "5s"       # Delay after service is ready before continuing (defaults to 3s)
 
   # Helm chart from HTTP repository
   another-service:

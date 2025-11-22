@@ -30,6 +30,7 @@ services:
     version: 15.5.38
     namespace: data
     create_namespace: true
+    post_ready_delay: "5s"  # Give PostgreSQL extra time to stabilize before dependent services start
     values_inline: |
       auth:
         username: appuser

@@ -1,6 +1,9 @@
 package config
 
-import "fmt"
+import (
+	"fmt"
+	"time"
+)
 
 // Config represents the complete kraze.yml structure
 type Config struct {
@@ -120,8 +123,9 @@ type ServiceConfig struct {
 	// Common fields
 	CreateNamespace *bool             `yaml:"create_namespace,omitempty"` // Defaults to true
 	Labels          map[string]string `yaml:"labels,omitempty"`
-	Wait            *bool             `yaml:"wait,omitempty"`         // Wait for resources to be ready (defaults to CLI flag)
-	WaitTimeout     string            `yaml:"wait_timeout,omitempty"` // Timeout for wait operations (e.g., "10m", "5m")
+	Wait            *bool             `yaml:"wait,omitempty"`           // Wait for resources to be ready (defaults to CLI flag)
+	WaitTimeout     string            `yaml:"wait_timeout,omitempty"`   // Timeout for wait operations (e.g., "10m", "5m")
+	PostReadyDelay  string            `yaml:"post_ready_delay,omitempty"` // Delay after service is ready before continuing (e.g., "3s", "5s")
 
 	// Helm-specific fields
 	Repo         string      `yaml:"repo,omitempty"`          // Remote Helm repo URL
@@ -170,6 +174,21 @@ func (srv *ServiceConfig) ShouldCreateNamespace() bool {
 		return *srv.CreateNamespace
 	}
 	return true // Default to true for local dev convenience
+}
+
+// GetPostReadyDelay returns the post-ready delay duration, defaulting to 3 seconds
+// This delay helps with kube-proxy propagation and service endpoint readiness
+func (srv *ServiceConfig) GetPostReadyDelay() (time.Duration, error) {
+	if srv.PostReadyDelay == "" {
+		return 3 * time.Second, nil // Default to 3 seconds
+	}
+
+	duration, err := time.ParseDuration(srv.PostReadyDelay)
+	if err != nil {
+		return 0, fmt.Errorf("invalid post_ready_delay '%s': %w", srv.PostReadyDelay, err)
+	}
+
+	return duration, nil
 }
 
 // Validate performs basic validation on the service config

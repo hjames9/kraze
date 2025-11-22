@@ -3,6 +3,7 @@ package cli
 import (
 	"context"
 	"fmt"
+	"time"
 
 	"github.com/hjames9/kraze/internal/cluster"
 	"github.com/hjames9/kraze/internal/color"
@@ -304,6 +305,18 @@ func runUp(cmd *cobra.Command, args []string) error {
 		}
 
 		fmt.Printf("%s Service '%s' installed successfully\n", color.Checkmark(), svc.Name)
+
+		// Apply post-ready delay (defaults to 3 seconds)
+		// This helps with kube-proxy propagation and service endpoint readiness
+		delay, err := svc.GetPostReadyDelay()
+		if err != nil {
+			Verbose("Warning: %v, using default 3s delay", err)
+			delay = 3 * time.Second
+		}
+		if delay > 0 {
+			Verbose("Waiting %v for service to stabilize...", delay)
+			time.Sleep(delay)
+		}
 	}
 
 	fmt.Printf("\n%s All services installed successfully!\n", color.Checkmark())
