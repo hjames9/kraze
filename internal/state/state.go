@@ -11,10 +11,14 @@ import (
 const (
 	// StateFileName is the name of the state file
 	StateFileName = ".kraze.state"
+
+	// CurrentStateVersion is the current version of the state file format
+	CurrentStateVersion = 1
 )
 
 // State represents the state of deployed services
 type State struct {
+	Version     int                     `json:"version"`      // State file format version
 	ClusterName string                  `json:"cluster_name"`
 	IsExternal  bool                    `json:"is_external"`  // Whether this is an external cluster
 	Services    map[string]ServiceState `json:"services"`
@@ -34,6 +38,7 @@ type ServiceState struct {
 // New creates a new empty state
 func New(clusterName string, isExternal bool) *State {
 	return &State{
+		Version:     CurrentStateVersion,
 		ClusterName: clusterName,
 		IsExternal:  isExternal,
 		Services:    make(map[string]ServiceState),
@@ -57,11 +62,43 @@ func Load(stateFilePath string) (*State, error) {
 		return nil, fmt.Errorf("failed to parse state file: %w", err)
 	}
 
+	// Handle migration from older versions
+	if err := state.migrate(); err != nil {
+		return nil, fmt.Errorf("failed to migrate state file: %w", err)
+	}
+
 	return &state, nil
+}
+
+// migrate handles migration from older state file versions to the current version
+func (state *State) migrate() error {
+	originalVersion := state.Version
+
+	// Migrate from v0 (no version field) to v1
+	if state.Version == 0 {
+		// v0 state files had no version field
+		// All existing fields are compatible with v1, just set the version
+		state.Version = 1
+	}
+
+	// Check if version is supported
+	if state.Version > CurrentStateVersion {
+		return fmt.Errorf("state file version %d is newer than supported version %d - please upgrade kraze",
+			state.Version, CurrentStateVersion)
+	}
+
+	// Log migration if it occurred
+	if originalVersion != state.Version && originalVersion != 0 {
+		fmt.Printf("Migrated state file from version %d to %d\n", originalVersion, state.Version)
+	}
+
+	return nil
 }
 
 // Save writes the state file to disk
 func (state *State) Save(stateFilePath string) error {
+	// Ensure version is set to current version
+	state.Version = CurrentStateVersion
 	state.LastUpdated = time.Now()
 
 	data, err := json.MarshalIndent(state, "", "  ")

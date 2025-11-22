@@ -230,3 +230,113 @@ func TestSaveUpdatesTimestamp(test *testing.T) {
 		test.Error("Expected LastUpdated to be updated on save")
 	}
 }
+
+func TestStateVersioning(test *testing.T) {
+	// New state should have current version
+	st := New("test-cluster", false)
+	if st.Version != CurrentStateVersion {
+		test.Errorf("Expected version %d, got %d", CurrentStateVersion, st.Version)
+	}
+
+	// Saved state should have current version
+	tmpDir := test.TempDir()
+	stateFile := filepath.Join(tmpDir, StateFileName)
+
+	if err := st.Save(stateFile); err != nil {
+		test.Fatalf("Failed to save state: %v", err)
+	}
+
+	loaded, err := Load(stateFile)
+	if err != nil {
+		test.Fatalf("Failed to load state: %v", err)
+	}
+
+	if loaded.Version != CurrentStateVersion {
+		test.Errorf("Expected loaded version %d, got %d", CurrentStateVersion, loaded.Version)
+	}
+}
+
+func TestMigrateFromV0(test *testing.T) {
+	tmpDir := test.TempDir()
+	stateFile := filepath.Join(tmpDir, StateFileName)
+
+	// Create a v0 state file (no version field)
+	v0State := `{
+  "cluster_name": "test-cluster",
+  "is_external": false,
+  "services": {
+    "redis": {
+      "name": "redis",
+      "installed": true,
+      "updated_at": "2024-01-01T00:00:00Z",
+      "namespace": "data",
+      "created_namespace": true
+    }
+  },
+  "last_updated": "2024-01-01T00:00:00Z"
+}`
+
+	if err := os.WriteFile(stateFile, []byte(v0State), 0644); err != nil {
+		test.Fatalf("Failed to write v0 state: %v", err)
+	}
+
+	// Load and verify it migrates to v1
+	loaded, err := Load(stateFile)
+	if err != nil {
+		test.Fatalf("Failed to load v0 state: %v", err)
+	}
+
+	if loaded.Version != 1 {
+		test.Errorf("Expected migrated version to be 1, got %d", loaded.Version)
+	}
+
+	if loaded.ClusterName != "test-cluster" {
+		test.Errorf("Expected cluster name 'test-cluster', got '%s'", loaded.ClusterName)
+	}
+
+	if !loaded.IsServiceInstalled("redis") {
+		test.Error("Expected redis to be installed after migration")
+	}
+
+	// Save and verify version is persisted
+	if err := loaded.Save(stateFile); err != nil {
+		test.Fatalf("Failed to save migrated state: %v", err)
+	}
+
+	reloaded, err := Load(stateFile)
+	if err != nil {
+		test.Fatalf("Failed to reload state: %v", err)
+	}
+
+	if reloaded.Version != CurrentStateVersion {
+		test.Errorf("Expected reloaded version %d, got %d", CurrentStateVersion, reloaded.Version)
+	}
+}
+
+func TestLoadNewerVersion(test *testing.T) {
+	tmpDir := test.TempDir()
+	stateFile := filepath.Join(tmpDir, StateFileName)
+
+	// Create a state file with a future version
+	futureState := `{
+  "version": 999,
+  "cluster_name": "test-cluster",
+  "is_external": false,
+  "services": {},
+  "last_updated": "2024-01-01T00:00:00Z"
+}`
+
+	if err := os.WriteFile(stateFile, []byte(futureState), 0644); err != nil {
+		test.Fatalf("Failed to write future state: %v", err)
+	}
+
+	// Load should fail with helpful error
+	_, err := Load(stateFile)
+	if err == nil {
+		test.Error("Expected error loading newer version, got nil")
+	}
+
+	if err != nil && err.Error() != "failed to migrate state file: state file version 999 is newer than supported version 1 - please upgrade kraze" {
+		test.Errorf("Expected upgrade error message, got: %v", err)
+	}
+}
