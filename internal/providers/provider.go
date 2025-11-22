@@ -203,11 +203,15 @@ func IsNamespaceEmpty(ctx context.Context, kubeconfig, namespace string) (bool, 
 	if err != nil {
 		return false, fmt.Errorf("failed to list ConfigMaps: %w", err)
 	}
+	userConfigMapCount := 0
 	for _, cm := range configMaps.Items {
 		// Ignore the auto-created kube-root-ca.crt ConfigMap
 		if cm.Name != "kube-root-ca.crt" {
-			return false, nil
+			userConfigMapCount++
 		}
+	}
+	if userConfigMapCount > 0 {
+		return false, nil
 	}
 
 	// Check for Secrets (excluding auto-created ones)
@@ -215,11 +219,23 @@ func IsNamespaceEmpty(ctx context.Context, kubeconfig, namespace string) (bool, 
 	if err != nil {
 		return false, fmt.Errorf("failed to list Secrets: %w", err)
 	}
+	userSecretCount := 0
 	for _, secret := range secrets.Items {
-		// Ignore auto-created service account tokens
-		if secret.Type != "kubernetes.io/service-account-token" {
-			return false, nil
+		// Ignore auto-created service account tokens and Helm-managed secrets
+		// Helm often leaves behind webhook CA certificates when uninstalling
+		if secret.Type == "kubernetes.io/service-account-token" {
+			continue // Ignore service account tokens
 		}
+		// Ignore secrets managed by Helm that contain webhook CAs or TLS certs
+		if strings.Contains(strings.ToLower(secret.Name), "webhook") ||
+			strings.Contains(strings.ToLower(secret.Name), "-ca") ||
+			strings.Contains(strings.ToLower(secret.Name), "-tls") {
+			continue
+		}
+		userSecretCount++
+	}
+	if userSecretCount > 0 {
+		return false, nil
 	}
 
 	// Check for ServiceAccounts (excluding the default one)
@@ -227,11 +243,15 @@ func IsNamespaceEmpty(ctx context.Context, kubeconfig, namespace string) (bool, 
 	if err != nil {
 		return false, fmt.Errorf("failed to list ServiceAccounts: %w", err)
 	}
+	userServiceAccountCount := 0
 	for _, sa := range serviceAccounts.Items {
 		// Ignore the auto-created default ServiceAccount
 		if sa.Name != "default" {
-			return false, nil
+			userServiceAccountCount++
 		}
+	}
+	if userServiceAccountCount > 0 {
+		return false, nil
 	}
 
 	// Check for Deployments
