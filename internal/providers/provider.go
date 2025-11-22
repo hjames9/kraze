@@ -904,6 +904,21 @@ func checkTypedPodFailureState(pod *corev1.Pod) (bool, string) {
 		if cs.State.Terminated != nil && cs.State.Terminated.ExitCode != 0 {
 			return true, fmt.Sprintf("Container '%s': Exited with code %d - %s", cs.Name, cs.State.Terminated.ExitCode, cs.State.Terminated.Reason)
 		}
+
+		// Check for running containers that are not ready (probe failures)
+		// This catches containers that are stuck failing startup/readiness probes
+		if cs.State.Running != nil && !cs.Ready {
+			// If container has been restarted, it's definitely stuck
+			if cs.RestartCount > 0 {
+				return true, fmt.Sprintf("Container '%s': Running but not ready after %d restart(s) - likely failing probes", cs.Name, cs.RestartCount)
+			}
+			// If container has been running for more than 45 seconds and still not ready, it's stuck
+			// This catches the initial startup probe failures before the first restart
+			runningDuration := time.Since(cs.State.Running.StartedAt.Time)
+			if runningDuration > 45*time.Second {
+				return true, fmt.Sprintf("Container '%s': Running for %v but still not ready - likely failing startup probes", cs.Name, runningDuration.Round(time.Second))
+			}
+		}
 	}
 
 	// Check init container statuses
@@ -927,6 +942,19 @@ func checkTypedPodFailureState(pod *corev1.Pod) (bool, string) {
 		// Check terminated state with non-zero exit code
 		if cs.State.Terminated != nil && cs.State.Terminated.ExitCode != 0 {
 			return true, fmt.Sprintf("Init container '%s': Exited with code %d - %s", cs.Name, cs.State.Terminated.ExitCode, cs.State.Terminated.Reason)
+		}
+
+		// Check for running init containers that are not ready (probe failures)
+		if cs.State.Running != nil && !cs.Ready {
+			// If init container has been restarted, it's definitely stuck
+			if cs.RestartCount > 0 {
+				return true, fmt.Sprintf("Init container '%s': Running but not ready after %d restart(s) - likely failing probes", cs.Name, cs.RestartCount)
+			}
+			// If init container has been running for more than 45 seconds and still not ready, it's stuck
+			runningDuration := time.Since(cs.State.Running.StartedAt.Time)
+			if runningDuration > 45*time.Second {
+				return true, fmt.Sprintf("Init container '%s': Running for %v but still not ready - likely failing startup probes", cs.Name, runningDuration.Round(time.Second))
+			}
 		}
 	}
 
