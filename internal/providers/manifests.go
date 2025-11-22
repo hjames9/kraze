@@ -12,8 +12,11 @@ import (
 	"strings"
 	"time"
 
+	"crypto/sha256"
+
 	"github.com/hjames9/kraze/internal/color"
 	"github.com/hjames9/kraze/internal/config"
+	yamlv3 "gopkg.in/yaml.v3"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -22,6 +25,7 @@ import (
 	"k8s.io/client-go/discovery"
 	"k8s.io/client-go/discovery/cached/memory"
 	"k8s.io/client-go/dynamic"
+	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/restmapper"
 )
 
@@ -34,6 +38,7 @@ const (
 type ManifestsProvider struct {
 	opts          *ProviderOptions
 	dynamicClient dynamic.Interface
+	clientset     *kubernetes.Clientset
 	mapper        *restmapper.DeferredDiscoveryRESTMapper
 }
 
@@ -51,6 +56,12 @@ func NewManifestsProvider(opts *ProviderOptions) (*ManifestsProvider, error) {
 		return nil, fmt.Errorf("failed to create dynamic client: %w", err)
 	}
 
+	// Create clientset for fetching events and logs
+	clientset, err := kubernetes.NewForConfig(restConfig)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create clientset: %w", err)
+	}
+
 	// Create discovery client for REST mapper
 	discoveryClient, err := discovery.NewDiscoveryClientForConfig(restConfig)
 	if err != nil {
@@ -66,6 +77,7 @@ func NewManifestsProvider(opts *ProviderOptions) (*ManifestsProvider, error) {
 	return &ManifestsProvider{
 		opts:          opts,
 		dynamicClient: dynamicClient,
+		clientset:     clientset,
 		mapper:        mapper,
 	}, nil
 }
@@ -130,6 +142,20 @@ func (manifest *ManifestsProvider) Install(ctx context.Context, service *config.
 	}
 
 	fmt.Printf("%s Manifests applied successfully for '%s'\n", color.Checkmark(), service.Name)
+
+	// Inject config checksums to force rollouts when ConfigMaps/Secrets change
+	checksum, err := calculateConfigChecksumFromObjects(appliedObjects)
+	if err != nil {
+		if manifest.opts.Verbose {
+			fmt.Printf("Warning: failed to calculate config checksum: %v\n", err)
+		}
+	} else if checksum != "" {
+		if err := manifest.injectConfigChecksumsToObjects(ctx, appliedObjects, checksum); err != nil {
+			if manifest.opts.Verbose {
+				fmt.Printf("Warning: failed to inject config checksums: %v\n", err)
+			}
+		}
+	}
 
 	// Wait for resources to be ready using shared wait logic
 	if manifest.opts.Wait {
@@ -583,7 +609,7 @@ func (manifest *ManifestsProvider) waitForAppliedResources(ctx context.Context, 
 
 		fmt.Printf("  Waiting for %s/%s to be ready...\n", kind, name)
 
-		if err := waitForResourceReady(waitCtx, manifest.dynamicClient, manifest.mapper, obj, manifest.opts.Verbose); err != nil {
+		if err := waitForResourceReady(waitCtx, manifest.dynamicClient, manifest.clientset, manifest.mapper, obj, manifest.opts.Verbose); err != nil {
 			if waitCtx.Err() == context.DeadlineExceeded {
 				return fmt.Errorf("timeout waiting for %s/%s to be ready", kind, name)
 			}
@@ -642,6 +668,81 @@ func (manifest *ManifestsProvider) ensureNamespace(ctx context.Context, namespac
 	_, err = client.Create(ctx, ns, metav1.CreateOptions{})
 	if err != nil && !errors.IsAlreadyExists(err) {
 		return fmt.Errorf("failed to create namespace: %w", err)
+	}
+
+	return nil
+}
+
+// calculateConfigChecksumFromObjects calculates a checksum of all ConfigMaps and Secrets
+// in a list of unstructured objects
+func calculateConfigChecksumFromObjects(objects []*unstructured.Unstructured) (string, error) {
+	var configData []string
+
+	for _, obj := range objects {
+		kind := obj.GetKind()
+
+		// Only process ConfigMaps and Secrets
+		if kind != "ConfigMap" && kind != "Secret" {
+			continue
+		}
+
+		// Extract data field
+		data, found, err := unstructured.NestedMap(obj.Object, "data")
+		if err == nil && found && data != nil {
+			// Convert to YAML string for consistent hashing
+			dataBytes, err := yamlv3.Marshal(data)
+			if err == nil {
+				configData = append(configData, string(dataBytes))
+			}
+		}
+
+		// For Secrets, also check stringData
+		if kind == "Secret" {
+			stringData, found, err := unstructured.NestedMap(obj.Object, "stringData")
+			if err == nil && found && stringData != nil {
+				stringDataBytes, err := yamlv3.Marshal(stringData)
+				if err == nil {
+					configData = append(configData, string(stringDataBytes))
+				}
+			}
+		}
+	}
+
+	// If no config found, return empty string
+	if len(configData) == 0 {
+		return "", nil
+	}
+
+	// Calculate SHA-256 hash of all config data combined
+	combined := strings.Join(configData, "\n")
+	hash := sha256.Sum256([]byte(combined))
+	return fmt.Sprintf("%x", hash), nil
+}
+
+// injectConfigChecksumsToObjects patches Deployments, StatefulSets, and DaemonSets
+// with config checksum annotations to force rollouts when ConfigMaps or Secrets change
+func (manifest *ManifestsProvider) injectConfigChecksumsToObjects(ctx context.Context, objects []*unstructured.Unstructured, checksum string) error {
+	if checksum == "" {
+		return nil
+	}
+
+	for _, obj := range objects {
+		kind := obj.GetKind()
+
+		// Only process workload resources that have Pod templates
+		if kind != "Deployment" && kind != "StatefulSet" && kind != "DaemonSet" {
+			continue
+		}
+
+		name := obj.GetName()
+		namespace := obj.GetNamespace()
+
+		if name == "" || namespace == "" {
+			continue
+		}
+
+		// Use shared patching function
+		patchWorkloadWithConfigChecksum(ctx, manifest.dynamicClient, manifest.mapper, kind, name, namespace, checksum, manifest.opts.Verbose)
 	}
 
 	return nil

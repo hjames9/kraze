@@ -2,7 +2,7 @@ package providers
 
 import (
 	"context"
-	"crypto/md5"
+	"crypto/sha256"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -173,6 +173,22 @@ func (helm *HelmProvider) Install(ctx context.Context, service *config.ServiceCo
 			return fmt.Errorf("failed to install chart: %w", err)
 		}
 		fmt.Printf("%s Chart '%s' installed successfully\n", color.Checkmark(), service.Name)
+	}
+
+	// Inject config checksums to force rollouts when ConfigMaps/Secrets change
+	if rel != nil && rel.Manifest != "" {
+		checksum, err := calculateConfigChecksum(rel.Manifest)
+		if err != nil {
+			if helm.opts.Verbose {
+				fmt.Printf("Warning: failed to calculate config checksum: %v\n", err)
+			}
+		} else if checksum != "" {
+			if err := helm.injectConfigChecksums(ctx, service.GetNamespace(), rel.Manifest, checksum); err != nil {
+				if helm.opts.Verbose {
+					fmt.Printf("Warning: failed to inject config checksums: %v\n", err)
+				}
+			}
+		}
 	}
 
 	// Wait for resources to be ready using our shared wait logic
@@ -533,7 +549,7 @@ func generateRepoName(repoURL string) string {
 
 	// If name is too long, hash it
 	if len(name) > 50 {
-		hash := md5.Sum([]byte(repoURL))
+		hash := sha256.Sum256([]byte(repoURL))
 		name = fmt.Sprintf("repo-%x", hash)[:16]
 	}
 
@@ -796,6 +812,139 @@ func (helm *HelmProvider) deleteCRDs(ctx context.Context, crdNames []string) err
 
 	if len(errs) > 0 {
 		return fmt.Errorf("failed to delete CRDs: %s", strings.Join(errs, "; "))
+	}
+
+	return nil
+}
+
+// calculateConfigChecksum calculates a checksum of all ConfigMaps and Secrets in a manifest
+// Returns empty string if no ConfigMaps or Secrets are found
+func calculateConfigChecksum(manifest string) (string, error) {
+	if manifest == "" {
+		return "", nil
+	}
+
+	// Parse YAML documents
+	decoder := yaml.NewDecoder(strings.NewReader(manifest))
+
+	var configData []string
+
+	for {
+		var doc map[string]interface{}
+		if err := decoder.Decode(&doc); err != nil {
+			if err.Error() == "EOF" {
+				break
+			}
+			// Skip invalid documents
+			continue
+		}
+
+		if doc == nil {
+			continue
+		}
+
+		kind, _ := doc["kind"].(string)
+
+		// Only process ConfigMaps and Secrets
+		if kind != "ConfigMap" && kind != "Secret" {
+			continue
+		}
+
+		// Extract data field
+		data, hasData := doc["data"]
+		if hasData {
+			// Convert to YAML string for consistent hashing
+			dataBytes, err := yaml.Marshal(data)
+			if err == nil {
+				configData = append(configData, string(dataBytes))
+			}
+		}
+
+		// For Secrets, also check stringData
+		if kind == "Secret" {
+			stringData, hasStringData := doc["stringData"]
+			if hasStringData {
+				stringDataBytes, err := yaml.Marshal(stringData)
+				if err == nil {
+					configData = append(configData, string(stringDataBytes))
+				}
+			}
+		}
+	}
+
+	// If no config found, return empty string
+	if len(configData) == 0 {
+		return "", nil
+	}
+
+	// Calculate SHA-256 hash of all config data combined
+	combined := strings.Join(configData, "\n")
+	hash := sha256.Sum256([]byte(combined))
+	return fmt.Sprintf("%x", hash), nil
+}
+
+// injectConfigChecksums patches Deployments, StatefulSets, and DaemonSets with config checksum annotations
+// This forces a rollout when ConfigMaps or Secrets change
+func (helm *HelmProvider) injectConfigChecksums(ctx context.Context, namespace string, manifest string, checksum string) error {
+	if manifest == "" || checksum == "" {
+		return nil
+	}
+
+	// Create dynamic client
+	dynamicClient, err := dynamic.NewForConfig(helm.restConfig)
+	if err != nil {
+		return fmt.Errorf("failed to create dynamic client: %w", err)
+	}
+
+	// Create discovery client for REST mapper
+	discoveryClient, err := discovery.NewDiscoveryClientForConfig(helm.restConfig)
+	if err != nil {
+		return fmt.Errorf("failed to create discovery client: %w", err)
+	}
+
+	mapper := restmapper.NewDeferredDiscoveryRESTMapper(memory.NewMemCacheClient(discoveryClient))
+
+	// Parse YAML documents
+	decoder := yaml.NewDecoder(strings.NewReader(manifest))
+
+	for {
+		var doc map[string]interface{}
+		if err := decoder.Decode(&doc); err != nil {
+			if err.Error() == "EOF" {
+				break
+			}
+			continue
+		}
+
+		if doc == nil {
+			continue
+		}
+
+		kind, _ := doc["kind"].(string)
+
+		// Only process workload resources that have Pod templates
+		if kind != "Deployment" && kind != "StatefulSet" && kind != "DaemonSet" {
+			continue
+		}
+
+		metadata, ok := doc["metadata"].(map[string]interface{})
+		if !ok {
+			continue
+		}
+
+		name, _ := metadata["name"].(string)
+		if name == "" {
+			continue
+		}
+
+		// Use the namespace from the document, or fall back to the release namespace
+		docNamespace, _ := metadata["namespace"].(string)
+		if docNamespace == "" {
+			docNamespace = namespace
+		}
+
+		// Use shared patching function
+		patchWorkloadWithConfigChecksum(ctx, dynamicClient, mapper, kind, name, docNamespace, checksum, helm.opts.Verbose)
 	}
 
 	return nil

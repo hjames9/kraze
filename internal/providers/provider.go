@@ -11,9 +11,12 @@ import (
 
 	"github.com/hjames9/kraze/internal/color"
 	"github.com/hjames9/kraze/internal/config"
+	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/yaml"
 	"k8s.io/client-go/discovery"
 	"k8s.io/client-go/discovery/cached/memory"
@@ -361,6 +364,12 @@ func WaitForManifestsInNamespace(ctx context.Context, kubeconfigContent, manifes
 		return fmt.Errorf("failed to create dynamic client: %w", err)
 	}
 
+	// Create clientset for fetching events and logs
+	clientset, err := kubernetes.NewForConfig(restConfig)
+	if err != nil {
+		return fmt.Errorf("failed to create clientset: %w", err)
+	}
+
 	// Create discovery client for REST mapper
 	discoveryClient, err := discovery.NewDiscoveryClientForConfig(restConfig)
 	if err != nil {
@@ -411,7 +420,7 @@ func WaitForManifestsInNamespace(ctx context.Context, kubeconfigContent, manifes
 
 		fmt.Printf("  Waiting for %s/%s to be ready...\n", kind, name)
 
-		if err := waitForResourceReady(waitCtx, dynamicClient, mapper, obj, opts.Verbose); err != nil {
+		if err := waitForResourceReady(waitCtx, dynamicClient, clientset, mapper, obj, opts.Verbose); err != nil {
 			if waitCtx.Err() == context.DeadlineExceeded {
 				return fmt.Errorf("timeout waiting for %s/%s to be ready", kind, name)
 			}
@@ -515,7 +524,7 @@ func shouldWaitForResource(kind string) bool {
 }
 
 // waitForResourceReady waits for a specific resource to become ready
-func waitForResourceReady(ctx context.Context, dynamicClient dynamic.Interface, mapper *restmapper.DeferredDiscoveryRESTMapper, obj *unstructured.Unstructured, verbose bool) error {
+func waitForResourceReady(ctx context.Context, dynamicClient dynamic.Interface, clientset *kubernetes.Clientset, mapper *restmapper.DeferredDiscoveryRESTMapper, obj *unstructured.Unstructured, verbose bool) error {
 	gvk := obj.GroupVersionKind()
 	mapping, err := mapper.RESTMapping(gvk.GroupKind(), gvk.Version)
 	if err != nil {
@@ -581,6 +590,26 @@ func waitForResourceReady(ctx context.Context, dynamicClient dynamic.Interface, 
 
 			if ready {
 				return nil
+			}
+
+			// Check for failure states in Pods (direct or owned by this resource)
+			if kind == "Pod" {
+				// Skip Pods that are being terminated - they're expected to go away
+				deletionTimestamp, _, _ := unstructured.NestedString(current.Object, "metadata", "deletionTimestamp")
+				if deletionTimestamp != "" {
+					continue
+				}
+
+				// Direct Pod resource
+				if failed, failureMsg := checkPodFailureState(current); failed {
+					displayPodDiagnostics(ctx, clientset, current, failureMsg)
+					return fmt.Errorf("pod failed: %s", failureMsg)
+				}
+			} else if kind == "Deployment" || kind == "StatefulSet" || kind == "DaemonSet" || kind == "Job" {
+				// Check Pods controlled by this resource
+				if err := checkControlledPodsForFailures(ctx, clientset, current, kind); err != nil {
+					return err
+				}
 			}
 
 			// If not ready and verbose, show we're still waiting
@@ -764,6 +793,310 @@ func isPodReady(obj *unstructured.Unstructured, status map[string]interface{}) (
 	return false, nil
 }
 
+// checkControlledPodsForFailures checks Pods controlled by a Deployment/StatefulSet/etc for failures
+func checkControlledPodsForFailures(ctx context.Context, clientset *kubernetes.Clientset, obj *unstructured.Unstructured, kind string) error {
+	namespace := obj.GetNamespace()
+
+	// Get the selector for finding Pods
+	var labelSelector string
+	spec, found, err := unstructured.NestedMap(obj.Object, "spec")
+	if !found || err != nil {
+		return nil // Can't check without selector
+	}
+
+	selector, found, err := unstructured.NestedMap(spec, "selector")
+	if !found || err != nil {
+		return nil // Can't check without selector
+	}
+
+	matchLabels, found, err := unstructured.NestedStringMap(selector, "matchLabels")
+	if !found || err != nil {
+		return nil // Can't check without matchLabels
+	}
+
+	// Build label selector string
+	var selectors []string
+	for key, value := range matchLabels {
+		selectors = append(selectors, fmt.Sprintf("%s=%s", key, value))
+	}
+	labelSelector = strings.Join(selectors, ",")
+
+	// List Pods matching the selector
+	pods, err := clientset.CoreV1().Pods(namespace).List(ctx, metav1.ListOptions{
+		LabelSelector: labelSelector,
+	})
+	if err != nil {
+		return nil // Ignore error, just continue waiting
+	}
+
+	// Check each Pod for failures
+	for _, pod := range pods.Items {
+		// Skip Pods that are being terminated - they're expected to go away
+		if pod.DeletionTimestamp != nil {
+			continue
+		}
+
+		// Check for failure using typed Pod object
+		if failed, failureMsg := checkTypedPodFailureState(&pod); failed {
+			// Create minimal unstructured for displayPodDiagnostics
+			podUnstructured := &unstructured.Unstructured{}
+			podUnstructured.SetNamespace(pod.Namespace)
+			podUnstructured.SetName(pod.Name)
+
+			displayPodDiagnostics(ctx, clientset, podUnstructured, failureMsg)
+			return fmt.Errorf("%s has failing pod %s: %s", kind, pod.Name, failureMsg)
+		}
+	}
+
+	return nil
+}
+
+// checkTypedPodFailureState checks if a typed Pod is in a failure state
+func checkTypedPodFailureState(pod *corev1.Pod) (bool, string) {
+	// Check for outright failure phases
+	if pod.Status.Phase == corev1.PodFailed {
+		return true, fmt.Sprintf("Pod failed: %s - %s", pod.Status.Reason, pod.Status.Message)
+	}
+
+	// Check container statuses for common failure states
+	for _, cs := range pod.Status.ContainerStatuses {
+		// Check waiting state
+		if cs.State.Waiting != nil {
+			reason := cs.State.Waiting.Reason
+			message := cs.State.Waiting.Message
+
+			// Common failure reasons
+			switch reason {
+			case "ImagePullBackOff", "ErrImagePull":
+				return true, fmt.Sprintf("Container '%s': %s - %s", cs.Name, reason, message)
+			case "CrashLoopBackOff":
+				return true, fmt.Sprintf("Container '%s': %s - %s", cs.Name, reason, message)
+			case "CreateContainerConfigError", "CreateContainerError":
+				return true, fmt.Sprintf("Container '%s': %s - %s", cs.Name, reason, message)
+			case "InvalidImageName":
+				return true, fmt.Sprintf("Container '%s': %s - %s", cs.Name, reason, message)
+			case "ErrImageNeverPull":
+				return true, fmt.Sprintf("Container '%s': %s - %s", cs.Name, reason, message)
+			}
+		}
+
+		// Check terminated state with non-zero exit code
+		if cs.State.Terminated != nil && cs.State.Terminated.ExitCode != 0 {
+			return true, fmt.Sprintf("Container '%s': Exited with code %d - %s", cs.Name, cs.State.Terminated.ExitCode, cs.State.Terminated.Reason)
+		}
+	}
+
+	// Check init container statuses
+	for _, cs := range pod.Status.InitContainerStatuses {
+		// Check waiting state
+		if cs.State.Waiting != nil {
+			reason := cs.State.Waiting.Reason
+			message := cs.State.Waiting.Message
+
+			// Common failure reasons
+			switch reason {
+			case "ImagePullBackOff", "ErrImagePull":
+				return true, fmt.Sprintf("Init container '%s': %s - %s", cs.Name, reason, message)
+			case "CrashLoopBackOff":
+				return true, fmt.Sprintf("Init container '%s': %s - %s", cs.Name, reason, message)
+			case "CreateContainerConfigError", "CreateContainerError":
+				return true, fmt.Sprintf("Init container '%s': %s - %s", cs.Name, reason, message)
+			}
+		}
+
+		// Check terminated state with non-zero exit code
+		if cs.State.Terminated != nil && cs.State.Terminated.ExitCode != 0 {
+			return true, fmt.Sprintf("Init container '%s': Exited with code %d - %s", cs.Name, cs.State.Terminated.ExitCode, cs.State.Terminated.Reason)
+		}
+	}
+
+	return false, ""
+}
+
+// checkPodFailureState checks if a Pod is in a failure state and returns diagnostic information
+func checkPodFailureState(obj *unstructured.Unstructured) (bool, string) {
+	status, found, err := unstructured.NestedMap(obj.Object, "status")
+	if err != nil || !found {
+		return false, ""
+	}
+
+	phase, _, _ := unstructured.NestedString(status, "phase")
+
+	// Check for outright failure phases
+	if phase == "Failed" {
+		reason, _, _ := unstructured.NestedString(status, "reason")
+		message, _, _ := unstructured.NestedString(status, "message")
+		return true, fmt.Sprintf("Pod failed: %s - %s", reason, message)
+	}
+
+	// Check container statuses for common failure states
+	containerStatuses, found, _ := unstructured.NestedSlice(status, "containerStatuses")
+	if !found {
+		// Check init container statuses
+		containerStatuses, found, _ = unstructured.NestedSlice(status, "initContainerStatuses")
+	}
+
+	if found {
+		for _, cs := range containerStatuses {
+			csMap, ok := cs.(map[string]interface{})
+			if !ok {
+				continue
+			}
+
+			containerName, _, _ := unstructured.NestedString(csMap, "name")
+			state, found, _ := unstructured.NestedMap(csMap, "state")
+			if !found {
+				continue
+			}
+
+			// Check waiting state
+			if waiting, found, _ := unstructured.NestedMap(state, "waiting"); found {
+				reason, _, _ := unstructured.NestedString(waiting, "reason")
+				message, _, _ := unstructured.NestedString(waiting, "message")
+
+				// Common failure reasons
+				switch reason {
+				case "ImagePullBackOff", "ErrImagePull":
+					return true, fmt.Sprintf("Container '%s': %s - %s", containerName, reason, message)
+				case "CrashLoopBackOff":
+					return true, fmt.Sprintf("Container '%s': %s - %s", containerName, reason, message)
+				case "CreateContainerConfigError", "CreateContainerError":
+					return true, fmt.Sprintf("Container '%s': %s - %s", containerName, reason, message)
+				case "InvalidImageName":
+					return true, fmt.Sprintf("Container '%s': %s - %s", containerName, reason, message)
+				case "ErrImageNeverPull":
+					return true, fmt.Sprintf("Container '%s': %s - %s", containerName, reason, message)
+				}
+			}
+
+			// Check terminated state with non-zero exit code
+			if terminated, found, _ := unstructured.NestedMap(state, "terminated"); found {
+				exitCode, _, _ := unstructured.NestedInt64(terminated, "exitCode")
+				reason, _, _ := unstructured.NestedString(terminated, "reason")
+
+				if exitCode != 0 {
+					return true, fmt.Sprintf("Container '%s': Exited with code %d - %s", containerName, exitCode, reason)
+				}
+			}
+		}
+	}
+
+	return false, ""
+}
+
+// getPodEvents fetches recent events for a Pod
+func getPodEvents(ctx context.Context, clientset *kubernetes.Clientset, namespace, podName string, limit int) ([]string, error) {
+	events, err := clientset.CoreV1().Events(namespace).List(ctx, metav1.ListOptions{
+		FieldSelector: fmt.Sprintf("involvedObject.name=%s,involvedObject.kind=Pod", podName),
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	// Sort events by timestamp (most recent first) and limit
+	var eventMsgs []string
+	count := 0
+	for i := len(events.Items) - 1; i >= 0 && count < limit; i-- {
+		event := events.Items[i]
+		eventMsgs = append(eventMsgs, fmt.Sprintf("  - %s: %s", event.Reason, event.Message))
+		count++
+	}
+
+	return eventMsgs, nil
+}
+
+// getContainerLogs fetches recent logs from a container
+func getContainerLogs(ctx context.Context, clientset *kubernetes.Clientset, namespace, podName, containerName string, tailLines int) ([]string, error) {
+	tailLinesInt64 := int64(tailLines)
+	req := clientset.CoreV1().Pods(namespace).GetLogs(podName, &corev1.PodLogOptions{
+		Container: containerName,
+		TailLines: &tailLinesInt64,
+	})
+
+	logs, err := req.Stream(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer logs.Close()
+
+	var logLines []string
+	scanner := bufio.NewScanner(logs)
+	for scanner.Scan() {
+		logLines = append(logLines, "    "+scanner.Text())
+	}
+
+	if err := scanner.Err(); err != nil {
+		return nil, err
+	}
+
+	return logLines, nil
+}
+
+// displayPodDiagnostics shows detailed diagnostics for a failed Pod
+func displayPodDiagnostics(ctx context.Context, clientset *kubernetes.Clientset, obj *unstructured.Unstructured, failureMsg string) {
+	namespace := obj.GetNamespace()
+	podName := obj.GetName()
+
+	fmt.Printf("\n  %s Pod %s/%s is experiencing issues:\n", color.Warning(), namespace, podName)
+	fmt.Printf("  %s\n\n", failureMsg)
+
+	// Fetch and display events
+	events, err := getPodEvents(ctx, clientset, namespace, podName, 5)
+	if err == nil && len(events) > 0 {
+		fmt.Printf("  Recent events:\n")
+		for _, event := range events {
+			fmt.Println(event)
+		}
+		fmt.Println()
+	}
+
+	// Try to get container logs if it's a CrashLoopBackOff
+	if strings.Contains(failureMsg, "CrashLoopBackOff") || strings.Contains(failureMsg, "Exited with code") {
+		// Extract container name from failure message
+		containerName := extractContainerName(failureMsg)
+		if containerName != "" {
+			logs, err := getContainerLogs(ctx, clientset, namespace, podName, containerName, 20)
+			if err == nil && len(logs) > 0 {
+				fmt.Printf("  Last %d log lines from container '%s':\n", len(logs), containerName)
+				for _, log := range logs {
+					fmt.Println(log)
+				}
+				fmt.Println()
+			}
+		}
+	}
+
+	// Provide helpful suggestions based on failure type
+	if strings.Contains(failureMsg, "ImagePullBackOff") || strings.Contains(failureMsg, "ErrImagePull") {
+		fmt.Printf("  %s\n", color.Info("Suggestion: Check that the image exists and is accessible"))
+		fmt.Printf("  - For local images, use: kraze load-image <image>\n")
+		fmt.Printf("  - For private registries, ensure imagePullSecrets are configured\n\n")
+	} else if strings.Contains(failureMsg, "CrashLoopBackOff") {
+		fmt.Printf("  %s\n", color.Info("Suggestion: The container is crashing on startup"))
+		fmt.Printf("  - Check environment variables and configuration\n")
+		fmt.Printf("  - Review the logs above for error messages\n\n")
+	} else if strings.Contains(failureMsg, "CreateContainerConfigError") {
+		fmt.Printf("  %s\n", color.Info("Suggestion: There's an issue with the container configuration"))
+		fmt.Printf("  - Check ConfigMaps and Secrets are created\n")
+		fmt.Printf("  - Verify volume mounts and environment variables\n\n")
+	}
+}
+
+// extractContainerName extracts the container name from a failure message
+func extractContainerName(msg string) string {
+	// Message format: "Container 'name': ..."
+	start := strings.Index(msg, "Container '")
+	if start == -1 {
+		return ""
+	}
+	start += len("Container '")
+	end := strings.Index(msg[start:], "'")
+	if end == -1 {
+		return ""
+	}
+	return msg[start : start+end]
+}
+
 // hasReadyCondition checks if a resource has a Ready=True condition (for CRDs)
 func hasReadyCondition(status map[string]interface{}) (bool, error) {
 	conditions, found, err := unstructured.NestedSlice(status, "conditions")
@@ -786,4 +1119,56 @@ func hasReadyCondition(status map[string]interface{}) (bool, error) {
 	}
 
 	return false, nil
+}
+
+// patchWorkloadWithConfigChecksum patches a Deployment, StatefulSet, or DaemonSet
+// with a config checksum annotation to force a rollout when the checksum changes
+func patchWorkloadWithConfigChecksum(
+	ctx context.Context,
+	dynamicClient dynamic.Interface,
+	mapper *restmapper.DeferredDiscoveryRESTMapper,
+	kind, name, namespace, checksum string,
+	verbose bool,
+) error {
+	// Get the GVR for this resource
+	gvk := schema.GroupVersionKind{
+		Group:   "apps",
+		Version: "v1",
+		Kind:    kind,
+	}
+
+	gk := schema.GroupKind{
+		Group: gvk.Group,
+		Kind:  gvk.Kind,
+	}
+
+	mapping, err := mapper.RESTMapping(gk, gvk.Version)
+	if err != nil {
+		if verbose {
+			fmt.Printf("Warning: failed to get REST mapping for %s: %v\n", kind, err)
+		}
+		return err
+	}
+
+	// Get the resource interface
+	resourceClient := dynamicClient.Resource(mapping.Resource).Namespace(namespace)
+
+	// Patch the resource with checksum annotation
+	// We use merge patch to add the annotation to spec.template.metadata.annotations
+	patch := fmt.Sprintf(`{"spec":{"template":{"metadata":{"annotations":{"kraze.dev/config-hash":"%s"}}}}}`, checksum)
+
+	_, err = resourceClient.Patch(ctx, name, types.MergePatchType, []byte(patch), metav1.PatchOptions{})
+	if err != nil {
+		// Log warning but don't fail - the resource might not exist yet or might not support patching
+		if verbose {
+			fmt.Printf("Warning: failed to patch %s/%s with config checksum: %v\n", kind, name, err)
+		}
+		return err
+	}
+
+	if verbose {
+		fmt.Printf("Added config checksum annotation to %s/%s (hash: %s)\n", kind, name, checksum[:8])
+	}
+
+	return nil
 }
