@@ -113,6 +113,14 @@ func runUp(cmd *cobra.Command, args []string) error {
 		if err := kindMgr.CreateCluster(ctx, &cfg.Cluster); err != nil {
 			return fmt.Errorf("failed to create cluster: %w", err)
 		}
+
+		// Update ~/.kube/config with cluster access (Use container IP)
+		Verbose("Updating kubeconfig...")
+		if err := kindMgr.UpdateKubeconfigFile(cfg.Cluster.Name); err != nil {
+			Verbose("Warning: failed to update kubeconfig: %v", err)
+		} else {
+			Verbose("Kubeconfig updated (context: kind-%s)", cfg.Cluster.Name)
+		}
 	} else {
 		Verbose("Cluster '%s' already exists", cfg.Cluster.Name)
 	}

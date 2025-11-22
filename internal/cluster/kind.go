@@ -199,6 +199,62 @@ func (kind *KindManager) patchKubeconfigWithContainerIP(clusterName, kubeconfig 
 	return patchedConfig, nil
 }
 
+// UpdateKubeconfigFile updates ~/.kube/config with cluster access, patched for dev container compatibility
+// This ensures kubectl works inside dev containers by using container IP instead of 127.0.0.1
+func (kind *KindManager) UpdateKubeconfigFile(clusterName string) error {
+	// Get patched kubeconfig with container IP
+	kubeconfigContent, err := kind.GetKubeConfig(clusterName, true)
+	if err != nil {
+		return fmt.Errorf("failed to get kubeconfig: %w", err)
+	}
+
+	// Parse the kubeconfig
+	config, err := clientcmd.Load([]byte(kubeconfigContent))
+	if err != nil {
+		return fmt.Errorf("failed to parse kubeconfig: %w", err)
+	}
+
+	// Add insecure-skip-tls-verify to the cluster (needed because cert is for 127.0.0.1, not container IP)
+	contextName := "kind-" + clusterName
+	if cluster, exists := config.Clusters[contextName]; exists {
+		cluster.InsecureSkipTLSVerify = true
+		cluster.CertificateAuthorityData = nil // Remove CA data when using insecure
+	}
+
+	// Get path to user's kubeconfig
+	kubeconfigPath := clientcmd.RecommendedHomeFile
+
+	// Load existing kubeconfig or create new one
+	pathOptions := clientcmd.NewDefaultPathOptions()
+	existingConfig, err := pathOptions.GetStartingConfig()
+	if err != nil {
+		// If no existing config, use the new one
+		existingConfig = config
+	} else {
+		// Merge the new config into existing
+		// This preserves other clusters/contexts/users
+		for key, value := range config.Clusters {
+			existingConfig.Clusters[key] = value
+		}
+		for key, value := range config.AuthInfos {
+			existingConfig.AuthInfos[key] = value
+		}
+		for key, value := range config.Contexts {
+			existingConfig.Contexts[key] = value
+		}
+	}
+
+	// Set current context to the new cluster
+	existingConfig.CurrentContext = contextName
+
+	// Write the merged config back
+	if err := clientcmd.WriteToFile(*existingConfig, kubeconfigPath); err != nil {
+		return fmt.Errorf("failed to write kubeconfig: %w", err)
+	}
+
+	return nil
+}
+
 // WaitForClusterReady waits for the cluster API server to be ready
 func (kind *KindManager) WaitForClusterReady(ctx context.Context, clusterName string, timeout time.Duration) error {
 	fmt.Printf("Waiting for cluster API server to be ready...\n")

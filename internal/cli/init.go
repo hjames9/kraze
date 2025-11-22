@@ -93,6 +93,15 @@ For external clusters (cluster.external.enabled: true):
 			if err := kindMgr.CreateCluster(ctx, &cfg.Cluster); err != nil {
 				return fmt.Errorf("failed to create cluster: %w", err)
 			}
+
+			// Update ~/.kube/config with cluster access (Use container IP in case you're accessing control plane from another container)
+			fmt.Printf("\nUpdating kubeconfig...\n")
+			if err := kindMgr.UpdateKubeconfigFile(cfg.Cluster.Name); err != nil {
+				fmt.Printf("Warning: failed to update kubeconfig: %v\n", err)
+				fmt.Printf("You may need to manually run: kind export kubeconfig --name %s\n", cfg.Cluster.Name)
+			} else {
+				fmt.Printf("%s Kubeconfig updated (context: kind-%s)\n", color.Checkmark(), cfg.Cluster.Name)
+			}
 		}
 
 		// Preload images if specified
