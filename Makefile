@@ -1,4 +1,4 @@
-.PHONY: all build test clean install fmt vet lint help run-tests coverage validate-examples release
+.PHONY: all build test clean install fmt vet lint help run-tests coverage validate-examples release release-publish
 
 BINARY_NAME=kraze
 VERSION?=dev
@@ -14,6 +14,8 @@ GOGET=$(GOCMD) get
 GOMOD=$(GOCMD) mod
 GOFMT=$(GOCMD) fmt
 GOVET=$(GOCMD) vet
+
+GHCMD=gh
 
 BUILD_DIR=build
 CMD_DIR=./cmd/$(BINARY_NAME)
@@ -55,8 +57,29 @@ release:
 	@echo "Files:"
 	@ls -lh $(BUILD_DIR)/$(BINARY_NAME)-$(VERSION)-*
 	@echo ""
-	@echo "To create a GitHub release, run:"
-	@echo "  gh release create $(VERSION) --title '$(VERSION)' --generate-notes $(BUILD_DIR)/$(BINARY_NAME)-$(VERSION)-*"
+	@echo "Creating draft GitHub release..."
+	$(GHCMD) release create $(VERSION) \
+		--draft \
+		--title "$(VERSION)" \
+		--generate-notes \
+		$(BUILD_DIR)/$(BINARY_NAME)-$(VERSION)-*
+	@echo ""
+	@echo "Draft release $(VERSION) created successfully!"
+	@echo ""
+	@echo "To publish the release, run:"
+	@echo "  make release-publish VERSION=$(VERSION)"
+
+release-publish:
+	@echo "Publishing release $(VERSION)..."
+	@if [ "$(VERSION)" = "dev" ]; then \
+		echo "Error: VERSION must be set (e.g., make release-publish VERSION=v0.1.0)"; \
+		exit 1; \
+	fi
+	$(GHCMD) release edit $(VERSION) --draft=false
+	@echo ""
+	@echo "Release $(VERSION) published successfully!"
+	@echo ""
+	@echo "View at: https://github.com/$$($(GHCMD) repo view --json nameWithOwner -q .nameWithOwner)/releases/tag/$(VERSION)"
 
 test:
 	@echo "Running tests..."
