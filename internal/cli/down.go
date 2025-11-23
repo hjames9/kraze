@@ -10,6 +10,7 @@ import (
 	"github.com/hjames9/kraze/internal/graph"
 	"github.com/hjames9/kraze/internal/providers"
 	"github.com/hjames9/kraze/internal/state"
+	"github.com/hjames9/kraze/internal/ui"
 	"github.com/spf13/cobra"
 )
 
@@ -30,7 +31,8 @@ You can filter services by name or by labels:
   kraze down service1 service2    # Uninstall specific services
   kraze down --label env=dev      # Uninstall services with label env=dev
   kraze down --label tier=backend # Uninstall services with label tier=backend`,
-	RunE: runDown,
+	ValidArgsFunction: getServiceNames,
+	RunE:              runDown,
 }
 
 func runDown(cmd *cobra.Command, args []string) error {
@@ -86,7 +88,6 @@ func runDown(cmd *cobra.Command, args []string) error {
 	if specificServicesRequested {
 		// When specific services are requested, uninstall them in the order specified
 		// (no dependency resolution needed - just uninstall what was asked)
-		fmt.Printf("Uninstalling %d service(s)...\n", len(cfg.Services))
 		if len(downLabels) > 0 {
 			// Labels: iterate over filtered services
 			for name, svc := range cfg.Services {
@@ -104,7 +105,6 @@ func runDown(cmd *cobra.Command, args []string) error {
 		}
 	} else {
 		// When uninstalling all services, respect dependencies (reverse order)
-		fmt.Printf("Uninstalling %d service(s) in reverse dependency order...\n", len(cfg.Services))
 
 		// Create dependency graph
 		depGraph := graph.NewDependencyGraph(cfg.Services)
@@ -156,10 +156,24 @@ func runDown(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("failed to get kubeconfig: %w", err)
 	}
 
-	// Uninstall each service in reverse dependency order
+	// Create progress manager
+	progress := ui.NewProgressManager(verbose, plain)
+
+	// Start progress display
+	progress.Start(len(orderedServices), "Uninstalling")
+
+	// Initialize all services as pending
+	for i, svc := range orderedServices {
+		progress.UpdateService(i, svc.Name, ui.StatusPending, "")
+	}
+
 	uninstalledCount := 0
+
+	// Uninstall each service in reverse dependency order
 	for itr, svc := range orderedServices {
-		fmt.Printf("\n[%d/%d] Uninstalling '%s' (%s)...\n", itr+1, len(orderedServices), svc.Name, svc.Type)
+		// Update progress to show we're uninstalling this service
+		progress.UpdateService(itr, svc.Name, ui.StatusInstalling, fmt.Sprintf("(%s)", svc.Type))
+		progress.Verbose("Uninstalling '%s' (%s)...", svc.Name, svc.Type)
 
 		// Create provider options
 		providerOpts := &providers.ProviderOptions{
@@ -167,44 +181,52 @@ func runDown(cmd *cobra.Command, args []string) error {
 			KubeConfig:  kubeconfig,
 			Verbose:     verbose,
 			KeepCRDs:    downKeepCRDs,
+			Quiet:       !verbose, // Suppress intermediate output unless verbose
 		}
 
 		// Create provider for this service
 		provider, err := providers.NewProvider(svc, providerOpts)
 		if err != nil {
-			Verbose("Warning: failed to create provider for '%s': %v", svc.Name, err)
+			progress.Verbose("Warning: failed to create provider for '%s': %v", svc.Name, err)
+			progress.UpdateService(itr, svc.Name, ui.StatusSkipped, "Failed to create provider")
 			continue
 		}
 
 		// Check if installed
 		installed, err := provider.IsInstalled(ctx, svc)
 		if err != nil {
-			Verbose("Warning: failed to check if '%s' is installed: %v", svc.Name, err)
+			progress.Verbose("Warning: failed to check if '%s' is installed: %v", svc.Name, err)
 			installed = true // Try to uninstall anyway
 		}
 
 		if !installed {
-			fmt.Printf("Service '%s' is not installed, skipping...\n", svc.Name)
+			progress.UpdateService(itr, svc.Name, ui.StatusSkipped, "Not installed")
 			continue
 		}
 
+		// Update status to show we're removing resources
+		progress.UpdateService(itr, svc.Name, ui.StatusInstalling, "Removing resources")
+
 		// Uninstall the service
 		if err := provider.Uninstall(ctx, svc); err != nil {
-			Verbose("Warning: failed to uninstall '%s': %v", svc.Name, err)
+			progress.Verbose("Warning: failed to uninstall '%s': %v", svc.Name, err)
+			progress.UpdateService(itr, svc.Name, ui.StatusFailed, err.Error())
 			continue
 		}
 
 		// Update state
 		st.MarkServiceUninstalled(svc.Name)
 		if err := st.Save(stateFilePath); err != nil {
-			Verbose("Warning: failed to save state: %v", err)
+			progress.Verbose("Warning: failed to save state: %v", err)
 		}
 
-		fmt.Printf("%s Service '%s' uninstalled successfully\n", color.Checkmark(), svc.Name)
+		// Mark service as uninstalled
+		progress.UpdateService(itr, svc.Name, ui.StatusReady, "Removed")
 		uninstalledCount++
 	}
 
-	fmt.Printf("\n%s Uninstalled %d service(s)\n", color.Checkmark(), uninstalledCount)
+	// Finish progress display
+	progress.Finish(uninstalledCount)
 
 	// Clean up namespaces we created (if they're empty)
 	if len(namespacesToCleanup) > 0 {
@@ -212,7 +234,7 @@ func runDown(cmd *cobra.Command, args []string) error {
 		deletedNamespaces := 0
 
 		for ns := range namespacesToCleanup {
-			Verbose("Checking namespace '%s' for cleanup...", ns)
+			progress.Verbose("Checking namespace '%s' for cleanup...", ns)
 
 			// Check if namespace still exists
 			exists, err := providers.CheckNamespaceExists(ctx, kubeconfig, ns)
@@ -222,7 +244,7 @@ func runDown(cmd *cobra.Command, args []string) error {
 			}
 
 			if !exists {
-				Verbose("Namespace '%s' already deleted", ns)
+				progress.Verbose("Namespace '%s' already deleted", ns)
 				continue
 			}
 
@@ -232,7 +254,7 @@ func runDown(cmd *cobra.Command, args []string) error {
 				fmt.Printf("%s Warning: failed to delete PVCs in namespace '%s': %v\n", color.Warning(), ns, err)
 				// Continue anyway - maybe we can still delete the namespace
 			} else if pvcCount > 0 {
-				Verbose("Deleted %d PVC(s) from namespace '%s'", pvcCount, ns)
+				progress.Verbose("Deleted %d PVC(s) from namespace '%s'", pvcCount, ns)
 			}
 
 			// Check if namespace is empty (after PVC deletion)
@@ -247,7 +269,7 @@ func runDown(cmd *cobra.Command, args []string) error {
 				continue
 			}
 
-			Verbose("Namespace '%s' is empty, deleting...", ns)
+			progress.Verbose("Namespace '%s' is empty, deleting...", ns)
 
 			// Delete the namespace
 			if err := providers.DeleteNamespace(ctx, kubeconfig, ns); err != nil {

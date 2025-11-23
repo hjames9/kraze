@@ -11,6 +11,7 @@ var (
 	configFile string
 	verbose    bool
 	dryRun     bool
+	plain      bool
 
 	// Version information
 	version   string
@@ -42,6 +43,7 @@ func init() {
 	rootCmd.PersistentFlags().StringVarP(&configFile, "file", "f", "kraze.yml", "Path to kraze configuration file")
 	rootCmd.PersistentFlags().BoolVarP(&verbose, "verbose", "v", false, "Verbose output")
 	rootCmd.PersistentFlags().BoolVar(&dryRun, "dry-run", false, "Show what would happen without executing")
+	rootCmd.PersistentFlags().BoolVar(&plain, "plain", false, "Use plain scrolling output instead of interactive mode")
 
 	// Add subcommands
 	rootCmd.AddCommand(initCmd)
@@ -53,6 +55,7 @@ func init() {
 	rootCmd.AddCommand(validateCmd)
 	rootCmd.AddCommand(loadImageCmd)
 	rootCmd.AddCommand(portForwardCmd)
+	rootCmd.AddCommand(completionCmd)
 }
 
 // SetVersionInfo sets the version information for the CLI

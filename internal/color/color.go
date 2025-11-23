@@ -4,6 +4,14 @@ import (
 	"github.com/fatih/color"
 )
 
+// Icon constants for consistent output
+const (
+	IconCheckmark = "✓"
+	IconCross     = "✗"
+	IconWarning   = "⚠"
+	IconInfo      = "ℹ"
+)
+
 var (
 	// Green creates green colored text
 	Green = color.New(color.FgGreen).SprintFunc()
@@ -23,17 +31,17 @@ var (
 
 // Checkmark returns a green checkmark
 func Checkmark() string {
-	return Green("✓")
+	return Green(IconCheckmark)
 }
 
 // Cross returns a red cross
 func Cross() string {
-	return Red("✗")
+	return Red(IconCross)
 }
 
 // Warning returns a yellow warning symbol
 func Warning() string {
-	return Yellow("⚠")
+	return Yellow(IconWarning)
 }
 
 // Success formats a success message with a green checkmark
@@ -48,5 +56,5 @@ func Error(msg string) string {
 
 // Info formats an info message with a cyan symbol
 func Info(msg string) string {
-	return Cyan("ℹ") + " " + msg
+	return Cyan(IconInfo) + " " + msg
 }

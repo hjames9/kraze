@@ -69,6 +69,9 @@ type ProviderOptions struct {
 
 	// KeepCRDs determines if CRDs should be kept when uninstalling Helm charts
 	KeepCRDs bool
+
+	// Quiet suppresses intermediate status messages (for clean progress UI)
+	Quiet bool
 }
 
 // NewProvider creates a provider based on the service type
@@ -409,7 +412,9 @@ func WaitForManifestsInNamespace(ctx context.Context, kubeconfigContent, manifes
 		return nil // Nothing to wait for
 	}
 
-	fmt.Printf("Waiting for resources to be ready (timeout: %v)...\n", timeout)
+	if !opts.Quiet {
+		fmt.Printf("Waiting for resources to be ready (timeout: %v)...\n", timeout)
+	}
 
 	// Create context with timeout
 	waitCtx, cancel := context.WithTimeout(ctx, timeout)
@@ -438,7 +443,9 @@ func WaitForManifestsInNamespace(ctx context.Context, kubeconfigContent, manifes
 			continue
 		}
 
-		fmt.Printf("  Waiting for %s/%s to be ready...\n", kind, name)
+		if !opts.Quiet {
+			fmt.Printf("  Waiting for %s/%s to be ready...\n", kind, name)
+		}
 
 		if err := waitForResourceReady(waitCtx, dynamicClient, clientset, mapper, obj, opts.Verbose); err != nil {
 			if waitCtx.Err() == context.DeadlineExceeded {
@@ -447,10 +454,14 @@ func WaitForManifestsInNamespace(ctx context.Context, kubeconfigContent, manifes
 			return fmt.Errorf("error waiting for %s/%s: %w", kind, name, err)
 		}
 
-		fmt.Printf("  %s %s/%s is ready\n", color.Checkmark(), kind, name)
+		if !opts.Quiet {
+			fmt.Printf("  %s %s/%s is ready\n", color.Checkmark(), kind, name)
+		}
 	}
 
-	fmt.Printf("%s All resources are ready\n", color.Checkmark())
+	if !opts.Quiet {
+		fmt.Printf("%s All resources are ready\n", color.Checkmark())
+	}
 	return nil
 }
 

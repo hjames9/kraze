@@ -101,7 +101,9 @@ func (manifest *ManifestsProvider) Install(ctx context.Context, service *config.
 		return fmt.Errorf("no manifests found")
 	}
 
-	fmt.Printf("Applying %d manifest(s) for service '%s'...\n", len(manifests), service.Name)
+	if !manifest.opts.Quiet {
+		fmt.Printf("Applying %d manifest(s) for service '%s'...\n", len(manifests), service.Name)
+	}
 
 	// Track applied resources with their fully resolved state (including namespace)
 	var appliedObjects []*unstructured.Unstructured
@@ -141,7 +143,9 @@ func (manifest *ManifestsProvider) Install(ctx context.Context, service *config.
 		appliedObjects = append(appliedObjects, obj.DeepCopy())
 	}
 
-	fmt.Printf("%s Manifests applied successfully for '%s'\n", color.Checkmark(), service.Name)
+	if !manifest.opts.Quiet {
+		fmt.Printf("%s Manifests applied successfully for '%s'\n", color.Checkmark(), service.Name)
+	}
 
 	// Inject config checksums to force rollouts when ConfigMaps/Secrets change
 	checksum, err := calculateConfigChecksumFromObjects(appliedObjects)
@@ -169,7 +173,9 @@ func (manifest *ManifestsProvider) Install(ctx context.Context, service *config.
 
 // Uninstall removes Kubernetes resources
 func (manifest *ManifestsProvider) Uninstall(ctx context.Context, service *config.ServiceConfig) error {
-	fmt.Printf("Deleting resources for service '%s'...\n", service.Name)
+	if !manifest.opts.Quiet {
+		fmt.Printf("Deleting resources for service '%s'...\n", service.Name)
+	}
 
 	// Load manifests to get resource info
 	manifests, err := manifest.loadManifests(service)
@@ -183,7 +189,9 @@ func (manifest *ManifestsProvider) Uninstall(ctx context.Context, service *confi
 		obj, err := manifest.parseManifest(manifestContent)
 		if err != nil {
 			// Log warning but continue
-			fmt.Printf("  Warning: failed to parse manifest %d: %v\n", itr+1, err)
+			if !manifest.opts.Quiet {
+				fmt.Printf("  Warning: failed to parse manifest %d: %v\n", itr+1, err)
+			}
 			continue
 		}
 
@@ -198,8 +206,10 @@ func (manifest *ManifestsProvider) Uninstall(ctx context.Context, service *confi
 
 		// Delete the resource
 		if err := manifest.deleteResource(ctx, obj); err != nil {
-			fmt.Printf("  Warning: failed to delete %s/%s: %v\n",
-				obj.GetKind(), obj.GetName(), err)
+			if !manifest.opts.Quiet {
+				fmt.Printf("  Warning: failed to delete %s/%s: %v\n",
+					obj.GetKind(), obj.GetName(), err)
+			}
 			continue
 		}
 
@@ -209,7 +219,9 @@ func (manifest *ManifestsProvider) Uninstall(ctx context.Context, service *confi
 		deletedCount++
 	}
 
-	fmt.Printf("%s Deleted %d resource(s) for '%s'\n", color.Checkmark(), deletedCount, service.Name)
+	if !manifest.opts.Quiet {
+		fmt.Printf("%s Deleted %d resource(s) for '%s'\n", color.Checkmark(), deletedCount, service.Name)
+	}
 	return nil
 }
 
@@ -588,7 +600,9 @@ func (manifest *ManifestsProvider) waitForAppliedResources(ctx context.Context, 
 		}
 	}
 
-	fmt.Printf("Waiting for resources to be ready (timeout: %v)...\n", timeout)
+	if !manifest.opts.Quiet {
+		fmt.Printf("Waiting for resources to be ready (timeout: %v)...\n", timeout)
+	}
 
 	// Create context with timeout
 	waitCtx, cancel := context.WithTimeout(ctx, timeout)
@@ -607,7 +621,9 @@ func (manifest *ManifestsProvider) waitForAppliedResources(ctx context.Context, 
 			continue
 		}
 
-		fmt.Printf("  Waiting for %s/%s to be ready...\n", kind, name)
+		if !manifest.opts.Quiet {
+			fmt.Printf("  Waiting for %s/%s to be ready...\n", kind, name)
+		}
 
 		if err := waitForResourceReady(waitCtx, manifest.dynamicClient, manifest.clientset, manifest.mapper, obj, manifest.opts.Verbose); err != nil {
 			if waitCtx.Err() == context.DeadlineExceeded {
@@ -616,10 +632,14 @@ func (manifest *ManifestsProvider) waitForAppliedResources(ctx context.Context, 
 			return fmt.Errorf("error waiting for %s/%s: %w", kind, name, err)
 		}
 
-		fmt.Printf("  %s %s/%s is ready\n", color.Checkmark(), kind, name)
+		if !manifest.opts.Quiet {
+			fmt.Printf("  %s %s/%s is ready\n", color.Checkmark(), kind, name)
+		}
 	}
 
-	fmt.Printf("%s All resources are ready\n", color.Checkmark())
+	if !manifest.opts.Quiet {
+		fmt.Printf("%s All resources are ready\n", color.Checkmark())
+	}
 	return nil
 }
 

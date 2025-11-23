@@ -11,6 +11,7 @@ import (
 	"github.com/hjames9/kraze/internal/graph"
 	"github.com/hjames9/kraze/internal/providers"
 	"github.com/hjames9/kraze/internal/state"
+	"github.com/hjames9/kraze/internal/ui"
 	"github.com/spf13/cobra"
 )
 
@@ -33,7 +34,8 @@ You can filter services by name or by labels:
   kraze up service1 service2      # Install specific services
   kraze up --label env=dev        # Install services with label env=dev
   kraze up --label tier=backend   # Install services with label tier=backend`,
-	RunE: runUp,
+	ValidArgsFunction: getServiceNames,
+	RunE:              runUp,
 }
 
 func runUp(cmd *cobra.Command, args []string) error {
@@ -98,7 +100,8 @@ func runUp(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("failed to resolve dependencies: %w", err)
 	}
 
-	fmt.Printf("Installing %d service(s) in dependency order...\n", len(orderedServices))
+	// Create progress manager
+	progress := ui.NewProgressManager(verbose, plain)
 
 	// Create or verify cluster
 	kindMgr := cluster.NewKindManager()
@@ -153,22 +156,34 @@ func runUp(cmd *cobra.Command, args []string) error {
 	// Create image manager for automatic image loading
 	imgMgr := cluster.NewImageManager(verbose)
 
+	// Start progress display
+	progress.Start(len(orderedServices), "Installing")
+
+	// Initialize all services as pending
+	for i, svc := range orderedServices {
+		progress.UpdateService(i, svc.Name, ui.StatusPending, "")
+	}
+
+	successCount := 0
+
 	// Install each service in dependency order
 	for itr, svc := range orderedServices {
-		fmt.Printf("\n[%d/%d] Installing '%s' (%s)...\n", itr+1, len(orderedServices), svc.Name, svc.Type)
+		// Update progress to show we're installing this service
+		progress.UpdateService(itr, svc.Name, ui.StatusInstalling, fmt.Sprintf("(%s)", svc.Type))
+		progress.Verbose("Installing '%s' (%s)...", svc.Name, svc.Type)
 
 		// Determine wait behavior for this service (precedence: service config > CLI flag)
 		serviceWait := globalWait
 		if svc.Wait != nil {
 			serviceWait = *svc.Wait
-			Verbose("Service '%s' has wait=%v configured", svc.Name, serviceWait)
+			progress.Verbose("Service '%s' has wait=%v configured", svc.Name, serviceWait)
 		}
 
 		// Determine timeout for this service (precedence: service config > CLI flag)
 		serviceTimeout := globalTimeout
 		if svc.WaitTimeout != "" {
 			serviceTimeout = svc.WaitTimeout
-			Verbose("Service '%s' has wait_timeout=%s configured", svc.Name, serviceTimeout)
+			progress.Verbose("Service '%s' has wait_timeout=%s configured", svc.Name, serviceTimeout)
 		}
 
 		// Create provider options
@@ -178,6 +193,7 @@ func runUp(cmd *cobra.Command, args []string) error {
 			Wait:        serviceWait,
 			Timeout:     serviceTimeout,
 			Verbose:     verbose,
+			Quiet:       !verbose, // Suppress intermediate output unless verbose
 		}
 
 		// Create provider for this service
@@ -189,12 +205,12 @@ func runUp(cmd *cobra.Command, args []string) error {
 		// Extract images from service configuration
 		serviceImages, err := imgMgr.GetImagesForService(ctx, svc, kubeconfig)
 		if err != nil {
-			Verbose("Warning: failed to extract images for '%s': %v", svc.Name, err)
+			progress.Verbose("Warning: failed to extract images for '%s': %v", svc.Name, err)
 			serviceImages = []string{}
 		}
 
 		if len(serviceImages) > 0 {
-			Verbose("Detected %d image(s) for service '%s': %v", len(serviceImages), svc.Name, serviceImages)
+			progress.Verbose("Detected %d image(s) for service '%s': %v", len(serviceImages), svc.Name, serviceImages)
 
 			// Get image info and hashes for all detected images
 			imageHashes := make(map[string]string)
@@ -203,7 +219,7 @@ func runUp(cmd *cobra.Command, args []string) error {
 			for _, img := range serviceImages {
 				imgInfo, err := imgMgr.GetImageInfo(ctx, img)
 				if err != nil {
-					Verbose("Warning: failed to get info for image '%s': %v", img, err)
+					progress.Verbose("Warning: failed to get info for image '%s': %v", img, err)
 					continue
 				}
 
@@ -236,28 +252,28 @@ func runUp(cmd *cobra.Command, args []string) error {
 						// External cluster - use state file comparison
 						needsLoad = st.HasImageHashChanged(svc.Name, img, currentHash)
 						if needsLoad {
-							Verbose("Image '%s' changed (state file), but external cluster - skipping auto-load", img)
+							progress.Verbose("Image '%s' changed (state file), but external cluster - skipping auto-load", img)
 							needsLoad = false // Can't auto-load to external clusters
 						} else {
-							Verbose("Image '%s' unchanged (hash matches state), skipping", img)
+							progress.Verbose("Image '%s' unchanged (hash matches state), skipping", img)
 						}
 					} else {
 						// Kind cluster - compare with actual cluster
 						clusterHash, err := imgMgr.GetClusterImageHash(ctx, cfg.Cluster.Name, img)
 						if err != nil {
-							Verbose("Warning: failed to get cluster image hash for '%s': %v", img, err)
+							progress.Verbose("Warning: failed to get cluster image hash for '%s': %v", img, err)
 							// On error, load to be safe
 							needsLoad = true
 						} else if clusterHash == "" {
 							// Image not in cluster yet
-							Verbose("Image '%s' not found in cluster, will load", img)
+							progress.Verbose("Image '%s' not found in cluster, will load", img)
 							needsLoad = true
 						} else if clusterHash != currentHash {
 							// Image exists but hash differs - needs reload
-							Verbose("Image '%s' changed (cluster: %s, local: %s), will reload", img, clusterHash[:12], currentHash[:12])
+							progress.Verbose("Image '%s' changed (cluster: %s, local: %s), will reload", img, clusterHash[:12], currentHash[:12])
 							needsLoad = true
 						} else {
-							Verbose("Image '%s' unchanged (hash matches cluster), skipping load", img)
+							progress.Verbose("Image '%s' unchanged (hash matches cluster), skipping load", img)
 						}
 					}
 
@@ -272,13 +288,13 @@ func runUp(cmd *cobra.Command, args []string) error {
 
 			// Pull remote images first
 			if len(imagesToPull) > 0 {
-				fmt.Printf("Pulling %d remote image(s)...\n", len(imagesToPull))
+				progress.UpdateService(itr, svc.Name, ui.StatusInstalling, fmt.Sprintf("Pulling %d image(s)", len(imagesToPull)))
 				for _, img := range imagesToPull {
-					Verbose("Pulling image '%s'...", img)
+					progress.Verbose("Pulling image '%s'...", img)
 					if err := kindMgr.PullImage(ctx, img); err != nil {
-						fmt.Printf("Warning: failed to pull image '%s': %v\n", img, err)
+						progress.Verbose("Warning: failed to pull image '%s': %v", img, err)
 					} else {
-						Verbose("%s Image '%s' pulled", color.Checkmark(), img)
+						progress.Verbose("%s Image '%s' pulled", color.Checkmark(), img)
 						// Add to load list after successful pull
 						imagesToLoad = append(imagesToLoad, img)
 					}
@@ -287,22 +303,22 @@ func runUp(cmd *cobra.Command, args []string) error {
 
 			// Load images that need to be loaded
 			if len(imagesToLoad) > 0 {
-				fmt.Printf("Loading %d local image(s) into cluster...\n", len(imagesToLoad))
+				progress.UpdateService(itr, svc.Name, ui.StatusInstalling, fmt.Sprintf("Loading %d image(s)", len(imagesToLoad)))
 
 				for _, img := range imagesToLoad {
-					Verbose("Loading image '%s'...", img)
+					progress.Verbose("Loading image '%s'...", img)
 					if err := kindMgr.LoadImage(ctx, cfg.Cluster.Name, img); err != nil {
 						// Don't fail the installation if image loading fails
 						// The image might be available in a registry
-						fmt.Printf("Warning: failed to load image '%s': %v\n", img, err)
+						progress.Verbose("Warning: failed to load image '%s': %v", img, err)
 					} else {
-						Verbose("%s Image '%s' loaded", color.Checkmark(), img)
+						progress.Verbose("%s Image '%s' loaded", color.Checkmark(), img)
 					}
 				}
 
-				fmt.Printf("%s Images loaded successfully\n", color.Checkmark())
+				progress.Verbose("%s Images loaded successfully", color.Checkmark())
 			} else if len(localImages) > 0 {
-				Verbose("All %d local image(s) already loaded (hashes match)", len(localImages))
+				progress.Verbose("All %d local image(s) already loaded (hashes match)", len(localImages))
 			}
 
 			// Store image hashes in state for future comparisons
@@ -322,7 +338,7 @@ func runUp(cmd *cobra.Command, args []string) error {
 		namespace := svc.GetNamespace()
 		namespaceExists, err := providers.CheckNamespaceExists(ctx, kubeconfig, namespace)
 		if err != nil {
-			Verbose("Warning: failed to check if namespace '%s' exists: %v", namespace, err)
+			progress.Verbose("Warning: failed to check if namespace '%s' exists: %v", namespace, err)
 			namespaceExists = false
 		}
 
@@ -331,33 +347,41 @@ func runUp(cmd *cobra.Command, args []string) error {
 		// 2. create_namespace is true (which is now the default)
 		willCreateNamespace := !namespaceExists && svc.ShouldCreateNamespace()
 
+		// Update status to show we're applying resources
+		progress.UpdateService(itr, svc.Name, ui.StatusInstalling, "Applying resources")
+
 		// Install the service
 		if err := provider.Install(ctx, svc); err != nil {
+			progress.UpdateService(itr, svc.Name, ui.StatusFailed, err.Error())
 			return fmt.Errorf("failed to install '%s': %w", svc.Name, err)
 		}
 
 		// Update state with namespace tracking
 		st.MarkServiceInstalledWithNamespace(svc.Name, namespace, willCreateNamespace)
 		if err := st.Save(stateFilePath); err != nil {
-			Verbose("Warning: failed to save state: %v", err)
+			progress.Verbose("Warning: failed to save state: %v", err)
 		}
 
-		fmt.Printf("%s Service '%s' installed successfully\n", color.Checkmark(), svc.Name)
+		// Mark service as ready
+		progress.UpdateService(itr, svc.Name, ui.StatusReady, "Deployed")
+		successCount++
 
 		// Apply post-ready delay (defaults to 3 seconds)
 		// This helps with kube-proxy propagation and service endpoint readiness
 		delay, err := svc.GetPostReadyDelay()
 		if err != nil {
-			Verbose("Warning: %v, using default 3s delay", err)
+			progress.Verbose("Warning: %v, using default 3s delay", err)
 			delay = 3 * time.Second
 		}
 		if delay > 0 {
-			Verbose("Waiting %v for service to stabilize...", delay)
+			progress.Verbose("Waiting %v for service to stabilize...", delay)
 			time.Sleep(delay)
 		}
 	}
 
-	fmt.Printf("\n%s All services installed successfully!\n", color.Checkmark())
+	// Finish progress display
+	progress.Finish(successCount)
+
 	fmt.Printf("\nTo check status: kraze status\n")
 	fmt.Printf("To tear down:    kraze down\n")
 

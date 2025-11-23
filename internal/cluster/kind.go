@@ -122,6 +122,11 @@ func (kind *KindManager) ClusterExists(clusterName string) (bool, error) {
 // GetKubeConfig returns the kubeconfig for the cluster
 // Always patches the kubeconfig to use the container's IP address for better compatibility
 func (kind *KindManager) GetKubeConfig(clusterName string, internal bool) (string, error) {
+	return kind.GetKubeConfigQuiet(clusterName, internal, false)
+}
+
+// GetKubeConfigQuiet returns the kubeconfig with optional message suppression
+func (kind *KindManager) GetKubeConfigQuiet(clusterName string, internal bool, quiet bool) (string, error) {
 	// Get the base kubeconfig from kind
 	kubeconfig, err := kind.provider.KubeConfig(clusterName, internal)
 	if err != nil {
@@ -130,7 +135,7 @@ func (kind *KindManager) GetKubeConfig(clusterName string, internal bool) (strin
 
 	// Patch the kubeconfig to use the container's IP address
 	// This works in dev containers, CI, and other Docker-in-Docker environments
-	patchedConfig, err := kind.patchKubeconfigWithContainerIP(clusterName, kubeconfig)
+	patchedConfig, err := kind.patchKubeconfigWithContainerIP(clusterName, kubeconfig, quiet)
 	if err != nil {
 		// If patching fails, fall back to original kubeconfig
 		// This ensures we don't break in normal environments
@@ -142,7 +147,11 @@ func (kind *KindManager) GetKubeConfig(clusterName string, internal bool) (strin
 
 // patchKubeconfigWithContainerIP replaces the server address with the container's IP
 // This provides better compatibility across different Docker network configurations
-func (kind *KindManager) patchKubeconfigWithContainerIP(clusterName, kubeconfig string) (string, error) {
+func (kind *KindManager) patchKubeconfigWithContainerIP(clusterName, kubeconfig string, quiet ...bool) (string, error) {
+	shouldPrint := true
+	if len(quiet) > 0 && quiet[0] {
+		shouldPrint = false
+	}
 	containerName := clusterName + "-control-plane"
 
 	// Auto-detect networks to try based on current environment
@@ -157,7 +166,9 @@ func (kind *KindManager) patchKubeconfigWithContainerIP(clusterName, kubeconfig 
 			containerIP := strings.Trim(strings.TrimSpace(string(output)), "\"")
 			if containerIP != "" && containerIP != "<no value>" {
 				// Found IP on this network
-				fmt.Printf("%s Using container IP %s from '%s' network\n", color.Checkmark(), containerIP, network)
+				if shouldPrint {
+					fmt.Printf("%s Using container IP %s from '%s' network\n", color.Checkmark(), containerIP, network)
+				}
 				patchedConfig := kubeconfig
 
 				// Replace hostname with container IP:6443

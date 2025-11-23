@@ -5,9 +5,11 @@
 ## Table of Contents
 
 - [Description](#description)
+- [Demo](#demo)
 - [Installation](#installation)
   - [Prerequisites](#prerequisites)
   - [Build from Source](#build-from-source)
+  - [Shell Completion](#shell-completion)
 - [Quick Start](#quick-start)
 - [Usage](#usage)
   - [Commands](#commands)
@@ -19,6 +21,7 @@
     - [`kraze validate`](#kraze-validate)
     - [`kraze load-image <image...>`](#kraze-load-image-image)
     - [`kraze version`](#kraze-version)
+    - [`kraze completion [bash|zsh|fish|powershell]`](#kraze-completion-bashzshfishpowershell)
   - [Configuration File Reference](#configuration-file-reference)
   - [Environment Variables](#environment-variables)
   - [Global Flags](#global-flags)
@@ -39,6 +42,20 @@ kraze is a Kubernetes development environment manager that brings the familiar d
 - **Clean Teardown** - Removes all resources including CRDS, namespaces, and PVCs
 - **State Management** - Tracks what's installed to enable incremental updates
 - **docker-compose UX** - Familiar commands: `up`, `down`, `status`
+
+## Demo
+
+Watch kraze orchestrate a full microservices stack with dependencies, Helm charts, and custom manifests:
+
+![kraze up demo](./docs/demo.gif)
+
+The interactive UI shows real-time progress with:
+- **Live status updates** - All services visible at once with in-place updates
+- **Animated spinners** - Visual feedback during installation and resource loading
+- **Dependency ordering** - Services start automatically in the correct sequence
+- **Clean output** - No scrolling clutter, just clear status for each service
+
+> **Tip:** Use `--plain` for traditional scrolling output or `-v` for detailed verbose logging.
 
 ## Installation
 
@@ -62,6 +79,54 @@ make build
 
 # Optional: Install to system path
 make install
+```
+
+### Shell Completion
+
+kraze supports shell completion for bash, zsh, fish, and PowerShell.
+
+**Bash:**
+```bash
+# Load completion for current session
+source <(kraze completion bash)
+
+# Install permanently (Linux)
+kraze completion bash | sudo tee /etc/bash_completion.d/kraze
+
+# Install permanently (macOS with Homebrew)
+kraze completion bash > $(brew --prefix)/etc/bash_completion.d/kraze
+```
+
+**Zsh:**
+```bash
+# Enable completion if not already enabled
+echo "autoload -U compinit; compinit" >> ~/.zshrc
+
+# Install completion
+mkdir -p ~/.zsh/completions
+kraze completion zsh > ~/.zsh/completions/_kraze
+
+# Add to .zshrc if not present
+echo 'fpath=(~/.zsh/completions $fpath)' >> ~/.zshrc
+
+# Restart shell or reload
+source ~/.zshrc
+```
+
+**Fish:**
+```bash
+# Install completion
+mkdir -p ~/.config/fish/completions
+kraze completion fish > ~/.config/fish/completions/kraze.fish
+```
+
+**PowerShell:**
+```powershell
+# Load for current session
+kraze completion powershell | Out-String | Invoke-Expression
+
+# Add to profile for all sessions
+kraze completion powershell >> $PROFILE
 ```
 
 ## Quick Start
@@ -229,6 +294,25 @@ Display version information.
 ```bash
 kraze version
 ```
+
+#### `kraze completion [bash|zsh|fish|powershell]`
+Generate shell completion scripts.
+
+```bash
+# Bash
+kraze completion bash > /etc/bash_completion.d/kraze
+
+# Zsh
+kraze completion zsh > ~/.zsh/completions/_kraze
+
+# Fish
+kraze completion fish > ~/.config/fish/completions/kraze.fish
+
+# PowerShell
+kraze completion powershell >> $PROFILE
+```
+
+See [Shell Completion](#shell-completion) section for detailed installation instructions.
 
 ### Configuration File Reference
 

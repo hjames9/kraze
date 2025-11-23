@@ -141,12 +141,16 @@ func (helm *HelmProvider) Install(ctx context.Context, service *config.ServiceCo
 			upgradeClient.Version = service.Version
 		}
 
-		fmt.Printf("Upgrading Helm chart '%s' in namespace '%s'...\n", service.Name, service.GetNamespace())
+		if !helm.opts.Quiet {
+			fmt.Printf("Upgrading Helm chart '%s' in namespace '%s'...\n", service.Name, service.GetNamespace())
+		}
 		rel, err = upgradeClient.RunWithContext(ctx, service.Name, chart, values)
 		if err != nil {
 			return fmt.Errorf("failed to upgrade chart: %w", err)
 		}
-		fmt.Printf("%s Chart '%s' upgraded successfully\n", color.Checkmark(), service.Name)
+		if !helm.opts.Quiet {
+			fmt.Printf("%s Chart '%s' upgraded successfully\n", color.Checkmark(), service.Name)
+		}
 	} else {
 		// Install new release
 		installClient := action.NewInstall(actionConfig)
@@ -167,12 +171,16 @@ func (helm *HelmProvider) Install(ctx context.Context, service *config.ServiceCo
 			installClient.Version = service.Version
 		}
 
-		fmt.Printf("Installing Helm chart '%s' in namespace '%s'...\n", service.Name, service.GetNamespace())
+		if !helm.opts.Quiet {
+			fmt.Printf("Installing Helm chart '%s' in namespace '%s'...\n", service.Name, service.GetNamespace())
+		}
 		rel, err = installClient.RunWithContext(ctx, chart, values)
 		if err != nil {
 			return fmt.Errorf("failed to install chart: %w", err)
 		}
-		fmt.Printf("%s Chart '%s' installed successfully\n", color.Checkmark(), service.Name)
+		if !helm.opts.Quiet {
+			fmt.Printf("%s Chart '%s' installed successfully\n", color.Checkmark(), service.Name)
+		}
 	}
 
 	// Inject config checksums to force rollouts when ConfigMaps/Secrets change
@@ -238,7 +246,9 @@ func (helm *HelmProvider) Uninstall(ctx context.Context, service *config.Service
 	// DisableHooks is false by default (run hooks)
 	client.DisableHooks = false
 
-	fmt.Printf("Uninstalling Helm release '%s' from namespace '%s'...\n", service.Name, service.GetNamespace())
+	if !helm.opts.Quiet {
+		fmt.Printf("Uninstalling Helm release '%s' from namespace '%s'...\n", service.Name, service.GetNamespace())
+	}
 
 	// Show CRD behavior if verbose or if CRDs will be deleted
 	if !keepCRDs {
@@ -269,7 +279,9 @@ func (helm *HelmProvider) Uninstall(ctx context.Context, service *config.Service
 		return fmt.Errorf("failed to uninstall chart: %w", err)
 	}
 
-	fmt.Printf("%s Release '%s' uninstalled successfully\n", color.Checkmark(), service.Name)
+	if !helm.opts.Quiet {
+		fmt.Printf("%s Release '%s' uninstalled successfully\n", color.Checkmark(), service.Name)
+	}
 
 	// Delete CRDs if requested
 	if !keepCRDs && len(releaseCRDs) > 0 {
