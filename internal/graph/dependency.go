@@ -94,6 +94,79 @@ func (graph *DependencyGraph) TopologicalSort() ([]*config.ServiceConfig, error)
 	return result, nil
 }
 
+// TopologicalSortByLevel returns services grouped by dependency level
+// Services in the same level have no dependencies on each other and can be installed in parallel
+// Level 0 has no dependencies, Level 1 depends only on Level 0, etc.
+func (graph *DependencyGraph) TopologicalSortByLevel() ([][]*config.ServiceConfig, error) {
+	// Detect cycles first
+	if cycle := graph.detectCycle(); cycle != nil {
+		return nil, fmt.Errorf("circular dependency detected: %s", formatCycle(cycle))
+	}
+
+	// Calculate in-degrees
+	inDegree := make(map[string]int)
+	for name, deps := range graph.edges {
+		if _, exists := inDegree[name]; !exists {
+			inDegree[name] = 0
+		}
+		inDegree[name] += len(deps)
+	}
+
+	// Ensure all services are in inDegree map
+	for name := range graph.services {
+		if _, exists := inDegree[name]; !exists {
+			inDegree[name] = 0
+		}
+	}
+
+	// Process level by level
+	var levels [][]*config.ServiceConfig
+	processed := 0
+
+	for processed < len(graph.services) {
+		// Find all services with in-degree 0 (no remaining dependencies)
+		currentLevel := []*config.ServiceConfig{}
+		currentLevelNames := []string{}
+
+		for name, degree := range inDegree {
+			if degree == 0 {
+				currentLevel = append(currentLevel, graph.services[name])
+				currentLevelNames = append(currentLevelNames, name)
+			}
+		}
+
+		if len(currentLevel) == 0 {
+			// No progress possible - shouldn't happen after cycle detection
+			return nil, fmt.Errorf("failed to resolve all dependencies")
+		}
+
+		levels = append(levels, currentLevel)
+		processed += len(currentLevel)
+
+		// Remove processed services and update in-degrees
+		for _, name := range currentLevelNames {
+			delete(inDegree, name)
+		}
+
+		// Decrement in-degrees for services that depended on current level
+		for name, deps := range graph.edges {
+			if _, exists := inDegree[name]; !exists {
+				continue // Already processed
+			}
+			for _, dep := range deps {
+				for _, levelName := range currentLevelNames {
+					if dep == levelName {
+						inDegree[name]--
+						break
+					}
+				}
+			}
+		}
+	}
+
+	return levels, nil
+}
+
 // ReverseTopologicalSort returns services in reverse dependency order
 // (dependents first, for safe uninstallation)
 func (graph *DependencyGraph) ReverseTopologicalSort() ([]*config.ServiceConfig, error) {

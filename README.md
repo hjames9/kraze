@@ -16,6 +16,7 @@
     - [`kraze up [services...]`](#kraze-up-services)
     - [`kraze down [services...]`](#kraze-down-services)
     - [`kraze status`](#kraze-status)
+    - [`kraze plan [services...]`](#kraze-plan-services)
     - [`kraze init`](#kraze-init)
     - [`kraze destroy`](#kraze-destroy)
     - [`kraze validate`](#kraze-validate)
@@ -243,6 +244,50 @@ kraze status
 
 # Verbose output
 kraze status -v
+```
+
+#### `kraze plan [services...]`
+Show a detailed plan of what would be installed or changed without actually executing.
+
+```bash
+# Plan all services
+kraze plan
+
+# Plan specific services (includes dependencies)
+kraze plan frontend
+
+# Plan services with labels
+kraze plan --label env=prod
+
+# Use custom config
+kraze plan -f dev.yml
+```
+
+**Output includes:**
+- Services to be added, changed, or unchanged
+- Dependency levels and parallel execution groups
+- Namespaces that would be created
+- Cluster status and configuration
+
+**Example output:**
+```
+Cluster: deps-cluster
+  Status: no, will be created
+
+Services to install: 4
+
+Level 0 (parallel installation):
+  + postgres (add) - helm chart postgresql@15.5.38
+    + Namespace: data (will be created)
+  + redis (add) - helm chart redis@20.2.1
+    + Namespace: data (will be created)
+
+Level 1:
+  + backend (add) - manifests from remote URL
+    + Namespace: app (will be created)
+      Depends on: postgres, redis
+
+Plan: 2 to add
 ```
 
 #### `kraze init`

@@ -3,6 +3,7 @@ package cli
 import (
 	"context"
 	"fmt"
+	"sync"
 	"time"
 
 	"github.com/hjames9/kraze/internal/cluster"
@@ -94,10 +95,16 @@ func runUp(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("dependency validation failed: %w", err)
 	}
 
-	// Get installation order (topological sort)
-	orderedServices, err := depGraph.TopologicalSort()
+	// Get installation order grouped by dependency level (for parallel installation)
+	serviceLevels, err := depGraph.TopologicalSortByLevel()
 	if err != nil {
 		return fmt.Errorf("failed to resolve dependencies: %w", err)
+	}
+
+	// Flatten for progress tracking
+	var orderedServices []*config.ServiceConfig
+	for _, level := range serviceLevels {
+		orderedServices = append(orderedServices, level...)
 	}
 
 	// Create progress manager
@@ -165,216 +172,63 @@ func runUp(cmd *cobra.Command, args []string) error {
 	}
 
 	successCount := 0
+	serviceIndex := 0
 
-	// Install each service in dependency order
-	for itr, svc := range orderedServices {
-		// Update progress to show we're installing this service
-		progress.UpdateService(itr, svc.Name, ui.StatusInstalling, fmt.Sprintf("(%s)", svc.Type))
-		progress.Verbose("Installing '%s' (%s)...", svc.Name, svc.Type)
+	// Install services level by level (parallel within each level)
+	for levelNum, level := range serviceLevels {
+		progress.Verbose("Installing level %d with %d service(s)", levelNum, len(level))
 
-		// Determine wait behavior for this service (precedence: service config > CLI flag)
-		serviceWait := globalWait
-		if svc.Wait != nil {
-			serviceWait = *svc.Wait
-			progress.Verbose("Service '%s' has wait=%v configured", svc.Name, serviceWait)
-		}
+		if len(level) == 1 {
+			// Single service - install sequentially without goroutine overhead
+			svc := level[0]
+			itr := serviceIndex
 
-		// Determine timeout for this service (precedence: service config > CLI flag)
-		serviceTimeout := globalTimeout
-		if svc.WaitTimeout != "" {
-			serviceTimeout = svc.WaitTimeout
-			progress.Verbose("Service '%s' has wait_timeout=%s configured", svc.Name, serviceTimeout)
-		}
-
-		// Create provider options
-		providerOpts := &providers.ProviderOptions{
-			ClusterName: cfg.Cluster.Name,
-			KubeConfig:  kubeconfig,
-			Wait:        serviceWait,
-			Timeout:     serviceTimeout,
-			Verbose:     verbose,
-			Quiet:       !verbose, // Suppress intermediate output unless verbose
-		}
-
-		// Create provider for this service
-		provider, err := providers.NewProvider(svc, providerOpts)
-		if err != nil {
-			return fmt.Errorf("failed to create provider for '%s': %w", svc.Name, err)
-		}
-
-		// Extract images from service configuration
-		serviceImages, err := imgMgr.GetImagesForService(ctx, svc, kubeconfig)
-		if err != nil {
-			progress.Verbose("Warning: failed to extract images for '%s': %v", svc.Name, err)
-			serviceImages = []string{}
-		}
-
-		if len(serviceImages) > 0 {
-			progress.Verbose("Detected %d image(s) for service '%s': %v", len(serviceImages), svc.Name, serviceImages)
-
-			// Get image info and hashes for all detected images
-			imageHashes := make(map[string]string)
-			localImages := make([]string, 0)
-
-			for _, img := range serviceImages {
-				imgInfo, err := imgMgr.GetImageInfo(ctx, img)
-				if err != nil {
-					progress.Verbose("Warning: failed to get info for image '%s': %v", img, err)
-					continue
-				}
-
-				// Store the hash
-				if imgInfo.SHA256 != "" {
-					imageHashes[img] = imgInfo.SHA256
-				}
-
-				// Collect local images
-				if imgInfo.IsLocal {
-					localImages = append(localImages, img)
-				}
+			if err := installService(ctx, svc, itr, cfg, kubeconfig, st, stateFilePath, kindMgr, imgMgr, progress, globalWait, globalTimeout, verbose); err != nil {
+				return err
 			}
+			successCount++
+			serviceIndex++
+		} else {
+			// Multiple services - install in parallel
+			var wg sync.WaitGroup
+			errChan := make(chan error, len(level))
+			successChan := make(chan bool, len(level))
 
-			// Determine which images need to be loaded
-			imagesToLoad := make([]string, 0)
-			imagesToPull := make([]string, 0)
+			for _, svc := range level {
+				wg.Add(1)
+				itr := serviceIndex
+				serviceIndex++
 
-			// Separate local images (already in Docker) from remote images (need to pull)
-			for _, img := range serviceImages {
-				currentHash := imageHashes[img]
-				imgInfo, _ := imgMgr.GetImageInfo(ctx, img)
+				go func(service *config.ServiceConfig, idx int) {
+					defer wg.Done()
 
-				if imgInfo != nil && imgInfo.IsLocal {
-					// Image is local - check if it needs to be loaded into cluster
-					// For external clusters, fall back to state file comparison (can't inspect cluster directly)
-					// For kind clusters, compare with actual cluster image hash
-					needsLoad := false
-					if cfg.Cluster.IsExternal() {
-						// External cluster - use state file comparison
-						needsLoad = st.HasImageHashChanged(svc.Name, img, currentHash)
-						if needsLoad {
-							progress.Verbose("Image '%s' changed (state file), but external cluster - skipping auto-load", img)
-							needsLoad = false // Can't auto-load to external clusters
-						} else {
-							progress.Verbose("Image '%s' unchanged (hash matches state), skipping", img)
-						}
+					if err := installService(ctx, service, idx, cfg, kubeconfig, st, stateFilePath, kindMgr, imgMgr, progress, globalWait, globalTimeout, verbose); err != nil {
+						errChan <- err
 					} else {
-						// Kind cluster - compare with actual cluster
-						clusterHash, err := imgMgr.GetClusterImageHash(ctx, cfg.Cluster.Name, img)
-						if err != nil {
-							progress.Verbose("Warning: failed to get cluster image hash for '%s': %v", img, err)
-							// On error, load to be safe
-							needsLoad = true
-						} else if clusterHash == "" {
-							// Image not in cluster yet
-							progress.Verbose("Image '%s' not found in cluster, will load", img)
-							needsLoad = true
-						} else if clusterHash != currentHash {
-							// Image exists but hash differs - needs reload
-							progress.Verbose("Image '%s' changed (cluster: %s, local: %s), will reload", img, clusterHash[:12], currentHash[:12])
-							needsLoad = true
-						} else {
-							progress.Verbose("Image '%s' unchanged (hash matches cluster), skipping load", img)
-						}
+						successChan <- true
 					}
-
-					if needsLoad {
-						imagesToLoad = append(imagesToLoad, img)
-					}
-				} else {
-					// Image is not local - need to pull it first
-					imagesToPull = append(imagesToPull, img)
-				}
+				}(svc, itr)
 			}
 
-			// Pull remote images first
-			if len(imagesToPull) > 0 {
-				progress.UpdateService(itr, svc.Name, ui.StatusInstalling, fmt.Sprintf("Pulling %d image(s)", len(imagesToPull)))
-				for _, img := range imagesToPull {
-					progress.Verbose("Pulling image '%s'...", img)
-					if err := kindMgr.PullImage(ctx, img); err != nil {
-						progress.Verbose("Warning: failed to pull image '%s': %v", img, err)
-					} else {
-						progress.Verbose("%s Image '%s' pulled", color.Checkmark(), img)
-						// Add to load list after successful pull
-						imagesToLoad = append(imagesToLoad, img)
-					}
-				}
+			// Wait for all services in this level to complete
+			wg.Wait()
+			close(errChan)
+			close(successChan)
+
+			// Check for errors (fail-fast)
+			if len(errChan) > 0 {
+				return <-errChan
 			}
 
-			// Load images that need to be loaded
-			if len(imagesToLoad) > 0 {
-				progress.UpdateService(itr, svc.Name, ui.StatusInstalling, fmt.Sprintf("Loading %d image(s)", len(imagesToLoad)))
-
-				for _, img := range imagesToLoad {
-					progress.Verbose("Loading image '%s'...", img)
-					if err := kindMgr.LoadImage(ctx, cfg.Cluster.Name, img); err != nil {
-						// Don't fail the installation if image loading fails
-						// The image might be available in a registry
-						progress.Verbose("Warning: failed to load image '%s': %v", img, err)
-					} else {
-						progress.Verbose("%s Image '%s' loaded", color.Checkmark(), img)
-					}
-				}
-
-				progress.Verbose("%s Images loaded successfully", color.Checkmark())
-			} else if len(localImages) > 0 {
-				progress.Verbose("All %d local image(s) already loaded (hashes match)", len(localImages))
-			}
-
-			// Store image hashes in state for future comparisons
-			if len(imageHashes) > 0 {
-				// We'll update the state with image hashes after installation
-				defer func(serviceName string, hashes map[string]string) {
-					if svc, exists := st.Services[serviceName]; exists {
-						svc.ImageHashes = hashes
-						st.Services[serviceName] = svc
-						st.Save(stateFilePath)
-					}
-				}(svc.Name, imageHashes)
-			}
+			// Count successes
+			successCount += len(successChan)
 		}
 
-		// Check if namespace exists before installing (to track if we'll create it)
-		namespace := svc.GetNamespace()
-		namespaceExists, err := providers.CheckNamespaceExists(ctx, kubeconfig, namespace)
-		if err != nil {
-			progress.Verbose("Warning: failed to check if namespace '%s' exists: %v", namespace, err)
-			namespaceExists = false
-		}
-
-		// We will create the namespace if:
-		// 1. It doesn't exist AND
-		// 2. create_namespace is true (which is now the default)
-		willCreateNamespace := !namespaceExists && svc.ShouldCreateNamespace()
-
-		// Update status to show we're applying resources
-		progress.UpdateService(itr, svc.Name, ui.StatusInstalling, "Applying resources")
-
-		// Install the service
-		if err := provider.Install(ctx, svc); err != nil {
-			progress.UpdateService(itr, svc.Name, ui.StatusFailed, err.Error())
-			return fmt.Errorf("failed to install '%s': %w", svc.Name, err)
-		}
-
-		// Update state with namespace tracking
-		st.MarkServiceInstalledWithNamespace(svc.Name, namespace, willCreateNamespace)
-		if err := st.Save(stateFilePath); err != nil {
-			progress.Verbose("Warning: failed to save state: %v", err)
-		}
-
-		// Mark service as ready
-		progress.UpdateService(itr, svc.Name, ui.StatusReady, "Deployed")
-		successCount++
-
-		// Apply post-ready delay (defaults to 3 seconds)
-		// This helps with kube-proxy propagation and service endpoint readiness
-		delay, err := svc.GetPostReadyDelay()
-		if err != nil {
-			progress.Verbose("Warning: %v, using default 3s delay", err)
-			delay = 3 * time.Second
-		}
-		if delay > 0 {
-			progress.Verbose("Waiting %v for service to stabilize...", delay)
+		// Apply post-ready delay after each level
+		// This helps ensure all services in the level are stable before starting the next level
+		if levelNum < len(serviceLevels)-1 {
+			delay := 3 * time.Second
+			progress.Verbose("Level %d complete, waiting %v before next level...", levelNum, delay)
 			time.Sleep(delay)
 		}
 	}
@@ -384,6 +238,240 @@ func runUp(cmd *cobra.Command, args []string) error {
 
 	fmt.Printf("\nTo check status: kraze status\n")
 	fmt.Printf("To tear down:    kraze down\n")
+
+	return nil
+}
+
+// Mutex for protecting shared resources during parallel installation
+var (
+	dockerMutex sync.Mutex
+	stateMutex  sync.Mutex
+)
+
+// installService installs a single service - can be called from a goroutine
+func installService(
+	ctx context.Context,
+	svc *config.ServiceConfig,
+	serviceIndex int,
+	cfg *config.Config,
+	kubeconfig string,
+	st *state.State,
+	stateFilePath string,
+	kindMgr *cluster.KindManager,
+	imgMgr *cluster.ImageManager,
+	progress ui.ProgressManager,
+	globalWait bool,
+	globalTimeout string,
+	verbose bool,
+) error {
+	// Update progress to show we're installing this service
+	progress.UpdateService(serviceIndex, svc.Name, ui.StatusInstalling, fmt.Sprintf("(%s)", svc.Type))
+	progress.Verbose("Installing '%s' (%s)...", svc.Name, svc.Type)
+
+	// Determine wait behavior for this service (precedence: service config > CLI flag)
+	serviceWait := globalWait
+	if svc.Wait != nil {
+		serviceWait = *svc.Wait
+		progress.Verbose("Service '%s' has wait=%v configured", svc.Name, serviceWait)
+	}
+
+	// Determine timeout for this service (precedence: service config > CLI flag)
+	serviceTimeout := globalTimeout
+	if svc.WaitTimeout != "" {
+		serviceTimeout = svc.WaitTimeout
+		progress.Verbose("Service '%s' has wait_timeout=%s configured", svc.Name, serviceTimeout)
+	}
+
+	// Create provider options
+	providerOpts := &providers.ProviderOptions{
+		ClusterName: cfg.Cluster.Name,
+		KubeConfig:  kubeconfig,
+		Wait:        serviceWait,
+		Timeout:     serviceTimeout,
+		Verbose:     verbose,
+		Quiet:       !verbose, // Suppress intermediate output unless verbose
+	}
+
+	// Create provider for this service
+	provider, err := providers.NewProvider(svc, providerOpts)
+	if err != nil {
+		return fmt.Errorf("failed to create provider for '%s': %w", svc.Name, err)
+	}
+
+	// Extract images from service configuration (read-only, no lock needed)
+	serviceImages, err := imgMgr.GetImagesForService(ctx, svc, kubeconfig)
+	if err != nil {
+		progress.Verbose("Warning: failed to extract images for '%s': %v", svc.Name, err)
+		serviceImages = []string{}
+	}
+
+	if len(serviceImages) > 0 {
+		// Lock for Docker operations (pull/load) to avoid race conditions
+		dockerMutex.Lock()
+
+		progress.Verbose("Detected %d image(s) for service '%s': %v", len(serviceImages), svc.Name, serviceImages)
+
+		// Get image info and hashes for all detected images
+		imageHashes := make(map[string]string)
+		localImages := make([]string, 0)
+
+		for _, img := range serviceImages {
+			imgInfo, err := imgMgr.GetImageInfo(ctx, img)
+			if err != nil {
+				progress.Verbose("Warning: failed to get info for image '%s': %v", img, err)
+				continue
+			}
+
+			// Store the hash
+			if imgInfo.SHA256 != "" {
+				imageHashes[img] = imgInfo.SHA256
+			}
+
+			// Collect local images
+			if imgInfo.IsLocal {
+				localImages = append(localImages, img)
+			}
+		}
+
+		// Determine which images need to be loaded
+		imagesToLoad := make([]string, 0)
+		imagesToPull := make([]string, 0)
+
+		// Separate local images (already in Docker) from remote images (need to pull)
+		for _, img := range serviceImages {
+			currentHash := imageHashes[img]
+			imgInfo, _ := imgMgr.GetImageInfo(ctx, img)
+
+			if imgInfo != nil && imgInfo.IsLocal {
+				// Image is local - check if it needs to be loaded into cluster
+				needsLoad := false
+				if cfg.Cluster.IsExternal() {
+					// External cluster - use state file comparison
+					needsLoad = st.HasImageHashChanged(svc.Name, img, currentHash)
+					if needsLoad {
+						progress.Verbose("Image '%s' changed (state file), but external cluster - skipping auto-load", img)
+						needsLoad = false
+					} else {
+						progress.Verbose("Image '%s' unchanged (hash matches state), skipping", img)
+					}
+				} else {
+					// Kind cluster - compare with actual cluster
+					clusterHash, err := imgMgr.GetClusterImageHash(ctx, cfg.Cluster.Name, img)
+					if err != nil {
+						progress.Verbose("Warning: failed to get cluster image hash for '%s': %v", img, err)
+						needsLoad = true
+					} else if clusterHash == "" {
+						progress.Verbose("Image '%s' not found in cluster, will load", img)
+						needsLoad = true
+					} else if clusterHash != currentHash {
+						progress.Verbose("Image '%s' changed (cluster: %s, local: %s), will reload", img, clusterHash[:12], currentHash[:12])
+						needsLoad = true
+					} else {
+						progress.Verbose("Image '%s' unchanged (hash matches cluster), skipping load", img)
+					}
+				}
+
+				if needsLoad {
+					imagesToLoad = append(imagesToLoad, img)
+				}
+			} else {
+				// Image is not local - need to pull it first
+				imagesToPull = append(imagesToPull, img)
+			}
+		}
+
+		// Pull remote images first
+		if len(imagesToPull) > 0 {
+			progress.UpdateService(serviceIndex, svc.Name, ui.StatusInstalling, fmt.Sprintf("Pulling %d image(s)", len(imagesToPull)))
+			for _, img := range imagesToPull {
+				progress.Verbose("Pulling image '%s'...", img)
+				if err := kindMgr.PullImage(ctx, img); err != nil {
+					progress.Verbose("Warning: failed to pull image '%s': %v", img, err)
+				} else {
+					progress.Verbose("%s Image '%s' pulled", color.Checkmark(), img)
+					imagesToLoad = append(imagesToLoad, img)
+				}
+			}
+		}
+
+		// Load images that need to be loaded
+		if len(imagesToLoad) > 0 {
+			progress.UpdateService(serviceIndex, svc.Name, ui.StatusInstalling, fmt.Sprintf("Loading %d image(s)", len(imagesToLoad)))
+
+			for _, img := range imagesToLoad {
+				progress.Verbose("Loading image '%s'...", img)
+				if err := kindMgr.LoadImage(ctx, cfg.Cluster.Name, img); err != nil {
+					progress.Verbose("Warning: failed to load image '%s': %v", img, err)
+				} else {
+					progress.Verbose("%s Image '%s' loaded", color.Checkmark(), img)
+				}
+			}
+
+			progress.Verbose("%s Images loaded successfully", color.Checkmark())
+		} else if len(localImages) > 0 {
+			progress.Verbose("All %d local image(s) already loaded (hashes match)", len(localImages))
+		}
+
+		dockerMutex.Unlock()
+
+		// Store image hashes in state for future comparisons
+		if len(imageHashes) > 0 {
+			defer func(serviceName string, hashes map[string]string) {
+				stateMutex.Lock()
+				defer stateMutex.Unlock()
+				if svc, exists := st.Services[serviceName]; exists {
+					svc.ImageHashes = hashes
+					st.Services[serviceName] = svc
+					st.Save(stateFilePath)
+				}
+			}(svc.Name, imageHashes)
+		}
+	}
+
+	// Check if namespace exists before installing (to track if we'll create it)
+	namespace := svc.GetNamespace()
+	namespaceExists, err := providers.CheckNamespaceExists(ctx, kubeconfig, namespace)
+	if err != nil {
+		progress.Verbose("Warning: failed to check if namespace '%s' exists: %v", namespace, err)
+		namespaceExists = false
+	}
+
+	// We will create the namespace if:
+	// 1. It doesn't exist AND
+	// 2. create_namespace is true (which is now the default)
+	willCreateNamespace := !namespaceExists && svc.ShouldCreateNamespace()
+
+	// Update status to show we're applying resources
+	progress.UpdateService(serviceIndex, svc.Name, ui.StatusInstalling, "Applying resources")
+
+	// Install the service
+	if err := provider.Install(ctx, svc); err != nil {
+		progress.UpdateService(serviceIndex, svc.Name, ui.StatusFailed, err.Error())
+		return fmt.Errorf("failed to install '%s': %w", svc.Name, err)
+	}
+
+	// Update state with namespace tracking (protected by mutex)
+	stateMutex.Lock()
+	st.MarkServiceInstalledWithNamespace(svc.Name, namespace, willCreateNamespace)
+	if err := st.Save(stateFilePath); err != nil {
+		progress.Verbose("Warning: failed to save state: %v", err)
+	}
+	stateMutex.Unlock()
+
+	// Mark service as ready
+	progress.UpdateService(serviceIndex, svc.Name, ui.StatusReady, "Deployed")
+
+	// Apply post-ready delay (defaults to 3 seconds)
+	// This helps with kube-proxy propagation and service endpoint readiness
+	delay, err := svc.GetPostReadyDelay()
+	if err != nil {
+		progress.Verbose("Warning: %v, using default 3s delay", err)
+		delay = 3 * time.Second
+	}
+	if delay > 0 {
+		progress.Verbose("Waiting %v for service to stabilize...", delay)
+		time.Sleep(delay)
+	}
 
 	return nil
 }

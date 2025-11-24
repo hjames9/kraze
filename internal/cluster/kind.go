@@ -226,8 +226,8 @@ func (kind *KindManager) patchKubeconfigWithContainerIP(clusterName, kubeconfig 
 // UpdateKubeconfigFile updates ~/.kube/config with cluster access, patched for dev container compatibility
 // This ensures kubectl works inside dev containers by using container IP instead of 127.0.0.1
 func (kind *KindManager) UpdateKubeconfigFile(clusterName string) error {
-	// Get patched kubeconfig with container IP
-	kubeconfigContent, err := kind.GetKubeConfig(clusterName, true)
+	// Get patched kubeconfig with container IP (quiet mode to avoid duplicate messages)
+	kubeconfigContent, err := kind.GetKubeConfigQuiet(clusterName, true, true)
 	if err != nil {
 		return fmt.Errorf("failed to get kubeconfig: %w", err)
 	}

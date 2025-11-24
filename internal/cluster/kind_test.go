@@ -310,7 +310,7 @@ func TestPatchKubeconfigWithContainerIP(test *testing.T) {
 		test.Run(tt.name, func(test *testing.T) {
 			// Note: This will fail if Docker is not running or container doesn't exist
 			// That's expected for unit tests - we're just testing the logic
-			result, err := km.patchKubeconfigWithContainerIP(tt.clusterName, tt.kubeconfig)
+			result, err := km.patchKubeconfigWithContainerIP(tt.clusterName, tt.kubeconfig, "")
 
 			// If patching succeeds (Docker available, container exists)
 			if err == nil {
