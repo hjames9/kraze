@@ -137,13 +137,20 @@ func runDown(cmd *cobra.Command, args []string) error {
 	}
 
 	// Collect namespaces to clean up BEFORE uninstalling (since uninstall removes from state)
-	// When uninstalling all services, clean up ALL namespaces used by kraze (not just created ones)
-	// When uninstalling specific services, only clean up namespaces we created (be conservative)
+	// For local dev environments, aggressively clean up namespaces when uninstalling services
+	// - When uninstalling specific services: clean up namespaces used by those services (if no other services need them)
+	// - When uninstalling all services: clean up ALL namespaces (nothing will be using them)
 	var namespacesToCleanup map[string]int
 	if specificServicesRequested {
-		namespacesToCleanup = st.GetCreatedNamespaces()
+		// Get list of service names being uninstalled
+		var serviceNames []string
+		for _, svc := range orderedServices {
+			serviceNames = append(serviceNames, svc.Name)
+		}
+		namespacesToCleanup = st.GetNamespacesForServices(serviceNames)
 	} else {
-		namespacesToCleanup = st.GetAllNamespacesUsed()
+		// Uninstalling all services - clean up all namespaces (count will be 0 for all)
+		namespacesToCleanup = st.GetAllNamespacesUsedForCleanup()
 	}
 
 	// Verify cluster exists
@@ -181,7 +188,7 @@ func runDown(cmd *cobra.Command, args []string) error {
 	// Uninstall each service in reverse dependency order
 	for itr, svc := range orderedServices {
 		// Update progress to show we're uninstalling this service
-		progress.UpdateService(itr, svc.Name, ui.StatusInstalling, fmt.Sprintf("(%s)", svc.Type))
+		progress.UpdateService(itr, svc.Name, ui.StatusUninstalling, fmt.Sprintf("(%s)", svc.Type))
 		progress.Verbose("Uninstalling '%s' (%s)...", svc.Name, svc.Type)
 
 		// Create provider options
@@ -214,7 +221,7 @@ func runDown(cmd *cobra.Command, args []string) error {
 		}
 
 		// Update status to show we're removing resources
-		progress.UpdateService(itr, svc.Name, ui.StatusInstalling, "Removing resources")
+		progress.UpdateService(itr, svc.Name, ui.StatusUninstalling, "Removing resources")
 
 		// Uninstall the service
 		if err := provider.Uninstall(ctx, svc); err != nil {
@@ -237,13 +244,23 @@ func runDown(cmd *cobra.Command, args []string) error {
 	// Finish progress display
 	progress.Finish(uninstalledCount)
 
-	// Clean up namespaces we created (if they're empty)
+	// Clean up namespaces
+	// For local dev environments, aggressively delete namespaces used by uninstalled services
+	// Only delete if no other services are using the namespace
 	if len(namespacesToCleanup) > 0 {
-		fmt.Printf("\nCleaning up empty namespaces we created...\n")
+		fmt.Printf("\nCleaning up namespaces...\n")
 		deletedNamespaces := 0
+		skippedNamespaces := 0
 
-		for ns := range namespacesToCleanup {
-			progress.Verbose("Checking namespace '%s' for cleanup...", ns)
+		for ns, otherServicesCount := range namespacesToCleanup {
+			// Skip namespace if other services are still using it
+			if otherServicesCount > 0 {
+				progress.Verbose("Skipping namespace '%s' (still used by %d other service(s))", ns, otherServicesCount)
+				skippedNamespaces++
+				continue
+			}
+
+			progress.Verbose("Cleaning up namespace '%s'...", ns)
 
 			// Check if namespace still exists
 			exists, err := providers.CheckNamespaceExists(ctx, kubeconfig, ns)
@@ -257,43 +274,28 @@ func runDown(cmd *cobra.Command, args []string) error {
 				continue
 			}
 
-			// Delete PVCs in the namespace (Helm doesn't delete them by default)
-			pvcCount, err := providers.DeletePVCsInNamespace(ctx, kubeconfig, ns)
-			if err != nil {
-				fmt.Printf("%s Warning: failed to delete PVCs in namespace '%s': %v\n", color.Warning(), ns, err)
-				// Continue anyway - maybe we can still delete the namespace
-			} else if pvcCount > 0 {
-				progress.Verbose("Deleted %d PVC(s) from namespace '%s'", pvcCount, ns)
-			}
-
-			// Check if namespace is empty (after PVC deletion)
-			isEmpty, err := providers.IsNamespaceEmpty(ctx, kubeconfig, ns)
-			if err != nil {
-				fmt.Printf("%s Warning: failed to check if namespace '%s' is empty: %v\n", color.Warning(), ns, err)
-				continue
-			}
-
-			if !isEmpty {
-				fmt.Printf("%s Namespace '%s' is not empty, skipping deletion\n", color.Warning(), ns)
-				continue
-			}
-
-			progress.Verbose("Namespace '%s' is empty, deleting...", ns)
-
-			// Delete the namespace
+			// Delete the namespace (cascades to all resources including secrets, configmaps, etc.)
+			// This is aggressive but appropriate for local dev environments
+			progress.Verbose("Deleting namespace '%s' (including all remaining resources)...", ns)
 			if err := providers.DeleteNamespace(ctx, kubeconfig, ns); err != nil {
 				fmt.Printf("%s Warning: failed to delete namespace '%s': %v\n", color.Warning(), ns, err)
 				continue
 			}
 
-			fmt.Printf("%s Deleted empty namespace '%s'\n", color.Checkmark(), ns)
+			fmt.Printf("%s Deleted namespace '%s'\n", color.Checkmark(), ns)
 			deletedNamespaces++
 		}
 
 		if deletedNamespaces > 0 {
-			fmt.Printf("%s Cleaned up %d empty namespace(s)\n", color.Checkmark(), deletedNamespaces)
+			fmt.Printf("%s Deleted %d namespace(s)", color.Checkmark(), deletedNamespaces)
+			if skippedNamespaces > 0 {
+				fmt.Printf(" (skipped %d still in use)", skippedNamespaces)
+			}
+			fmt.Printf("\n")
+		} else if skippedNamespaces > 0 {
+			fmt.Printf("No namespaces deleted (%d still in use by other services)\n", skippedNamespaces)
 		} else {
-			fmt.Printf("No empty namespaces to clean up\n")
+			fmt.Printf("No namespaces to clean up\n")
 		}
 	}
 

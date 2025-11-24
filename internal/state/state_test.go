@@ -203,6 +203,115 @@ func TestGetInstalledServices(test *testing.T) {
 	}
 }
 
+func TestGetNamespacesForServices(test *testing.T) {
+	st := New("test-cluster", false)
+
+	// Setup: Install 3 services in 2 namespaces
+	st.MarkServiceInstalledWithNamespace("argocd", "argocd", true)
+	st.MarkServiceInstalledWithNamespace("redis", "data", false)
+	st.MarkServiceInstalledWithNamespace("postgres", "data", true)
+
+	// Test 1: Uninstalling argocd (only service in argocd namespace)
+	// Should return argocd namespace with count 0 (no other services using it)
+	namespaces := st.GetNamespacesForServices([]string{"argocd"})
+	if len(namespaces) != 1 {
+		test.Errorf("Expected 1 namespace, got %d", len(namespaces))
+	}
+	if count, exists := namespaces["argocd"]; !exists || count != 0 {
+		test.Errorf("Expected argocd namespace with count 0, got count %d, exists %v", count, exists)
+	}
+
+	// Test 2: Uninstalling redis (one of two services in data namespace)
+	// Should return data namespace with count 1 (postgres still using it)
+	namespaces = st.GetNamespacesForServices([]string{"redis"})
+	if len(namespaces) != 1 {
+		test.Errorf("Expected 1 namespace, got %d", len(namespaces))
+	}
+	if count, exists := namespaces["data"]; !exists || count != 1 {
+		test.Errorf("Expected data namespace with count 1, got count %d, exists %v", count, exists)
+	}
+
+	// Test 3: Uninstalling both redis and postgres (all services in data namespace)
+	// Should return data namespace with count 0 (no other services using it)
+	namespaces = st.GetNamespacesForServices([]string{"redis", "postgres"})
+	if len(namespaces) != 1 {
+		test.Errorf("Expected 1 namespace, got %d", len(namespaces))
+	}
+	if count, exists := namespaces["data"]; !exists || count != 0 {
+		test.Errorf("Expected data namespace with count 0, got count %d, exists %v", count, exists)
+	}
+
+	// Test 4: Uninstalling all three services
+	// Should return both namespaces with count 0
+	namespaces = st.GetNamespacesForServices([]string{"argocd", "redis", "postgres"})
+	if len(namespaces) != 2 {
+		test.Errorf("Expected 2 namespaces, got %d", len(namespaces))
+	}
+	if count, exists := namespaces["argocd"]; !exists || count != 0 {
+		test.Errorf("Expected argocd namespace with count 0, got count %d, exists %v", count, exists)
+	}
+	if count, exists := namespaces["data"]; !exists || count != 0 {
+		test.Errorf("Expected data namespace with count 0, got count %d, exists %v", count, exists)
+	}
+}
+
+func TestGetAllNamespacesUsedForCleanup(test *testing.T) {
+	st := New("test-cluster", false)
+
+	// Setup: Install 3 services in 2 namespaces
+	// This simulates the state BEFORE we start uninstalling
+	st.MarkServiceInstalledWithNamespace("argocd", "argocd", true)
+	st.MarkServiceInstalledWithNamespace("metallb", "metallb-system", true)
+	st.MarkServiceInstalledWithNamespace("metallb-l2", "metallb-system", false)
+
+	// Test: GetAllNamespacesUsedForCleanup should return ALL namespaces with count 0
+	// This is used when uninstalling all services (called BEFORE actual uninstall)
+	namespaces := st.GetAllNamespacesUsedForCleanup()
+
+	// Should include both namespaces with count 0
+	// (count is 0 because we're going to uninstall everything)
+	if len(namespaces) != 2 {
+		test.Errorf("Expected 2 namespaces, got %d", len(namespaces))
+	}
+
+	if count, exists := namespaces["argocd"]; !exists || count != 0 {
+		test.Errorf("Expected argocd namespace with count 0, got count %d, exists %v", count, exists)
+	}
+
+	if count, exists := namespaces["metallb-system"]; !exists || count != 0 {
+		test.Errorf("Expected metallb-system namespace with count 0, got count %d, exists %v", count, exists)
+	}
+}
+
+func TestGetAllNamespacesUsed(test *testing.T) {
+	st := New("test-cluster", false)
+
+	// Setup: Install 3 services in 2 namespaces, then uninstall one
+	st.MarkServiceInstalledWithNamespace("argocd", "argocd", true)
+	st.MarkServiceInstalledWithNamespace("metallb", "metallb-system", true)
+	st.MarkServiceInstalledWithNamespace("metallb-l2", "metallb-system", false)
+
+	// Uninstall argocd
+	st.MarkServiceUninstalled("argocd")
+
+	// Test: GetAllNamespacesUsed should only return namespaces with INSTALLED services
+	namespaces := st.GetAllNamespacesUsed()
+
+	// Should only include metallb-system (2 installed services)
+	// argocd namespace should NOT be included (argocd is uninstalled)
+	if len(namespaces) != 1 {
+		test.Errorf("Expected 1 namespace, got %d", len(namespaces))
+	}
+
+	if count, exists := namespaces["metallb-system"]; !exists || count != 2 {
+		test.Errorf("Expected metallb-system namespace with count 2, got count %d, exists %v", count, exists)
+	}
+
+	if _, exists := namespaces["argocd"]; exists {
+		test.Errorf("Did not expect argocd namespace (service is uninstalled)")
+	}
+}
+
 func TestGetStateFilePath(test *testing.T) {
 	path := GetStateFilePath("/test/dir")
 	expected := filepath.Join("/test/dir", StateFileName)

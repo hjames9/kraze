@@ -193,15 +193,25 @@ func runUp(cmd *cobra.Command, args []string) error {
 			itr := serviceIndex
 
 			if err := installService(ctx, svc, itr, cfg, kubeconfig, st, stateFilePath, kindMgr, imgMgr, progress, globalWait, globalTimeout, verbose); err != nil {
-				return err
+				return fmt.Errorf("failed to install service '%s' in level %d: %w", svc.Name, levelNum, err)
 			}
 			successCount++
 			serviceIndex++
 		} else {
-			// Multiple services - install in parallel
+			// Multiple services - install in parallel with cancellation
+			levelCtx, cancel := context.WithCancel(ctx)
+			defer cancel()
+
+			// Service error tracking
+			type serviceError struct {
+				serviceName string
+				err         error
+			}
+
 			var wg sync.WaitGroup
-			errChan := make(chan error, len(level))
+			errChan := make(chan serviceError, len(level))
 			successChan := make(chan bool, len(level))
+			var firstError sync.Once
 
 			for _, svc := range level {
 				wg.Add(1)
@@ -211,8 +221,13 @@ func runUp(cmd *cobra.Command, args []string) error {
 				go func(service *config.ServiceConfig, idx int) {
 					defer wg.Done()
 
-					if err := installService(ctx, service, idx, cfg, kubeconfig, st, stateFilePath, kindMgr, imgMgr, progress, globalWait, globalTimeout, verbose); err != nil {
-						errChan <- err
+					if err := installService(levelCtx, service, idx, cfg, kubeconfig, st, stateFilePath, kindMgr, imgMgr, progress, globalWait, globalTimeout, verbose); err != nil {
+						// Cancel context on first error to stop other installations
+						firstError.Do(func() {
+							progress.Verbose("Service '%s' failed, cancelling other installations in level %d", service.Name, levelNum)
+							cancel()
+						})
+						errChan <- serviceError{serviceName: service.Name, err: err}
 					} else {
 						successChan <- true
 					}
@@ -224,9 +239,10 @@ func runUp(cmd *cobra.Command, args []string) error {
 			close(errChan)
 			close(successChan)
 
-			// Check for errors (fail-fast)
+			// Check for errors (fail-fast with context)
 			if len(errChan) > 0 {
-				return <-errChan
+				svcErr := <-errChan
+				return fmt.Errorf("failed to install service '%s' in level %d: %w", svcErr.serviceName, levelNum, svcErr.err)
 			}
 
 			// Count successes
@@ -315,6 +331,12 @@ func installService(
 	}
 
 	if len(serviceImages) > 0 {
+		// Check if context was cancelled before expensive Docker operations
+		if ctx.Err() != nil {
+			progress.UpdateService(serviceIndex, svc.Name, ui.StatusFailed, "Cancelled")
+			return ctx.Err()
+		}
+
 		// Lock for Docker operations (pull/load) to avoid race conditions
 		dockerMutex.Lock()
 
@@ -449,6 +471,12 @@ func installService(
 	// 1. It doesn't exist AND
 	// 2. create_namespace is true (which is now the default)
 	willCreateNamespace := !namespaceExists && svc.ShouldCreateNamespace()
+
+	// Check if context was cancelled before installing
+	if ctx.Err() != nil {
+		progress.UpdateService(serviceIndex, svc.Name, ui.StatusFailed, "Cancelled")
+		return ctx.Err()
+	}
 
 	// Update status to show we're applying resources
 	progress.UpdateService(serviceIndex, svc.Name, ui.StatusInstalling, "Applying resources")

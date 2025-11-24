@@ -210,17 +210,72 @@ func (state *State) GetCreatedNamespaces() map[string]int {
 	return namespaces
 }
 
-// GetAllNamespacesUsed returns a map of all namespaces used by services
-// The map key is namespace name, value is count of services using it
+// GetAllNamespacesUsed returns a map of all namespaces used by installed services
+// The map key is namespace name, value is count of installed services using it
 // This includes namespaces we created AND namespaces that existed before
 func (state *State) GetAllNamespacesUsed() map[string]int {
 	namespaces := make(map[string]int)
 	for _, svc := range state.Services {
-		if svc.Namespace != "" {
+		if svc.Installed && svc.Namespace != "" {
 			namespaces[svc.Namespace]++
 		}
 	}
 	return namespaces
+}
+
+// GetAllNamespacesUsedForCleanup returns all unique namespaces used by any service
+// For "uninstall all" scenarios, returns map with count 0 for all namespaces
+// since we're uninstalling everything
+func (state *State) GetAllNamespacesUsedForCleanup() map[string]int {
+	namespaces := make(map[string]int)
+	for _, svc := range state.Services {
+		if svc.Namespace != "" {
+			// Set count to 0 since we're cleaning up everything
+			namespaces[svc.Namespace] = 0
+		}
+	}
+	return namespaces
+}
+
+// GetNamespacesForServices returns namespaces used by specific services
+// For local dev environments, we aggressively clean up namespaces when uninstalling services
+// Returns map of namespace name to count of installed services still using it
+func (state *State) GetNamespacesForServices(serviceNames []string) map[string]int {
+	// Get namespaces used by the specified services
+	targetNamespaces := make(map[string]bool)
+	for _, name := range serviceNames {
+		if svc, exists := state.Services[name]; exists && svc.Namespace != "" {
+			targetNamespaces[svc.Namespace] = true
+		}
+	}
+
+	// Count how many OTHER installed services use these namespaces
+	// If count is 0, the namespace can be safely deleted
+	namespaceCounts := make(map[string]int)
+	for ns := range targetNamespaces {
+		count := 0
+		for _, svc := range state.Services {
+			// Skip the services we're uninstalling
+			isTargetService := false
+			for _, name := range serviceNames {
+				if svc.Name == name {
+					isTargetService = true
+					break
+				}
+			}
+			if isTargetService {
+				continue
+			}
+
+			// Count if this namespace is used by an installed service
+			if svc.Installed && svc.Namespace == ns {
+				count++
+			}
+		}
+		namespaceCounts[ns] = count
+	}
+
+	return namespaceCounts
 }
 
 // GetImageHashes returns the stored image hashes for a service

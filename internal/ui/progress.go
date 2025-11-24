@@ -14,12 +14,13 @@ import (
 type ServiceStatus string
 
 const (
-	StatusPending    ServiceStatus = "Pending"
-	StatusWaiting    ServiceStatus = "Waiting"
-	StatusInstalling ServiceStatus = "Installing"
-	StatusReady      ServiceStatus = "Ready"
-	StatusFailed     ServiceStatus = "Failed"
-	StatusSkipped    ServiceStatus = "Skipped"
+	StatusPending      ServiceStatus = "Pending"
+	StatusWaiting      ServiceStatus = "Waiting"
+	StatusInstalling   ServiceStatus = "Installing"
+	StatusUninstalling ServiceStatus = "Uninstalling"
+	StatusReady        ServiceStatus = "Ready"
+	StatusFailed       ServiceStatus = "Failed"
+	StatusSkipped      ServiceStatus = "Skipped"
 )
 
 // Status icons for progress display
@@ -134,7 +135,7 @@ func (ip *InteractiveProgress) redraw() {
 
 		// Clear line and print service status
 		var statusIcon string
-		if svc.status == StatusInstalling {
+		if svc.status == StatusInstalling || svc.status == StatusUninstalling {
 			statusIcon = ip.getSpinnerIcon()
 		} else {
 			statusIcon = getStatusIcon(svc.status)
@@ -242,8 +243,8 @@ func (sp *ScrollingProgress) UpdateService(index int, name string, status Servic
 	statusColor := getStatusColor(status)
 
 	switch status {
-	case StatusInstalling:
-		// Only print the main header once (first time we transition to Installing)
+	case StatusInstalling, StatusUninstalling:
+		// Only print the main header once (first time we transition to Installing/Uninstalling)
 		if !sp.shownHeaders[index] {
 			fmt.Printf("\n[%d/%d] %s '%s'...\n", index+1, sp.total, sp.operation, name)
 			sp.shownHeaders[index] = true
@@ -293,7 +294,7 @@ func getStatusIcon(status ServiceStatus) string {
 		return IconPending
 	case StatusWaiting:
 		return IconWaiting
-	case StatusInstalling:
+	case StatusInstalling, StatusUninstalling:
 		return spinnerFrames[0] // Use first frame for static display (scrolling mode)
 	case StatusReady:
 		return IconReady
@@ -314,7 +315,7 @@ func getStatusColor(status ServiceStatus) func(string) string {
 		return func(s string) string { return color.Red(s) }
 	case StatusWaiting:
 		return func(s string) string { return color.Yellow(s) }
-	case StatusInstalling:
+	case StatusInstalling, StatusUninstalling:
 		return func(s string) string { return color.Cyan(s) }
 	default:
 		return func(s string) string { return s }
