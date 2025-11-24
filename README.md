@@ -323,6 +323,9 @@ The `kraze.yml` file defines your cluster and services:
 cluster:
   name: my-cluster                    # Name of the kind cluster
   version: "1.34.0"                   # Kubernetes version (optional)
+  network: "dev"                      # Docker network name (optional, auto-detected if not specified)
+  ipv4_address: "172.1.0.2"           # Static IPv4 for cluster container (optional)
+  subnet: "172.1.0.0/16"              # Network subnet (optional, creates network if doesn't exist)
   config:                             # kind cluster configuration
     - role: control-plane
       extraPortMappings:              # Expose ports from cluster

@@ -21,7 +21,8 @@ import (
 
 // KindManager manages kind cluster operations
 type KindManager struct {
-	provider *cluster.Provider
+	provider      *cluster.Provider
+	customNetwork string // Custom Docker network name (set during cluster creation)
 }
 
 // NewKindManager creates a new kind cluster manager
@@ -33,6 +34,11 @@ func NewKindManager() *KindManager {
 
 // CreateCluster creates a new kind cluster based on the configuration
 func (kind *KindManager) CreateCluster(ctx context.Context, cfg *config.ClusterConfig) error {
+	// Store custom network name for kubeconfig patching
+	if cfg.Network != "" {
+		kind.customNetwork = cfg.Network
+	}
+
 	// Check if cluster already exists
 	exists, err := kind.ClusterExists(cfg.Name)
 	if err != nil {
@@ -61,7 +67,7 @@ func (kind *KindManager) CreateCluster(ctx context.Context, cfg *config.ClusterC
 	fmt.Printf("%s Cluster '%s' created successfully\n", color.Checkmark(), cfg.Name)
 
 	// Connect cluster to host's Docker network for better connectivity
-	if err := kind.connectToHostNetwork(cfg.Name); err != nil {
+	if err := kind.connectToHostNetwork(cfg.Name, cfg.Network, cfg.Subnet, cfg.IPv4Address); err != nil {
 		// Log warning but continue - cluster might still be accessible
 		fmt.Printf("Warning: Could not connect to host network: %v\n", err)
 	}
@@ -135,7 +141,7 @@ func (kind *KindManager) GetKubeConfigQuiet(clusterName string, internal bool, q
 
 	// Patch the kubeconfig to use the container's IP address
 	// This works in dev containers, CI, and other Docker-in-Docker environments
-	patchedConfig, err := kind.patchKubeconfigWithContainerIP(clusterName, kubeconfig, quiet)
+	patchedConfig, err := kind.patchKubeconfigWithContainerIP(clusterName, kubeconfig, kind.customNetwork, quiet)
 	if err != nil {
 		// If patching fails, fall back to original kubeconfig
 		// This ensures we don't break in normal environments
@@ -147,15 +153,22 @@ func (kind *KindManager) GetKubeConfigQuiet(clusterName string, internal bool, q
 
 // patchKubeconfigWithContainerIP replaces the server address with the container's IP
 // This provides better compatibility across different Docker network configurations
-func (kind *KindManager) patchKubeconfigWithContainerIP(clusterName, kubeconfig string, quiet ...bool) (string, error) {
+func (kind *KindManager) patchKubeconfigWithContainerIP(clusterName, kubeconfig string, customNetwork string, quiet ...bool) (string, error) {
 	shouldPrint := true
 	if len(quiet) > 0 && quiet[0] {
 		shouldPrint = false
 	}
 	containerName := clusterName + "-control-plane"
 
-	// Auto-detect networks to try based on current environment
-	networksToTry := kind.detectNetworks()
+	// Determine networks to try - prioritize custom network if specified
+	var networksToTry []string
+	if customNetwork != "" {
+		// Custom network specified - try it first, then fall back to auto-detect
+		networksToTry = append([]string{customNetwork}, kind.detectNetworks()...)
+	} else {
+		// Auto-detect networks to try based on current environment
+		networksToTry = kind.detectNetworks()
+	}
 
 	for _, network := range networksToTry {
 		cmd := osexec.Command("docker", "inspect", containerName,
@@ -511,13 +524,30 @@ func (kind *KindManager) buildKindNode(node config.KindNode) v1alpha4.Node {
 	return kindNode
 }
 
-// connectToHostNetwork connects the kind cluster to the same network as the current container
+// connectToHostNetwork connects the kind cluster to the specified or auto-detected Docker network
 // This enables connectivity in Docker-in-Docker environments like dev containers
-func (kind *KindManager) connectToHostNetwork(clusterName string) error {
+// Parameters:
+// - clusterName: name of the kind cluster
+// - networkName: explicit network name (optional, auto-detected if empty)
+// - subnet: network subnet for creation (optional, e.g., "172.1.0.0/16")
+// - ipv4Address: static IP for the cluster container (optional)
+func (kind *KindManager) connectToHostNetwork(clusterName string, networkName string, subnet string, ipv4Address string) error {
 	containerName := clusterName + "-control-plane"
 
-	// Auto-detect networks to try
-	networksToTry := kind.detectNetworks()
+	// Determine which networks to try
+	var networksToTry []string
+	if networkName != "" {
+		// Use explicit network name
+		networksToTry = []string{networkName}
+
+		// Ensure the network exists (create if needed and subnet is provided)
+		if err := kind.ensureNetworkExists(networkName, subnet); err != nil {
+			return fmt.Errorf("failed to ensure network '%s' exists: %w", networkName, err)
+		}
+	} else {
+		// Auto-detect networks
+		networksToTry = kind.detectNetworks()
+	}
 
 	for _, network := range networksToTry {
 		// Check if network exists
@@ -527,18 +557,61 @@ func (kind *KindManager) connectToHostNetwork(clusterName string) error {
 		}
 
 		// Try to connect to this network
-		connectCmd := osexec.Command("docker", "network", "connect", network, containerName)
+		var connectCmd *osexec.Cmd
+		if ipv4Address != "" {
+			// Connect with static IP
+			connectCmd = osexec.Command("docker", "network", "connect", "--ip", ipv4Address, network, containerName)
+		} else {
+			// Connect with dynamic IP
+			connectCmd = osexec.Command("docker", "network", "connect", network, containerName)
+		}
+
 		if err := connectCmd.Run(); err != nil {
 			// Might already be connected or other error, try next network
 			continue
 		}
 
-		fmt.Printf("%s Connected cluster to '%s' network for better connectivity\n", color.Checkmark(), network)
+		if ipv4Address != "" {
+			fmt.Printf("%s Connected cluster to '%s' network with IP %s\n", color.Checkmark(), network, ipv4Address)
+		} else {
+			fmt.Printf("%s Connected cluster to '%s' network for better connectivity\n", color.Checkmark(), network)
+		}
 		return nil
 	}
 
 	// No networks worked, return error
 	return fmt.Errorf("could not connect to any common Docker network")
+}
+
+// ensureNetworkExists checks if a Docker network exists and creates it if needed
+func (kind *KindManager) ensureNetworkExists(networkName string, subnet string) error {
+	// Check if network already exists
+	checkCmd := osexec.Command("docker", "network", "inspect", networkName)
+	if err := checkCmd.Run(); err == nil {
+		// Network exists
+		return nil
+	}
+
+	// Network doesn't exist - create it if subnet is provided
+	if subnet == "" {
+		// Can't create without subnet
+		return fmt.Errorf("network '%s' does not exist and no subnet specified", networkName)
+	}
+
+	fmt.Printf("Creating Docker network '%s' with subnet %s...\n", networkName, subnet)
+
+	// Create the network with subnet
+	createCmd := osexec.Command("docker", "network", "create",
+		"--driver", "bridge",
+		"--subnet", subnet,
+		networkName)
+
+	if output, err := createCmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("failed to create network: %w\nOutput: %s", err, string(output))
+	}
+
+	fmt.Printf("%s Created Docker network '%s'\n", color.Checkmark(), networkName)
+	return nil
 }
 
 // detectNetworks detects which Docker networks to use based on the current environment

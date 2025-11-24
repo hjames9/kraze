@@ -20,6 +20,9 @@ type ClusterConfig struct {
 	Networking    *NetworkingConfig      `yaml:"networking,omitempty"`
 	PreloadImages []string               `yaml:"preload_images,omitempty"`
 	External      *ExternalClusterConfig `yaml:"external,omitempty"`
+	Network       string                 `yaml:"network,omitempty"`       // Docker network name (optional, auto-detected if not specified)
+	IPv4Address   string                 `yaml:"ipv4_address,omitempty"`  // Static IPv4 address for cluster container on Docker network
+	Subnet        string                 `yaml:"subnet,omitempty"`        // Docker network subnet (e.g., "172.1.0.0/16") - creates network if it doesn't exist
 }
 
 // KindNode represents a kind node configuration
