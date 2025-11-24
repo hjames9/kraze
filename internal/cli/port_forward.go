@@ -106,6 +106,15 @@ func runPortForward(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("failed to parse config: %w", err)
 	}
 
+	// Check Docker availability (only for kind clusters, not external)
+	if !cfg.Cluster.IsExternal() {
+		Verbose("Checking Docker availability...")
+		if err := cluster.CheckDockerAvailable(ctx); err != nil {
+			return err
+		}
+		Verbose("Docker is available")
+	}
+
 	// Find the service
 	svc, ok := cfg.Services[serviceName]
 	if !ok {

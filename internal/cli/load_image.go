@@ -48,6 +48,13 @@ func runLoadImage(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("failed to parse config: %w", err)
 	}
 
+	// Check Docker availability (load-image always requires Docker/kind)
+	Verbose("Checking Docker availability...")
+	if err := cluster.CheckDockerAvailable(ctx); err != nil {
+		return err
+	}
+	Verbose("Docker is available")
+
 	clusterName := cfg.Cluster.Name
 
 	if verbose {
