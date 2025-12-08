@@ -7,7 +7,6 @@ import (
 	"github.com/hjames9/kraze/internal/cluster"
 	"github.com/hjames9/kraze/internal/config"
 	"github.com/hjames9/kraze/internal/providers"
-	"github.com/hjames9/kraze/internal/state"
 	"github.com/spf13/cobra"
 )
 
@@ -95,19 +94,15 @@ func runStatus(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("failed to get kubeconfig: %w", err)
 	}
 
-	// Load state
-	stateFilePath := state.GetStateFilePath(".")
-	st, err := state.Load(stateFilePath)
-	if err != nil {
-		Verbose("Warning: failed to load state: %v", err)
-		st = state.New(cfg.Cluster.Name, cfg.Cluster.IsExternal())
-	}
-
 	fmt.Printf("Cluster: %s\n\n", cfg.Cluster.Name)
 
 	// Print header
 	fmt.Printf("%-20s %-12s %-10s %-10s %s\n", "SERVICE", "TYPE", "INSTALLED", "READY", "MESSAGE")
 	fmt.Println("--------------------------------------------------------------------------------")
+
+	// Track counts for summary
+	installedCount := 0
+	readyCount := 0
 
 	// Check status of each service
 	for name, svc := range cfg.Services {
@@ -134,6 +129,14 @@ func runStatus(cmd *cobra.Command, args []string) error {
 			continue
 		}
 
+		// Count installed and ready services
+		if status.Installed {
+			installedCount++
+		}
+		if status.Ready {
+			readyCount++
+		}
+
 		// Format output
 		installedStr := "No"
 		if status.Installed {
@@ -157,9 +160,8 @@ func runStatus(cmd *cobra.Command, args []string) error {
 
 	fmt.Println()
 
-	// Summary
-	installedServices := st.GetInstalledServices()
-	fmt.Printf("Summary: %d/%d services installed\n", len(installedServices), len(cfg.Services))
+	// Summary based on actual status checks (not state file)
+	fmt.Printf("Summary: %d/%d services installed, %d ready\n", installedCount, len(cfg.Services), readyCount)
 
 	return nil
 }
