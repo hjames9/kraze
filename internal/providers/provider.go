@@ -918,15 +918,28 @@ func checkTypedPodFailureState(pod *corev1.Pod) (bool, string) {
 
 		// Check for running containers that are not ready (probe failures)
 		// This catches containers that are stuck failing startup/readiness probes
+		// Note: We're tolerant of restarts during startup since some services (like webhook
+		// controllers) need to restart once during initialization. Kubernetes will mark
+		// containers as CrashLoopBackOff if they're truly stuck in a restart loop.
 		if cs.State.Running != nil && !cs.Ready {
-			// If container has been restarted, it's definitely stuck
-			if cs.RestartCount > 0 {
-				return true, fmt.Sprintf("Container '%s': Running but not ready after %d restart(s) - likely failing probes", cs.Name, cs.RestartCount)
-			}
-			// If container has been running for more than 45 seconds and still not ready, it's stuck
-			// This catches the initial startup probe failures before the first restart
 			runningDuration := time.Since(cs.State.Running.StartedAt.Time)
-			if runningDuration > 45*time.Second {
+
+			// Only fail if we have excessive restarts AND still not ready
+			// A few restarts during startup is normal, especially for webhook-based controllers
+			if cs.RestartCount >= 5 {
+				return true, fmt.Sprintf("Container '%s': Running but not ready after %d restart(s) - likely stuck in restart loop", cs.Name, cs.RestartCount)
+			}
+
+			// If container has been running in its current iteration for more than 90 seconds
+			// and still not ready (and has restarted at least twice), it's likely stuck
+			// We use 90s instead of 45s to give more time for slow startup probes
+			if cs.RestartCount >= 2 && runningDuration > 90*time.Second {
+				return true, fmt.Sprintf("Container '%s': Running for %v but still not ready after %d restart(s) - likely failing probes", cs.Name, runningDuration.Round(time.Second), cs.RestartCount)
+			}
+
+			// For containers with 0-1 restarts, only fail if they've been running a very long time
+			// This gives services time to complete their startup sequence
+			if cs.RestartCount <= 1 && runningDuration > 180*time.Second {
 				return true, fmt.Sprintf("Container '%s': Running for %v but still not ready - likely failing startup probes", cs.Name, runningDuration.Round(time.Second))
 			}
 		}
