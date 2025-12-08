@@ -150,7 +150,19 @@ func runDown(cmd *cobra.Command, args []string) error {
 		namespacesToCleanup = st.GetNamespacesForServices(serviceNames)
 	} else {
 		// Uninstalling all services - clean up all namespaces (count will be 0 for all)
+		// Get namespaces from state file
 		namespacesToCleanup = st.GetAllNamespacesUsedForCleanup()
+
+		// Also collect namespaces from the services we're actually uninstalling
+		// This handles cases where state file is missing namespace data (e.g., services
+		// installed before namespace tracking was implemented, or corrupted state)
+		for _, svc := range orderedServices {
+			ns := svc.GetNamespace()
+			if ns != "" {
+				// Set count to 0 since we're uninstalling everything
+				namespacesToCleanup[ns] = 0
+			}
+		}
 	}
 
 	// Verify cluster exists
