@@ -1,7 +1,7 @@
-.PHONY: all build test clean install fmt vet lint help run-tests coverage validate-examples release release-publish
+.PHONY: all build test clean install fmt vet lint help run-tests coverage validate-examples release release-publish bump-patch bump-minor bump-major show-version
 
 BINARY_NAME=kraze
-VERSION?=dev
+VERSION?=$(shell cat VERSION 2>/dev/null || echo "dev")
 GIT_COMMIT?=$(shell git rev-parse --short HEAD 2>/dev/null || echo "unknown")
 BUILD_DATE?=$(shell date -u +"%Y-%m-%dT%H:%M:%SZ")
 LDFLAGS=-ldflags "-X main.Version=$(VERSION) -X main.GitCommit=$(GIT_COMMIT) -X main.BuildDate=$(BUILD_DATE)"
@@ -42,7 +42,22 @@ build-all:
 release:
 	@echo "Building release $(VERSION)..."
 	@if [ "$(VERSION)" = "dev" ]; then \
-		echo "Error: VERSION must be set (e.g., make release VERSION=v0.1.0)"; \
+		echo "Error: VERSION is 'dev'. Please bump the version first using:"; \
+		echo "  make bump-patch  # for bug fixes (0.4.1 -> 0.4.2)"; \
+		echo "  make bump-minor  # for new features (0.4.1 -> 0.5.0)"; \
+		echo "  make bump-major  # for breaking changes (0.4.1 -> 1.0.0)"; \
+		exit 1; \
+	fi
+	@echo "Checking if git tag $(VERSION) already exists..."
+	@if git rev-parse $(VERSION) >/dev/null 2>&1; then \
+		echo "Error: Git tag $(VERSION) already exists!"; \
+		echo "If you need to create a new release, bump the version first."; \
+		exit 1; \
+	fi
+	@echo "Checking for uncommitted changes..."
+	@if [ -n "$$(git status --porcelain)" ]; then \
+		echo "Error: You have uncommitted changes. Please commit or stash them first."; \
+		git status --short; \
 		exit 1; \
 	fi
 	@mkdir -p $(BUILD_DIR)
@@ -55,6 +70,9 @@ release:
 	GOOS=windows GOARCH=arm64 $(GOBUILD) $(LDFLAGS) -o $(BUILD_DIR)/$(BINARY_NAME)-$(VERSION)-windows-arm64.exe $(CMD_DIR)
 	@echo "Generating checksums..."
 	@cd $(BUILD_DIR) && sha256sum $(BINARY_NAME)-$(VERSION)-* > $(BINARY_NAME)-$(VERSION)-checksums.txt
+	@echo ""
+	@echo "Creating git tag $(VERSION)..."
+	git tag -a $(VERSION) -m "Release $(VERSION)"
 	@echo ""
 	@echo "Release $(VERSION) built successfully!"
 	@echo ""
@@ -70,15 +88,19 @@ release:
 	@echo ""
 	@echo "Draft release $(VERSION) created successfully!"
 	@echo ""
-	@echo "To publish the release, run:"
-	@echo "  make release-publish VERSION=$(VERSION)"
+	@echo "To publish the release and push the tag, run:"
+	@echo "  make release-publish"
 
 release-publish:
 	@echo "Publishing release $(VERSION)..."
 	@if [ "$(VERSION)" = "dev" ]; then \
-		echo "Error: VERSION must be set (e.g., make release-publish VERSION=v0.1.0)"; \
+		echo "Error: VERSION is 'dev'. Cannot publish."; \
 		exit 1; \
 	fi
+	@echo "Pushing git tag $(VERSION) to origin..."
+	git push origin $(VERSION)
+	@echo ""
+	@echo "Publishing GitHub release..."
 	$(GHCMD) release edit $(VERSION) --draft=false
 	@echo ""
 	@echo "Release $(VERSION) published successfully!"
@@ -170,3 +192,51 @@ help:
 	@echo "  Version:    $(VERSION)"
 	@echo "  Git Commit: $(GIT_COMMIT)"
 	@echo "  Build Date: $(BUILD_DATE)"
+
+show-version:
+	@echo "Current version: $(VERSION)"
+
+bump-patch:
+	@echo "Bumping patch version..."
+	@current=$$(cat VERSION | sed 's/^v//'); \
+	major=$$(echo $$current | cut -d. -f1); \
+	minor=$$(echo $$current | cut -d. -f2); \
+	patch=$$(echo $$current | cut -d. -f3); \
+	new_patch=$$((patch + 1)); \
+	new_version="v$$major.$$minor.$$new_patch"; \
+	echo "$$new_version" > VERSION; \
+	echo "Version bumped: $$current -> $$new_version"; \
+	echo ""; \
+	echo "Next steps:"; \
+	echo "  1. Review changes: git diff VERSION"; \
+	echo "  2. Commit the version bump: git add VERSION && git commit -m \"Bump version to $$new_version\""; \
+	echo "  3. Create release: make release"
+
+bump-minor:
+	@echo "Bumping minor version..."
+	@current=$$(cat VERSION | sed 's/^v//'); \
+	major=$$(echo $$current | cut -d. -f1); \
+	minor=$$(echo $$current | cut -d. -f2); \
+	new_minor=$$((minor + 1)); \
+	new_version="v$$major.$$new_minor.0"; \
+	echo "$$new_version" > VERSION; \
+	echo "Version bumped: $$current -> $$new_version"; \
+	echo ""; \
+	echo "Next steps:"; \
+	echo "  1. Review changes: git diff VERSION"; \
+	echo "  2. Commit the version bump: git add VERSION && git commit -m \"Bump version to $$new_version\""; \
+	echo "  3. Create release: make release"
+
+bump-major:
+	@echo "Bumping major version..."
+	@current=$$(cat VERSION | sed 's/^v//'); \
+	major=$$(echo $$current | cut -d. -f1); \
+	new_major=$$((major + 1)); \
+	new_version="v$$new_major.0.0"; \
+	echo "$$new_version" > VERSION; \
+	echo "Version bumped: $$current -> $$new_version"; \
+	echo ""; \
+	echo "Next steps:"; \
+	echo "  1. Review changes: git diff VERSION"; \
+	echo "  2. Commit the version bump: git add VERSION && git commit -m \"Bump version to $$new_version\""; \
+	echo "  3. Create release: make release"
