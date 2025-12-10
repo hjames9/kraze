@@ -60,8 +60,8 @@ func init() {
 }
 
 // SetVersionInfo sets the version information for the CLI
-func SetVersionInfo(v, commit, date string) {
-	version = v
+func SetVersionInfo(ver, commit, date string) {
+	version = ver
 	gitCommit = commit
 	buildDate = date
 }

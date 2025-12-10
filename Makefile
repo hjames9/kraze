@@ -20,6 +20,9 @@ GHCMD=gh
 BUILD_DIR=build
 CMD_DIR=./cmd/$(BINARY_NAME)
 
+# Platform targets for cross-compilation
+PLATFORMS=linux/amd64 linux/arm64 darwin/amd64 darwin/arm64 windows/amd64 windows/arm64
+
 all: test build ## Run tests and build the binary
 
 build: ## Build the binary for the current platform
@@ -31,12 +34,13 @@ build: ## Build the binary for the current platform
 build-all: ## Build binaries for all platforms (linux, darwin, windows)
 	@echo "Building for all platforms..."
 	@mkdir -p $(BUILD_DIR)
-	GOOS=linux GOARCH=amd64 $(GOBUILD) $(LDFLAGS) -o $(BUILD_DIR)/$(BINARY_NAME)-linux-amd64 $(CMD_DIR)
-	GOOS=linux GOARCH=arm64 $(GOBUILD) $(LDFLAGS) -o $(BUILD_DIR)/$(BINARY_NAME)-linux-arm64 $(CMD_DIR)
-	GOOS=darwin GOARCH=amd64 $(GOBUILD) $(LDFLAGS) -o $(BUILD_DIR)/$(BINARY_NAME)-darwin-amd64 $(CMD_DIR)
-	GOOS=darwin GOARCH=arm64 $(GOBUILD) $(LDFLAGS) -o $(BUILD_DIR)/$(BINARY_NAME)-darwin-arm64 $(CMD_DIR)
-	GOOS=windows GOARCH=amd64 $(GOBUILD) $(LDFLAGS) -o $(BUILD_DIR)/$(BINARY_NAME)-windows-amd64.exe $(CMD_DIR)
-	GOOS=windows GOARCH=arm64 $(GOBUILD) $(LDFLAGS) -o $(BUILD_DIR)/$(BINARY_NAME)-windows-arm64.exe $(CMD_DIR)
+	@$(foreach platform,$(PLATFORMS), \
+		$(eval GOOS=$(word 1,$(subst /, ,$(platform)))) \
+		$(eval GOARCH=$(word 2,$(subst /, ,$(platform)))) \
+		$(eval EXT=$(if $(filter windows,$(GOOS)),.exe,)) \
+		echo "Building $(GOOS)/$(GOARCH)..." && \
+		GOOS=$(GOOS) GOARCH=$(GOARCH) $(GOBUILD) $(LDFLAGS) -o $(BUILD_DIR)/$(BINARY_NAME)-$(GOOS)-$(GOARCH)$(EXT) $(CMD_DIR) || exit 1; \
+	)
 	@echo "Cross-compilation complete"
 
 release: ## Build release binaries, create git tag, and draft GitHub release
@@ -62,12 +66,13 @@ release: ## Build release binaries, create git tag, and draft GitHub release
 	fi
 	@mkdir -p $(BUILD_DIR)
 	@echo "Building binaries..."
-	GOOS=linux GOARCH=amd64 $(GOBUILD) $(LDFLAGS) -o $(BUILD_DIR)/$(BINARY_NAME)-$(VERSION)-linux-amd64 $(CMD_DIR)
-	GOOS=linux GOARCH=arm64 $(GOBUILD) $(LDFLAGS) -o $(BUILD_DIR)/$(BINARY_NAME)-$(VERSION)-linux-arm64 $(CMD_DIR)
-	GOOS=darwin GOARCH=amd64 $(GOBUILD) $(LDFLAGS) -o $(BUILD_DIR)/$(BINARY_NAME)-$(VERSION)-darwin-amd64 $(CMD_DIR)
-	GOOS=darwin GOARCH=arm64 $(GOBUILD) $(LDFLAGS) -o $(BUILD_DIR)/$(BINARY_NAME)-$(VERSION)-darwin-arm64 $(CMD_DIR)
-	GOOS=windows GOARCH=amd64 $(GOBUILD) $(LDFLAGS) -o $(BUILD_DIR)/$(BINARY_NAME)-$(VERSION)-windows-amd64.exe $(CMD_DIR)
-	GOOS=windows GOARCH=arm64 $(GOBUILD) $(LDFLAGS) -o $(BUILD_DIR)/$(BINARY_NAME)-$(VERSION)-windows-arm64.exe $(CMD_DIR)
+	@$(foreach platform,$(PLATFORMS), \
+		$(eval GOOS=$(word 1,$(subst /, ,$(platform)))) \
+		$(eval GOARCH=$(word 2,$(subst /, ,$(platform)))) \
+		$(eval EXT=$(if $(filter windows,$(GOOS)),.exe,)) \
+		echo "Building $(GOOS)/$(GOARCH)..." && \
+		GOOS=$(GOOS) GOARCH=$(GOARCH) $(GOBUILD) $(LDFLAGS) -o $(BUILD_DIR)/$(BINARY_NAME)-$(VERSION)-$(GOOS)-$(GOARCH)$(EXT) $(CMD_DIR) || exit 1; \
+	)
 	@echo "Generating checksums..."
 	@cd $(BUILD_DIR) && sha256sum $(BINARY_NAME)-$(VERSION)-* > $(BINARY_NAME)-$(VERSION)-checksums.txt
 	@echo ""
