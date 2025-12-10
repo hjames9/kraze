@@ -20,15 +20,15 @@ GHCMD=gh
 BUILD_DIR=build
 CMD_DIR=./cmd/$(BINARY_NAME)
 
-all: test build
+all: test build ## Run tests and build the binary
 
-build:
+build: ## Build the binary for the current platform
 	@echo "Building $(BINARY_NAME)..."
 	@mkdir -p $(BUILD_DIR)
 	$(GOBUILD) $(LDFLAGS) -o $(BUILD_DIR)/$(BINARY_NAME) $(CMD_DIR)
 	@echo "Build complete: $(BUILD_DIR)/$(BINARY_NAME)"
 
-build-all:
+build-all: ## Build binaries for all platforms (linux, darwin, windows)
 	@echo "Building for all platforms..."
 	@mkdir -p $(BUILD_DIR)
 	GOOS=linux GOARCH=amd64 $(GOBUILD) $(LDFLAGS) -o $(BUILD_DIR)/$(BINARY_NAME)-linux-amd64 $(CMD_DIR)
@@ -39,7 +39,7 @@ build-all:
 	GOOS=windows GOARCH=arm64 $(GOBUILD) $(LDFLAGS) -o $(BUILD_DIR)/$(BINARY_NAME)-windows-arm64.exe $(CMD_DIR)
 	@echo "Cross-compilation complete"
 
-release:
+release: ## Build release binaries, create git tag, and draft GitHub release
 	@echo "Building release $(VERSION)..."
 	@if [ "$(VERSION)" = "dev" ]; then \
 		echo "Error: VERSION is 'dev'. Please bump the version first using:"; \
@@ -91,7 +91,7 @@ release:
 	@echo "To publish the release and push the tag, run:"
 	@echo "  make release-publish"
 
-release-publish:
+release-publish: ## Publish the draft release and push git tag
 	@echo "Publishing release $(VERSION)..."
 	@if [ "$(VERSION)" = "dev" ]; then \
 		echo "Error: VERSION is 'dev'. Cannot publish."; \
@@ -107,70 +107,70 @@ release-publish:
 	@echo ""
 	@echo "View at: https://github.com/$$($(GHCMD) repo view --json nameWithOwner -q .nameWithOwner)/releases/tag/$(VERSION)"
 
-test:
+test: ## Run all tests
 	@echo "Running tests..."
 	$(GOTEST) -v ./...
 
-test-coverage:
+test-coverage: ## Run tests with coverage report
 	@echo "Running tests with coverage..."
 	$(GOTEST) -v -coverprofile=$(BUILD_DIR)/coverage.out ./...
 	$(GOCMD) tool cover -html=$(BUILD_DIR)/coverage.out -o $(BUILD_DIR)/coverage.html
 	@echo "Coverage report generated: $(BUILD_DIR)/coverage.html"
 
-test-short:
+test-short: ## Run short tests only
 	@echo "Running short tests..."
 	$(GOTEST) -short ./...
 
-bench:
+bench: ## Run benchmarks
 	@echo "Running benchmarks..."
 	$(GOTEST) -bench=. -benchmem ./...
 
-install: build
+install: build ## Install binary to GOPATH/bin
 	@echo "Installing $(BINARY_NAME)..."
 	@cp $(BUILD_DIR)/$(BINARY_NAME) $(GOPATH)/bin/$(BINARY_NAME)
 	@echo "Installed to $(GOPATH)/bin/$(BINARY_NAME)"
 
-clean:
+clean: ## Remove build artifacts
 	@echo "Cleaning..."
 	$(GOCLEAN)
 	@rm -rf $(BUILD_DIR)
 	@echo "Clean complete"
 
-fmt:
+fmt: ## Format Go source code
 	@echo "Formatting code..."
 	$(GOFMT) ./...
 
-vet:
+vet: ## Run go vet
 	@echo "Running go vet..."
 	$(GOVET) ./...
 
-lint:
+lint: ## Run golangci-lint
 	@echo "Running linter..."
 	golangci-lint run ./...
 
-deps:
+deps: ## Download and tidy dependencies
 	@echo "Downloading dependencies..."
 	$(GOMOD) download
 	$(GOMOD) tidy
 
-deps-upgrade:
+deps-upgrade: ## Upgrade all dependencies
 	@echo "Upgrading dependencies..."
 	$(GOGET) -u ./...
 	$(GOMOD) tidy
 
-verify: fmt vet test
+verify: fmt vet test ## Run fmt, vet, and test
 
-run: build
+run: build ## Build and run the binary
 	@echo "Running $(BINARY_NAME)..."
 	./$(BUILD_DIR)/$(BINARY_NAME)
 
-run-help: build
+run-help: build ## Build and show help
 	./$(BUILD_DIR)/$(BINARY_NAME) --help
 
-run-version: build
+run-version: build ## Build and show version
 	./$(BUILD_DIR)/$(BINARY_NAME) version
 
-validate-examples: build
+validate-examples: build ## Validate all example configurations
 	@echo "Validating all examples..."
 	@for dir in examples/*/; do \
 		if [ -f "$$dir/kraze.yml" ]; then \
@@ -180,7 +180,7 @@ validate-examples: build
 	done
 	@echo "All examples validated successfully"
 
-help:
+help: ## Show this help message
 	@echo "$(BINARY_NAME) - Makefile help"
 	@echo ""
 	@echo "Usage: make [target]"
@@ -193,10 +193,10 @@ help:
 	@echo "  Git Commit: $(GIT_COMMIT)"
 	@echo "  Build Date: $(BUILD_DATE)"
 
-show-version:
+show-version: ## Show current version
 	@echo "Current version: $(VERSION)"
 
-bump-patch:
+bump-patch: ## Bump patch version (e.g., 0.4.1 -> 0.4.2)
 	@echo "Bumping patch version..."
 	@current=$$(cat VERSION | sed 's/^v//'); \
 	major=$$(echo $$current | cut -d. -f1); \
@@ -212,7 +212,7 @@ bump-patch:
 	echo "  2. Commit the version bump: git add VERSION && git commit -m \"Bump version to $$new_version\""; \
 	echo "  3. Create release: make release"
 
-bump-minor:
+bump-minor: ## Bump minor version (e.g., 0.4.1 -> 0.5.0)
 	@echo "Bumping minor version..."
 	@current=$$(cat VERSION | sed 's/^v//'); \
 	major=$$(echo $$current | cut -d. -f1); \
@@ -227,7 +227,7 @@ bump-minor:
 	echo "  2. Commit the version bump: git add VERSION && git commit -m \"Bump version to $$new_version\""; \
 	echo "  3. Create release: make release"
 
-bump-major:
+bump-major: ## Bump major version (e.g., 0.4.1 -> 1.0.0)
 	@echo "Bumping major version..."
 	@current=$$(cat VERSION | sed 's/^v//'); \
 	major=$$(echo $$current | cut -d. -f1); \
