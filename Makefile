@@ -78,6 +78,8 @@ release: ## Build release binaries, create git tag, and draft GitHub release
 	@echo ""
 	@echo "Creating git tag $(VERSION)..."
 	git tag -a $(VERSION) -m "Release $(VERSION)"
+	@echo "Pushing git tag $(VERSION) to origin..."
+	git push origin $(VERSION)
 	@echo ""
 	@echo "Release $(VERSION) built successfully!"
 	@echo ""
@@ -92,19 +94,17 @@ release: ## Build release binaries, create git tag, and draft GitHub release
 		$(BUILD_DIR)/$(BINARY_NAME)-$(VERSION)-*
 	@echo ""
 	@echo "Draft release $(VERSION) created successfully!"
+	@echo "Git tag $(VERSION) has been pushed to origin."
 	@echo ""
-	@echo "To publish the release and push the tag, run:"
+	@echo "To publish the draft release, run:"
 	@echo "  make release-publish"
 
-release-publish: ## Publish the draft release and push git tag
+release-publish: ## Publish the draft release (tag is already pushed by 'make release')
 	@echo "Publishing release $(VERSION)..."
 	@if [ "$(VERSION)" = "dev" ]; then \
 		echo "Error: VERSION is 'dev'. Cannot publish."; \
 		exit 1; \
 	fi
-	@echo "Pushing git tag $(VERSION) to origin..."
-	git push origin $(VERSION)
-	@echo ""
 	@echo "Publishing GitHub release..."
 	$(GHCMD) release edit $(VERSION) --draft=false
 	@echo ""
