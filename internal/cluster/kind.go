@@ -477,6 +477,46 @@ func (kind *KindManager) LoadImage(ctx context.Context, clusterName, imageName s
 	return nil
 }
 
+// UntagImage removes the tag reference from an image without removing the image itself
+// This allows running containers to continue using the old image while new containers get updated tags
+func (kind *KindManager) UntagImage(ctx context.Context, clusterName, imageName string) error {
+	// Normalize image name - add docker.io prefix if needed (same logic as GetClusterImageHash)
+	ref := ParseImageReference(imageName)
+	clusterImageName := imageName
+
+	// Add docker.io prefix if it's a Docker Hub image without explicit registry
+	if ref.IsDockerHub() && !strings.HasPrefix(imageName, "docker.io/") {
+		// If it's library/* (official images), use docker.io/library/
+		if !strings.Contains(imageName, "/") {
+			clusterImageName = "docker.io/library/" + imageName
+		} else {
+			clusterImageName = "docker.io/" + imageName
+		}
+	}
+
+	// Get the control plane container name
+	containerName := clusterName + "-control-plane"
+
+	// Use ctr (containerd CLI) to remove the tag reference
+	// This removes the tag but leaves the actual image data if it's in use
+	// Using ctr instead of crictl because ctr has more granular control
+	cmd := osexec.CommandContext(ctx, "docker", "exec", containerName,
+		"ctr", "-n", "k8s.io", "images", "rm", clusterImageName)
+	output, err := cmd.CombinedOutput()
+
+	if err != nil {
+		outputStr := string(output)
+		// If image doesn't exist, that's fine - nothing to untag
+		if strings.Contains(outputStr, "not found") || strings.Contains(outputStr, "No such image") {
+			return nil
+		}
+		// Other errors are problems
+		return fmt.Errorf("failed to untag image: %w (output: %s)", err, outputStr)
+	}
+
+	return nil
+}
+
 // buildKindNode converts a kraze node to a kind node
 func (kind *KindManager) buildKindNode(node config.KindNode) v1alpha4.Node {
 	kindNode := v1alpha4.Node{}

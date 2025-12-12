@@ -383,6 +383,7 @@ func installService(
 		// Determine which images need to be loaded
 		imagesToLoad := make([]string, 0)
 		imagesToPull := make([]string, 0)
+		imagesToRemove := make([]string, 0) // Track images that need to be removed before reloading
 
 		// Separate local images (already in Docker) from remote images (need to pull)
 		for _, img := range serviceImages {
@@ -392,6 +393,7 @@ func installService(
 			if imgInfo != nil && imgInfo.IsLocal {
 				// Image is local - check if it needs to be loaded into cluster
 				needsLoad := false
+				needsRemove := false
 				if cfg.Cluster.IsExternal() {
 					// External cluster - use state file comparison
 					needsLoad = st.HasImageHashChanged(svc.Name, img, currentHash)
@@ -413,6 +415,7 @@ func installService(
 					} else if clusterHash != currentHash {
 						progress.Verbose("Image '%s' changed (cluster: %s, local: %s), will reload", img, clusterHash[:12], currentHash[:12])
 						needsLoad = true
+						needsRemove = true // Remove old image before loading new one
 					} else {
 						progress.Verbose("Image '%s' unchanged (hash matches cluster), skipping load", img)
 					}
@@ -420,6 +423,9 @@ func installService(
 
 				if needsLoad {
 					imagesToLoad = append(imagesToLoad, img)
+					if needsRemove {
+						imagesToRemove = append(imagesToRemove, img)
+					}
 				}
 			} else {
 				// Image is not local - need to pull it first
@@ -437,6 +443,21 @@ func installService(
 				} else {
 					progress.Verbose("%s Image '%s' pulled", color.Checkmark(), img)
 					imagesToLoad = append(imagesToLoad, img)
+				}
+			}
+		}
+
+		// Untag old images that have changed (must be done before loading)
+		// This removes the tag reference but leaves the image data so running pods aren't affected
+		if len(imagesToRemove) > 0 {
+			progress.Verbose("Untagging %d outdated image(s) from cluster...", len(imagesToRemove))
+			for _, img := range imagesToRemove {
+				progress.Verbose("Untagging old version of image '%s'...", img)
+				if err := kindMgr.UntagImage(ctx, cfg.Cluster.Name, img); err != nil {
+					progress.Verbose("Warning: failed to untag old image '%s': %v", img, err)
+					progress.Verbose("  This may cause the tag to point to the old image even after loading the new one")
+				} else {
+					progress.Verbose("%s Old tag removed for '%s' (image data kept for running pods)", color.Checkmark(), img)
 				}
 			}
 		}
