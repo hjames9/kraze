@@ -139,9 +139,24 @@ func runPlan(cmd *cobra.Command, args []string) error {
 	toAdd := 0
 	toChange := 0
 	noChange := 0
+	skipped := 0
 
 	for name, svc := range cfg.Services {
 		svcCopy := svc
+
+		// Check if service is disabled
+		if !svc.IsEnabled() {
+			Verbose("Service '%s' is disabled (will not be installed)", name)
+			serviceInfos[name] = &ServicePlanInfo{
+				Name:    name,
+				Type:    svc.Type,
+				Action:  "skipped",
+				Details: "Disabled in configuration",
+			}
+			skipped++
+			continue
+		}
+
 		info := analyzeService(ctx, &svcCopy, st, cfg)
 		serviceInfos[name] = info
 
@@ -173,7 +188,7 @@ func runPlan(cmd *cobra.Command, args []string) error {
 	}
 
 	// Print summary
-	printPlanSummary(toAdd, toChange, noChange)
+	printPlanSummary(toAdd, toChange, noChange, skipped)
 
 	return nil
 }
@@ -276,6 +291,9 @@ func printServicePlan(info *ServicePlanInfo) {
 	case "no-change":
 		symbol = " "
 		formattedSymbol = symbol
+	case "skipped":
+		symbol = "-"
+		formattedSymbol = color.Gray(symbol)
 	}
 
 	// Print service line
@@ -284,6 +302,11 @@ func printServicePlan(info *ServicePlanInfo) {
 		fmt.Printf(" (%s)", info.Action)
 	}
 	fmt.Printf(" - %s\n", info.Details)
+
+	// Skip namespace and dependency info for skipped services
+	if info.Action == "skipped" {
+		return
+	}
 
 	// Print namespace
 	nsSymbol := " "
@@ -301,7 +324,7 @@ func printServicePlan(info *ServicePlanInfo) {
 	}
 }
 
-func printPlanSummary(toAdd, toChange, noChange int) {
+func printPlanSummary(toAdd, toChange, noChange, skipped int) {
 	fmt.Printf("%s", color.Bold("Plan:"))
 
 	parts := []string{}
@@ -313,6 +336,9 @@ func printPlanSummary(toAdd, toChange, noChange int) {
 	}
 	if noChange > 0 {
 		parts = append(parts, fmt.Sprintf("%d no change", noChange))
+	}
+	if skipped > 0 {
+		parts = append(parts, color.Gray(fmt.Sprintf("%d skipped", skipped)))
 	}
 
 	if len(parts) > 0 {

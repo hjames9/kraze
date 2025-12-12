@@ -34,11 +34,21 @@ var validateCmd = &cobra.Command{
 
 		if verbose {
 			fmt.Println("\nServices:")
+			enabledCount := 0
+			disabledCount := 0
 			for name, svc := range cfg.Services {
-				fmt.Printf("  - %s (%s)\n", name, svc.Type)
-				if len(svc.DependsOn) > 0 {
-					fmt.Printf("    depends_on: %v\n", svc.DependsOn)
+				if svc.IsEnabled() {
+					enabledCount++
+					fmt.Printf("  - %s (%s)\n", name, svc.Type)
+					if len(svc.DependsOn) > 0 {
+						fmt.Printf("    depends_on: %v\n", svc.DependsOn)
+					}
+				} else {
+					disabledCount++
 				}
+			}
+			if disabledCount > 0 {
+				fmt.Printf("\n  (%d disabled service(s) not shown)\n", disabledCount)
 			}
 		}
 

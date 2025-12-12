@@ -84,6 +84,22 @@ func runDown(cmd *cobra.Command, args []string) error {
 		Verbose("No services specified, will uninstall all services")
 	}
 
+	// Filter out disabled services
+	disabledCount := 0
+	enabledServices := make(map[string]config.ServiceConfig)
+	for name, svc := range cfg.Services {
+		if svc.IsEnabled() {
+			enabledServices[name] = svc
+		} else {
+			disabledCount++
+			Verbose("Skipping disabled service '%s' (not attempting uninstall)", name)
+		}
+	}
+	if disabledCount > 0 {
+		Verbose("Filtered out %d disabled service(s)", disabledCount)
+	}
+	cfg.Services = enabledServices
+
 	if dryRun {
 		fmt.Printf("[DRY RUN] Would uninstall %d service(s)\n", len(cfg.Services))
 		for name := range cfg.Services {

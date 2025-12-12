@@ -122,6 +122,7 @@ type ServiceConfig struct {
 	Type      string   `yaml:"type"` // helm, manifests
 	Namespace string   `yaml:"namespace,omitempty"`
 	DependsOn []string `yaml:"depends_on,omitempty"`
+	Enabled   *bool    `yaml:"enabled,omitempty"` // Defaults to true; set to false to skip service
 
 	// Common fields
 	CreateNamespace *bool             `yaml:"create_namespace,omitempty"` // Defaults to true
@@ -177,6 +178,14 @@ func (srv *ServiceConfig) ShouldCreateNamespace() bool {
 		return *srv.CreateNamespace
 	}
 	return true // Default to true for local dev convenience
+}
+
+// IsEnabled returns whether this service is enabled, defaulting to true for backward compatibility
+func (srv *ServiceConfig) IsEnabled() bool {
+	if srv.Enabled != nil {
+		return *srv.Enabled
+	}
+	return true
 }
 
 // GetPostReadyDelay returns the post-ready delay duration, defaulting to 3 seconds

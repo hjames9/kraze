@@ -72,6 +72,21 @@ func (cfg *Config) Validate() error {
 		}
 	}
 
+	// Validate that enabled services don't depend on disabled services
+	for _, svc := range cfg.Services {
+		if !svc.IsEnabled() {
+			continue
+		}
+		for _, depName := range svc.DependsOn {
+			if depSvc, exists := cfg.Services[depName]; exists && !depSvc.IsEnabled() {
+				return &ValidationError{
+					Field:   fmt.Sprintf("service '%s' depends_on", svc.Name),
+					Message: fmt.Sprintf("depends on disabled service '%s'", depName),
+				}
+			}
+		}
+	}
+
 	return nil
 }
 

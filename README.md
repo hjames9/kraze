@@ -24,6 +24,7 @@
     - [`kraze version`](#kraze-version)
     - [`kraze completion [bash|zsh|fish|powershell]`](#kraze-completion-bashzshfishpowershell)
   - [Configuration File Reference](#configuration-file-reference)
+    - [Disabling Services](#disabling-services)
   - [Environment Variables](#environment-variables)
   - [Global Flags](#global-flags)
 - [Examples](#examples)
@@ -425,6 +426,53 @@ services:
     namespace: app
     depends_on:
       - service-name
+```
+
+#### Disabling Services
+
+You can temporarily disable services without removing them from your configuration using the `enabled` field:
+
+```yaml
+services:
+  postgres:
+    type: helm
+    chart: postgresql
+    repo: oci://registry-1.docker.io/bitnamicharts
+    namespace: data
+    enabled: true               # Explicitly enabled (default)
+
+  redis:
+    type: helm
+    chart: redis
+    repo: oci://registry-1.docker.io/bitnamicharts
+    namespace: data
+    enabled: false              # Disabled - will be skipped
+
+  backend:
+    type: manifests
+    path: ./manifests/backend
+    namespace: app
+    # No 'enabled' field - defaults to true
+```
+
+**Behavior:**
+- Disabled services are completely skipped during `kraze up` (not installed)
+- Disabled services are ignored during `kraze down` (not uninstalled)
+- `kraze status` shows disabled services with "DISABLED" status
+- `kraze plan` shows disabled services as "skipped"
+- **Validation:** Enabled services cannot depend on disabled services (validation error)
+
+**Use Cases:**
+- Temporarily disable services during development/testing
+- Keep service definitions as reference without deploying them
+- Quickly toggle services on/off without editing configuration structure
+
+**Example:**
+```bash
+# With redis disabled in config:
+kraze up        # Installs postgres and backend only
+kraze status    # Shows redis as DISABLED
+kraze plan      # Shows "1 skipped" in summary
 ```
 
 ### Environment Variables

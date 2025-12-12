@@ -25,6 +25,9 @@ var (
 	// Cyan creates cyan colored text
 	Cyan = color.New(color.FgCyan).SprintFunc()
 
+	// Gray creates gray colored text (using bright black/dark gray)
+	Gray = color.New(color.FgHiBlack).SprintFunc()
+
 	// Bold creates bold text
 	Bold = color.New(color.Bold).SprintFunc()
 )

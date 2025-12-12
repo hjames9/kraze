@@ -106,6 +106,14 @@ func runStatus(cmd *cobra.Command, args []string) error {
 
 	// Check status of each service
 	for name, svc := range cfg.Services {
+		// Skip disabled services but show them in the status
+		if !svc.IsEnabled() {
+			Verbose("Service '%s' is disabled (skipping status check)", name)
+			fmt.Printf("%-20s %-12s %-10s %-10s %s\n",
+				name, svc.Type, "N/A", "N/A", "DISABLED")
+			continue
+		}
+
 		// Create provider options
 		providerOpts := &providers.ProviderOptions{
 			ClusterName: cfg.Cluster.Name,
