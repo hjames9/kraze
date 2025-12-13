@@ -208,6 +208,26 @@ func (cfg *Config) FilterServicesWithDependencies(names []string) (map[string]Se
 	return filtered, nil
 }
 
+// FilterServicesNoDependencies returns only the specified services without their dependencies
+// This is useful for fast iteration when dependencies are already installed
+func (cfg *Config) FilterServicesNoDependencies(names []string) (map[string]ServiceConfig, error) {
+	if len(names) == 0 {
+		return cfg.Services, nil
+	}
+
+	filtered := make(map[string]ServiceConfig)
+
+	for _, name := range names {
+		svc, ok := cfg.Services[name]
+		if !ok {
+			return nil, fmt.Errorf("service '%s' not found in configuration", name)
+		}
+		filtered[name] = svc
+	}
+
+	return filtered, nil
+}
+
 // FilterServicesByLabels returns services that match all the given label selectors
 // Label selectors are in the format "key=value"
 // If no labels provided, returns all services

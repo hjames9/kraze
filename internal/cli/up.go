@@ -20,6 +20,7 @@ var (
 	upWait    bool
 	upTimeout string
 	upNoWait  bool
+	upNoDeps  bool
 	upLabels  []string
 )
 
@@ -32,7 +33,8 @@ If no services are specified, all services will be installed.
 Services will be installed in dependency order automatically.
 
 You can filter services by name or by labels:
-  kraze up service1 service2      # Install specific services
+  kraze up service1 service2      # Install specific services (with dependencies)
+  kraze up service1 --no-deps     # Install service1 only, skip dependencies
   kraze up --label env=dev        # Install services with label env=dev
   kraze up --label tier=backend   # Install services with label tier=backend`,
 	ValidArgsFunction: getServiceNames,
@@ -67,6 +69,16 @@ func runUp(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("cannot specify both service names and labels, use one or the other")
 	}
 
+	// Validate --no-deps flag usage
+	if upNoDeps {
+		if len(upLabels) > 0 {
+			return fmt.Errorf("--no-deps cannot be used with --label")
+		}
+		if len(requestedServices) == 0 {
+			return fmt.Errorf("--no-deps requires specific service names to be provided")
+		}
+	}
+
 	if len(upLabels) > 0 {
 		// Filter by labels
 		Verbose("Filtering services by labels: %v", upLabels)
@@ -79,10 +91,32 @@ func runUp(cmd *cobra.Command, args []string) error {
 	} else if len(requestedServices) > 0 {
 		// Filter by service names
 		Verbose("Services to install: %v", requestedServices)
-		filteredServices, err := cfg.FilterServicesWithDependencies(requestedServices)
-		if err != nil {
-			return fmt.Errorf("failed to filter services: %w", err)
+		var filteredServices map[string]config.ServiceConfig
+		var err error
+
+		if upNoDeps {
+			// Skip dependencies - install only requested services
+			Verbose("--no-deps flag set, skipping dependencies")
+			filteredServices, err = cfg.FilterServicesNoDependencies(requestedServices)
+			if err != nil {
+				return fmt.Errorf("failed to filter services: %w", err)
+			}
+
+			// Clear dependency references since we're intentionally ignoring them
+			for name, svc := range filteredServices {
+				svc.DependsOn = nil
+				filteredServices[name] = svc
+			}
+
+			Verbose("Found %d service(s) (dependencies excluded)", len(filteredServices))
+		} else {
+			// Include dependencies (default behavior)
+			filteredServices, err = cfg.FilterServicesWithDependencies(requestedServices)
+			if err != nil {
+				return fmt.Errorf("failed to filter services: %w", err)
+			}
 		}
+
 		cfg.Services = filteredServices
 	} else {
 		Verbose("No services specified, will install all services")
@@ -115,9 +149,13 @@ func runUp(cmd *cobra.Command, args []string) error {
 	// Create dependency graph
 	depGraph := graph.NewDependencyGraph(cfg.Services)
 
-	// Validate dependencies
-	if err := depGraph.Validate(); err != nil {
-		return fmt.Errorf("dependency validation failed: %w", err)
+	// Validate dependencies (skip if --no-deps is used since we're intentionally ignoring them)
+	if !upNoDeps {
+		if err := depGraph.Validate(); err != nil {
+			return fmt.Errorf("dependency validation failed: %w", err)
+		}
+	} else {
+		Verbose("Skipping dependency validation (--no-deps flag set)")
 	}
 
 	// Get installation order grouped by dependency level (for parallel installation)
@@ -554,5 +592,6 @@ func init() {
 	upCmd.Flags().BoolVar(&upWait, "wait", true, "Wait for services to be ready")
 	upCmd.Flags().BoolVar(&upNoWait, "no-wait", false, "Don't wait for services to be ready")
 	upCmd.Flags().StringVar(&upTimeout, "timeout", "10m", "Timeout for wait operations")
+	upCmd.Flags().BoolVar(&upNoDeps, "no-deps", false, "Don't install dependencies (only install specified services)")
 	upCmd.Flags().StringSliceVarP(&upLabels, "label", "l", []string{}, "Filter services by label (format: key=value, can be specified multiple times)")
 }

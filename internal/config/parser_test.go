@@ -156,6 +156,105 @@ func TestFilterServicesEmpty(test *testing.T) {
 	}
 }
 
+func TestFilterServicesNoDependencies(test *testing.T) {
+	cfg := &Config{
+		Services: map[string]ServiceConfig{
+			"redis":    {Name: "redis", Type: "helm"},
+			"postgres": {Name: "postgres", Type: "helm"},
+			"api":      {Name: "api", Type: "manifests", DependsOn: []string{"redis", "postgres"}},
+			"frontend": {Name: "frontend", Type: "manifests", DependsOn: []string{"api"}},
+		},
+	}
+
+	// Test filtering api without dependencies (should only include api, not redis or postgres)
+	filtered, err := cfg.FilterServicesNoDependencies([]string{"api"})
+	if err != nil {
+		test.Fatalf("FilterServicesNoDependencies failed: %v", err)
+	}
+
+	if len(filtered) != 1 {
+		test.Errorf("Expected 1 service after filter (no deps), got %d", len(filtered))
+	}
+
+	if _, ok := filtered["api"]; !ok {
+		test.Error("Expected 'api' in filtered services")
+	}
+
+	if _, ok := filtered["redis"]; ok {
+		test.Error("Did not expect 'redis' in filtered services (dependency should be excluded)")
+	}
+
+	if _, ok := filtered["postgres"]; ok {
+		test.Error("Did not expect 'postgres' in filtered services (dependency should be excluded)")
+	}
+}
+
+func TestFilterServicesNoDependenciesMultiple(test *testing.T) {
+	cfg := &Config{
+		Services: map[string]ServiceConfig{
+			"redis":    {Name: "redis", Type: "helm"},
+			"postgres": {Name: "postgres", Type: "helm"},
+			"api":      {Name: "api", Type: "manifests", DependsOn: []string{"redis"}},
+			"frontend": {Name: "frontend", Type: "manifests", DependsOn: []string{"api"}},
+		},
+	}
+
+	// Test filtering multiple services without dependencies
+	filtered, err := cfg.FilterServicesNoDependencies([]string{"redis", "frontend"})
+	if err != nil {
+		test.Fatalf("FilterServicesNoDependencies failed: %v", err)
+	}
+
+	if len(filtered) != 2 {
+		test.Errorf("Expected 2 services after filter (no deps), got %d", len(filtered))
+	}
+
+	if _, ok := filtered["redis"]; !ok {
+		test.Error("Expected 'redis' in filtered services")
+	}
+
+	if _, ok := filtered["frontend"]; !ok {
+		test.Error("Expected 'frontend' in filtered services")
+	}
+
+	if _, ok := filtered["api"]; ok {
+		test.Error("Did not expect 'api' in filtered services (dependency should be excluded)")
+	}
+}
+
+func TestFilterServicesNoDependenciesEmpty(test *testing.T) {
+	cfg := &Config{
+		Services: map[string]ServiceConfig{
+			"redis": {Name: "redis", Type: "helm"},
+			"api":   {Name: "api", Type: "manifests", DependsOn: []string{"redis"}},
+		},
+	}
+
+	// Empty filter should return all services
+	filtered, err := cfg.FilterServicesNoDependencies([]string{})
+	if err != nil {
+		test.Fatalf("FilterServicesNoDependencies failed: %v", err)
+	}
+
+	if len(filtered) != 2 {
+		test.Errorf("Expected all services when filter is empty, got %d", len(filtered))
+	}
+}
+
+func TestFilterServicesNoDependenciesNonexistent(test *testing.T) {
+	cfg := &Config{
+		Services: map[string]ServiceConfig{
+			"redis": {Name: "redis", Type: "helm"},
+		},
+	}
+
+	// Nonexistent service should return error
+	_, err := cfg.FilterServicesNoDependencies([]string{"nonexistent"})
+	if err == nil {
+		test.Error("Expected error for nonexistent service, got nil")
+	}
+}
+
 func TestResolvePaths(test *testing.T) {
 	tmpDir := test.TempDir()
 	configFile := filepath.Join(tmpDir, "kraze.yml")
