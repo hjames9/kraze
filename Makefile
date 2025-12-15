@@ -28,7 +28,7 @@ all: test build ## Run tests and build the binary
 build: ## Build the binary for the current platform
 	@echo "Building $(BINARY_NAME)..."
 	@mkdir -p $(BUILD_DIR)
-	$(GOBUILD) $(LDFLAGS) -o $(BUILD_DIR)/$(BINARY_NAME) $(CMD_DIR)
+	CGO_ENABLED=0 $(GOBUILD) $(LDFLAGS) -o $(BUILD_DIR)/$(BINARY_NAME) $(CMD_DIR)
 	@echo "Build complete: $(BUILD_DIR)/$(BINARY_NAME)"
 
 build-all: ## Build binaries for all platforms (linux, darwin, windows)
@@ -39,7 +39,7 @@ build-all: ## Build binaries for all platforms (linux, darwin, windows)
 		$(eval GOARCH=$(word 2,$(subst /, ,$(platform)))) \
 		$(eval EXT=$(if $(filter windows,$(GOOS)),.exe,)) \
 		echo "Building $(GOOS)/$(GOARCH)..." && \
-		GOOS=$(GOOS) GOARCH=$(GOARCH) $(GOBUILD) $(LDFLAGS) -o $(BUILD_DIR)/$(BINARY_NAME)-$(GOOS)-$(GOARCH)$(EXT) $(CMD_DIR) || exit 1; \
+		CGO_ENABLED=0 GOOS=$(GOOS) GOARCH=$(GOARCH) $(GOBUILD) $(LDFLAGS) -o $(BUILD_DIR)/$(BINARY_NAME)-$(GOOS)-$(GOARCH)$(EXT) $(CMD_DIR) || exit 1; \
 	)
 	@echo "Cross-compilation complete"
 
@@ -71,7 +71,7 @@ release: ## Build release binaries, create git tag, and draft GitHub release
 		$(eval GOARCH=$(word 2,$(subst /, ,$(platform)))) \
 		$(eval EXT=$(if $(filter windows,$(GOOS)),.exe,)) \
 		echo "Building $(GOOS)/$(GOARCH)..." && \
-		GOOS=$(GOOS) GOARCH=$(GOARCH) $(GOBUILD) $(LDFLAGS) -o $(BUILD_DIR)/$(BINARY_NAME)-$(VERSION)-$(GOOS)-$(GOARCH)$(EXT) $(CMD_DIR) || exit 1; \
+		CGO_ENABLED=0 GOOS=$(GOOS) GOARCH=$(GOARCH) $(GOBUILD) $(LDFLAGS) -o $(BUILD_DIR)/$(BINARY_NAME)-$(VERSION)-$(GOOS)-$(GOARCH)$(EXT) $(CMD_DIR) || exit 1; \
 	)
 	@echo "Generating checksums..."
 	@cd $(BUILD_DIR) && sha256sum $(BINARY_NAME)-$(VERSION)-* > $(BINARY_NAME)-$(VERSION)-checksums.txt
