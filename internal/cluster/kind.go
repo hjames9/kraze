@@ -92,6 +92,14 @@ func (kind *KindManager) CreateCluster(ctx context.Context, cfg *config.ClusterC
 		}
 	}
 
+	// Configure proxy if specified
+	httpProxy, httpsProxy, noProxy := kind.getEffectiveProxyConfig(cfg)
+	if httpProxy != "" || httpsProxy != "" || noProxy != "" {
+		if err := kind.configureProxy(cfg.Name, httpProxy, httpsProxy, noProxy); err != nil {
+			fmt.Printf("Warning: Could not configure proxy: %v\n", err)
+		}
+	}
+
 	return nil
 }
 
@@ -637,6 +645,72 @@ func (kind *KindManager) configureInsecureRegistries(clusterName string, registr
 	return nil
 }
 
+// configureProxy configures containerd to use HTTP/HTTPS proxy
+// This is applied AFTER cluster initialization to avoid breaking kubeadm init
+func (kind *KindManager) configureProxy(clusterName, httpProxy, httpsProxy, noProxy string) error {
+	fmt.Printf("Configuring proxy settings in cluster nodes...\n")
+
+	// Inform user about proxy configuration source
+	fmt.Printf("  HTTP_PROXY=%s\n", httpProxy)
+	fmt.Printf("  HTTPS_PROXY=%s\n", httpsProxy)
+	fmt.Printf("  NO_PROXY=%s\n", noProxy)
+
+	// Get cluster nodes
+	nodes, err := kind.provider.ListInternalNodes(clusterName)
+	if err != nil {
+		return fmt.Errorf("failed to list cluster nodes: %w", err)
+	}
+
+	// Configure each node
+	for _, node := range nodes {
+		containerName := node.String()
+
+		// Create systemd drop-in directory for containerd
+		mkdirCmd := osexec.Command("docker", "exec", containerName, "mkdir", "-p", "/etc/systemd/system/containerd.service.d")
+		if output, err := mkdirCmd.CombinedOutput(); err != nil {
+			return fmt.Errorf("failed to create systemd drop-in directory in node %s: %w\nOutput: %s",
+				containerName, err, string(output))
+		}
+
+		// Create http-proxy.conf file with environment variables
+		var proxyConf strings.Builder
+		proxyConf.WriteString("[Service]\n")
+		proxyConf.WriteString("Environment=\"HTTP_PROXY=" + httpProxy + "\"\n")
+		proxyConf.WriteString("Environment=\"HTTPS_PROXY=" + httpsProxy + "\"\n")
+		proxyConf.WriteString("Environment=\"NO_PROXY=" + noProxy + "\"\n")
+
+		// Write the proxy configuration file
+		writeCmd := osexec.Command("docker", "exec", containerName, "sh", "-c",
+			fmt.Sprintf("cat > /etc/systemd/system/containerd.service.d/http-proxy.conf << 'EOF'\n%sEOF", proxyConf.String()))
+		if output, err := writeCmd.CombinedOutput(); err != nil {
+			return fmt.Errorf("failed to write proxy config in node %s: %w\nOutput: %s",
+				containerName, err, string(output))
+		}
+
+		// Reload systemd daemon
+		reloadCmd := osexec.Command("docker", "exec", containerName, "systemctl", "daemon-reload")
+		if output, err := reloadCmd.CombinedOutput(); err != nil {
+			return fmt.Errorf("failed to reload systemd daemon in node %s: %w\nOutput: %s",
+				containerName, err, string(output))
+		}
+
+		// Restart containerd to pick up the new proxy environment variables
+		// Note: This is safe because the cluster is already initialized
+		// Kubelet will automatically restart any affected containers
+		restartCmd := osexec.Command("docker", "exec", containerName, "systemctl", "restart", "containerd")
+		if output, err := restartCmd.CombinedOutput(); err != nil {
+			return fmt.Errorf("failed to restart containerd in node %s: %w\nOutput: %s",
+				containerName, err, string(output))
+		}
+
+		// Wait for containerd to fully restart
+		time.Sleep(3 * time.Second)
+	}
+
+	fmt.Printf("%s Proxy configured successfully\n", color.Checkmark())
+	return nil
+}
+
 // buildCAMounts creates extra mounts for CA certificates
 func (kind *KindManager) buildCAMounts(cfg *config.ClusterConfig) []v1alpha4.Mount {
 	var mounts []v1alpha4.Mount
@@ -726,77 +800,14 @@ func (kind *KindManager) getEffectiveProxyConfig(cfg *config.ClusterConfig) (htt
 }
 
 // buildKubeadmConfigPatches creates kubeadm configuration patches
+// Note: Proxy configuration is applied AFTER cluster initialization via configureProxy()
+// to avoid interfering with kubeadm init
 func (kind *KindManager) buildKubeadmConfigPatches(cfg *config.ClusterConfig) []string {
 	var patches []string
 
-	// Get effective proxy configuration (YAML config overrides environment variables)
-	httpProxy, httpsProxy, noProxy := kind.getEffectiveProxyConfig(cfg)
-
-	// Check if proxy was explicitly disabled
-	if cfg.Proxy != nil && cfg.Proxy.Enabled != nil && !*cfg.Proxy.Enabled {
-		fmt.Printf("Proxy explicitly disabled (ignoring environment variables)\n")
-		return patches
-	}
-
-	// Add proxy configuration if any proxy settings are present
-	if httpProxy != "" || httpsProxy != "" || noProxy != "" {
-		// Inform user about proxy configuration source
-		if cfg.Proxy != nil && (cfg.Proxy.HTTPProxy != "" || cfg.Proxy.HTTPSProxy != "" || cfg.Proxy.NoProxy != "") {
-			fmt.Printf("Using proxy configuration from kraze.yml\n")
-		} else {
-			fmt.Printf("Using proxy configuration from environment variables\n")
-		}
-		var proxyPatch strings.Builder
-		proxyPatch.WriteString("kind: InitConfiguration\n")
-		proxyPatch.WriteString("nodeRegistration:\n")
-		proxyPatch.WriteString("  kubeletExtraArgs:\n")
-
-		if httpProxy != "" {
-			proxyPatch.WriteString(fmt.Sprintf("    http-proxy: %s\n", httpProxy))
-		}
-		if httpsProxy != "" {
-			proxyPatch.WriteString(fmt.Sprintf("    https-proxy: %s\n", httpsProxy))
-		}
-		if noProxy != "" {
-			proxyPatch.WriteString(fmt.Sprintf("    no-proxy: %s\n", noProxy))
-		}
-
-		patches = append(patches, proxyPatch.String())
-
-		// Also add a ClusterConfiguration patch to set proxy for control plane components
-		var clusterPatch strings.Builder
-		clusterPatch.WriteString("kind: ClusterConfiguration\n")
-		clusterPatch.WriteString("apiServer:\n")
-		clusterPatch.WriteString("  extraEnv:\n")
-
-		if httpProxy != "" {
-			clusterPatch.WriteString(fmt.Sprintf("  - name: HTTP_PROXY\n    value: %s\n", httpProxy))
-		}
-		if httpsProxy != "" {
-			clusterPatch.WriteString(fmt.Sprintf("  - name: HTTPS_PROXY\n    value: %s\n", httpsProxy))
-		}
-		if noProxy != "" {
-			clusterPatch.WriteString(fmt.Sprintf("  - name: NO_PROXY\n    value: %s\n", noProxy))
-		}
-
-		patches = append(patches, clusterPatch.String())
-	}
-
-	// Add patch to update CA certificates if custom CAs are provided
-	if len(cfg.CACertificates) > 0 {
-		// Add a preKubeadmCommands-style patch
-		// Note: kind doesn't directly support preKubeadmCommands in v1alpha4
-		// but we can use a postKubeadmCommands via JoinConfiguration for workers
-		// For control-plane, we'll document that users should use node_image with pre-installed certs
-		// or rely on the containerd registry configuration
-
-		// Actually, we can use InitConfiguration to run commands before kubeadm
-		caPatch := `kind: InitConfiguration
-nodeRegistration:
-  kubeletExtraArgs:
-    node-labels: "kraze-ca-configured=true"`
-		patches = append(patches, caPatch)
-	}
+	// Note: We intentionally do NOT configure proxy here
+	// Proxy settings are applied after cluster initialization
+	// to avoid breaking internal cluster communication during kubeadm init
 
 	return patches
 }
