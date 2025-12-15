@@ -85,6 +85,13 @@ func (kind *KindManager) CreateCluster(ctx context.Context, cfg *config.ClusterC
 		}
 	}
 
+	// Configure insecure registries if specified
+	if len(cfg.InsecureRegistries) > 0 {
+		if err := kind.configureInsecureRegistries(cfg.Name, cfg.InsecureRegistries); err != nil {
+			fmt.Printf("Warning: Could not configure insecure registries: %v\n", err)
+		}
+	}
+
 	return nil
 }
 
@@ -570,6 +577,66 @@ func (kind *KindManager) updateCACertificates(clusterName string) error {
 	return nil
 }
 
+// configureInsecureRegistries configures containerd to skip TLS verification for specified registries
+// Uses the newer containerd v2 config_path format with hosts.toml files
+func (kind *KindManager) configureInsecureRegistries(clusterName string, registries []string) error {
+	fmt.Printf("Configuring insecure registries in cluster nodes...\n")
+
+	// Get cluster nodes
+	nodes, err := kind.provider.ListInternalNodes(clusterName)
+	if err != nil {
+		return fmt.Errorf("failed to list cluster nodes: %w", err)
+	}
+
+	// Configure each node
+	for _, node := range nodes {
+		containerName := node.String()
+
+		// For each registry, create a hosts.toml file
+		for _, registry := range registries {
+			// Determine the protocol (http or https)
+			// If registry starts with localhost or contains a port, use http, otherwise https
+			protocol := "https"
+			if strings.HasPrefix(registry, "localhost") || strings.Contains(registry, ":") && !strings.HasPrefix(registry, "https://") {
+				protocol = "http"
+			}
+			server := fmt.Sprintf("%s://%s", protocol, registry)
+
+			// Create the certs.d directory for this registry
+			mkdirCmd := osexec.Command("docker", "exec", containerName, "mkdir", "-p", fmt.Sprintf("/etc/containerd/certs.d/%s", registry))
+			if output, err := mkdirCmd.CombinedOutput(); err != nil {
+				return fmt.Errorf("failed to create certs.d directory for %s in node %s: %w\nOutput: %s",
+					registry, containerName, err, string(output))
+			}
+
+			// Create hosts.toml content
+			hostsToml := fmt.Sprintf(`server = "%s"
+
+[host."%s"]
+  skip_verify = true
+`, server, server)
+
+			// Write hosts.toml file
+			writeCmd := osexec.Command("docker", "exec", containerName, "sh", "-c",
+				fmt.Sprintf("cat > /etc/containerd/certs.d/%s/hosts.toml << 'EOF'\n%sEOF", registry, hostsToml))
+			if output, err := writeCmd.CombinedOutput(); err != nil {
+				return fmt.Errorf("failed to write hosts.toml for %s in node %s: %w\nOutput: %s",
+					registry, containerName, err, string(output))
+			}
+		}
+
+		// Reload containerd to pick up the new configuration
+		killCmd := osexec.Command("docker", "exec", containerName, "pkill", "-HUP", "containerd")
+		if output, err := killCmd.CombinedOutput(); err != nil {
+			return fmt.Errorf("failed to reload containerd configuration in node %s: %w\nOutput: %s",
+				containerName, err, string(output))
+		}
+	}
+
+	fmt.Printf("%s Insecure registries configured successfully\n", color.Checkmark())
+	return nil
+}
+
 // buildCAMounts creates extra mounts for CA certificates
 func (kind *KindManager) buildCAMounts(cfg *config.ClusterConfig) []v1alpha4.Mount {
 	var mounts []v1alpha4.Mount
@@ -592,26 +659,12 @@ func (kind *KindManager) buildCAMounts(cfg *config.ClusterConfig) []v1alpha4.Mou
 func (kind *KindManager) buildContainerdConfigPatches(cfg *config.ClusterConfig) []string {
 	var patches []string
 
-	// Add insecure registries configuration
+	// Enable containerd v2 registry config_path for insecure registries
+	// This allows us to use /etc/containerd/certs.d/<registry>/hosts.toml files
 	if len(cfg.InsecureRegistries) > 0 {
-		for _, registry := range cfg.InsecureRegistries {
-			patch := fmt.Sprintf(`[plugins."io.containerd.grpc.v1.cri".registry.configs."%s".tls]
-  insecure_skip_verify = true`, registry)
-			patches = append(patches, patch)
-		}
-	}
-
-	// Add CA certificate configuration
-	if len(cfg.CACertificates) > 0 {
-		// First, add a patch to update CA certificates
-		// This runs update-ca-certificates to add our custom CAs to the system trust store
-		patch := `[plugins."io.containerd.grpc.v1.cri".containerd.runtimes.runc.options]
-  SystemdCgroup = true`
+		patch := `[plugins."io.containerd.grpc.v1.cri".registry]
+  config_path = "/etc/containerd/certs.d"`
 		patches = append(patches, patch)
-
-		// Note: The actual CA certificate trust is handled by mounting the certs
-		// and running update-ca-certificates in the container
-		// We'll need to add a kubeadm patch to run this command
 	}
 
 	return patches
