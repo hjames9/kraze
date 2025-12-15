@@ -557,15 +557,12 @@ func (kind *KindManager) updateCACertificates(clusterName string) error {
 			return fmt.Errorf("failed to update CA certificates in node %s: %w\nOutput: %s", containerName, err, string(output))
 		}
 
-		// Restart containerd to pick up the new certificates
-		restartCmd := osexec.Command("docker", "exec", containerName, "systemctl", "restart", "containerd")
-		if output, err := restartCmd.CombinedOutput(); err != nil {
-			// Try pkill as fallback (some containers don't have systemctl)
-			killCmd := osexec.Command("docker", "exec", containerName, "pkill", "-HUP", "containerd")
-			if killOutput, killErr := killCmd.CombinedOutput(); killErr != nil {
-				return fmt.Errorf("failed to restart containerd in node %s: %w\nSystemctl output: %s\nPkill output: %s",
-					containerName, err, string(output), string(killOutput))
-			}
+		// Send SIGHUP to containerd to reload configuration (less disruptive than restart)
+		// This makes containerd reload its CA certificates without stopping containers
+		killCmd := osexec.Command("docker", "exec", containerName, "pkill", "-HUP", "containerd")
+		if output, err := killCmd.CombinedOutput(); err != nil {
+			return fmt.Errorf("failed to reload containerd configuration in node %s: %w\nOutput: %s",
+				containerName, err, string(output))
 		}
 	}
 
