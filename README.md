@@ -26,6 +26,7 @@
   - [Configuration File Reference](#configuration-file-reference)
     - [Disabling Services](#disabling-services)
   - [Environment Variables](#environment-variables)
+  - [Corporate Network Support](#corporate-network-support)
   - [Global Flags](#global-flags)
 - [Examples](#examples)
 - [Development](#development)
@@ -44,6 +45,7 @@ kraze is a Kubernetes development environment manager that brings the familiar d
 - **Clean Teardown** - Removes all resources including CRDS, namespaces, and PVCs
 - **State Management** - Tracks what's installed to enable incremental updates
 - **docker-compose UX** - Familiar commands: `up`, `down`, `status`
+- **Corporate Network Support** - Works behind proxies with TLS inspection and custom CAs
 
 ## Demo
 
@@ -379,6 +381,16 @@ cluster:
           hostPort: 8080
           protocol: TCP
 
+  # Optional: Corporate network support
+  # ca_certificates:                  # Trust custom CA certificates
+  #   - /etc/ssl/certs/corporate-ca.crt
+  # insecure_registries:              # Skip TLS verification for specific registries
+  #   - registry.corp.com
+  # proxy:                            # HTTP/HTTPS proxy (also auto-detected from env vars)
+  #   http_proxy: http://proxy:8080
+  #   https_proxy: http://proxy:8080
+  #   no_proxy: localhost,127.0.0.1
+
   # Optional: Use existing cluster (Docker Desktop, Minikube, remote)
   # external:
   #   enabled: true
@@ -488,6 +500,67 @@ services:
     namespace: ${NAMESPACE:-default}
 ```
 
+### Corporate Network Support
+
+kraze works seamlessly in corporate environments with TLS inspection proxies and custom certificate authorities.
+
+#### Custom CA Certificates
+
+If your network uses TLS inspection (MITM proxies), add your corporate CA certificate:
+
+```yaml
+cluster:
+  name: dev-cluster
+  ca_certificates:
+    - /etc/ssl/certs/corporate-ca.crt
+```
+
+kraze will mount the certificate into cluster nodes and configure containerd to trust it.
+
+#### HTTP/HTTPS Proxy
+
+kraze automatically detects and uses proxy settings from environment variables (`HTTP_PROXY`, `HTTPS_PROXY`, `NO_PROXY`):
+
+```bash
+export HTTP_PROXY=http://proxy.corp.com:8080
+export HTTPS_PROXY=http://proxy.corp.com:8080
+export NO_PROXY=localhost,127.0.0.1,.svc,.cluster.local
+kraze up
+```
+
+Or configure explicitly in YAML to override environment variables:
+
+```yaml
+cluster:
+  proxy:
+    http_proxy: http://proxy.corp.com:8080
+    https_proxy: http://proxy.corp.com:8080
+    no_proxy: localhost,127.0.0.1,.svc,.cluster.local
+```
+
+To disable proxy even when environment variables are set:
+
+```yaml
+cluster:
+  proxy:
+    enabled: false
+```
+
+#### Insecure Registries
+
+As a quick workaround, skip TLS verification for specific registries:
+
+```yaml
+cluster:
+  insecure_registries:
+    - ghcr.io
+    - registry.corp.com
+```
+
+**Note:** Using CA certificates is more secure than insecure registries.
+
+See [examples/corporate-network/](./examples/corporate-network) for complete examples and troubleshooting.
+
 ### Wait Behavior and Dependencies
 
 kraze automatically handles service dependencies and ensures services are ready before starting dependent services.
@@ -570,6 +643,7 @@ See the [examples/](./examples) directory for complete working examples:
 - **[dependencies/](./examples/dependencies)** - Multi-service with dependency management
 - **[external-cluster/](./examples/external-cluster)** - Use existing clusters (Docker Desktop, Minikube, remote)
 - **[labels/](./examples/labels)** - Filter services by labels (env, tier, team)
+- **[corporate-network/](./examples/corporate-network)** - Corporate environments (proxies, CA certificates, TLS inspection)
 
 Validate all examples:
 ```bash

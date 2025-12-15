@@ -339,3 +339,405 @@ func TestNewKindManager(test *testing.T) {
 		test.Error("KindManager.provider is nil")
 	}
 }
+
+func TestGetEffectiveProxyConfig(test *testing.T) {
+	km := NewKindManager()
+
+	tests := []struct {
+		name              string
+		envVars           map[string]string
+		config            *config.ClusterConfig
+		expectedHTTP      string
+		expectedHTTPS     string
+		expectedNoProxy   string
+		description       string
+	}{
+		{
+			name: "no proxy config, no env vars",
+			envVars: map[string]string{},
+			config: &config.ClusterConfig{
+				Name: "test",
+			},
+			expectedHTTP:    "",
+			expectedHTTPS:   "",
+			expectedNoProxy: "",
+			description:     "should return empty strings when no proxy configured",
+		},
+		{
+			name: "env vars only (uppercase)",
+			envVars: map[string]string{
+				"HTTP_PROXY":  "http://proxy.corp.com:8080",
+				"HTTPS_PROXY": "http://proxy.corp.com:8080",
+				"NO_PROXY":    "localhost,127.0.0.1",
+			},
+			config: &config.ClusterConfig{
+				Name: "test",
+			},
+			expectedHTTP:    "http://proxy.corp.com:8080",
+			expectedHTTPS:   "http://proxy.corp.com:8080",
+			expectedNoProxy: "localhost,127.0.0.1",
+			description:     "should use uppercase environment variables",
+		},
+		{
+			name: "env vars only (lowercase)",
+			envVars: map[string]string{
+				"http_proxy":  "http://proxy.example.com:3128",
+				"https_proxy": "http://proxy.example.com:3128",
+				"no_proxy":    ".internal",
+			},
+			config: &config.ClusterConfig{
+				Name: "test",
+			},
+			expectedHTTP:    "http://proxy.example.com:3128",
+			expectedHTTPS:   "http://proxy.example.com:3128",
+			expectedNoProxy: ".internal",
+			description:     "should use lowercase environment variables",
+		},
+		{
+			name: "YAML overrides env vars",
+			envVars: map[string]string{
+				"HTTP_PROXY":  "http://env-proxy:8080",
+				"HTTPS_PROXY": "http://env-proxy:8080",
+				"NO_PROXY":    "localhost",
+			},
+			config: &config.ClusterConfig{
+				Name: "test",
+				Proxy: &config.ProxyConfig{
+					HTTPProxy:  "http://yaml-proxy:3128",
+					HTTPSProxy: "http://yaml-proxy:3128",
+					NoProxy:    ".cluster.local",
+				},
+			},
+			expectedHTTP:    "http://yaml-proxy:3128",
+			expectedHTTPS:   "http://yaml-proxy:3128",
+			expectedNoProxy: ".cluster.local",
+			description:     "YAML config should override environment variables",
+		},
+		{
+			name: "YAML partial override",
+			envVars: map[string]string{
+				"HTTP_PROXY":  "http://env-proxy:8080",
+				"HTTPS_PROXY": "http://env-proxy:8080",
+				"NO_PROXY":    "localhost",
+			},
+			config: &config.ClusterConfig{
+				Name: "test",
+				Proxy: &config.ProxyConfig{
+					HTTPProxy: "http://yaml-proxy:3128",
+					// HTTPS_PROXY not set in YAML
+					// NO_PROXY not set in YAML
+				},
+			},
+			expectedHTTP:    "http://yaml-proxy:3128",
+			expectedHTTPS:   "http://env-proxy:8080",
+			expectedNoProxy: "localhost",
+			description:     "YAML should partially override, keeping env vars for unset fields",
+		},
+		{
+			name: "explicit disable ignores all",
+			envVars: map[string]string{
+				"HTTP_PROXY":  "http://proxy.corp.com:8080",
+				"HTTPS_PROXY": "http://proxy.corp.com:8080",
+				"NO_PROXY":    "localhost",
+			},
+			config: &config.ClusterConfig{
+				Name: "test",
+				Proxy: &config.ProxyConfig{
+					Enabled: boolPtr(false),
+				},
+			},
+			expectedHTTP:    "",
+			expectedHTTPS:   "",
+			expectedNoProxy: "",
+			description:     "enabled: false should ignore all proxy settings",
+		},
+		{
+			name: "explicit enable with YAML values",
+			envVars: map[string]string{
+				"HTTP_PROXY": "http://env-proxy:8080",
+			},
+			config: &config.ClusterConfig{
+				Name: "test",
+				Proxy: &config.ProxyConfig{
+					Enabled:    boolPtr(true),
+					HTTPProxy:  "http://yaml-proxy:3128",
+					HTTPSProxy: "http://yaml-proxy:3128",
+				},
+			},
+			expectedHTTP:    "http://yaml-proxy:3128",
+			expectedHTTPS:   "http://yaml-proxy:3128",
+			expectedNoProxy: "",
+			description:     "enabled: true with YAML values should use YAML values",
+		},
+	}
+
+	for _, tt := range tests {
+		test.Run(tt.name, func(test *testing.T) {
+			// Set up environment variables
+			for key, value := range tt.envVars {
+				test.Setenv(key, value)
+			}
+
+			// Call getEffectiveProxyConfig
+			httpProxy, httpsProxy, noProxy := km.getEffectiveProxyConfig(tt.config)
+
+			// Validate results
+			if httpProxy != tt.expectedHTTP {
+				test.Errorf("HTTP_PROXY: got %q, want %q (%s)", httpProxy, tt.expectedHTTP, tt.description)
+			}
+			if httpsProxy != tt.expectedHTTPS {
+				test.Errorf("HTTPS_PROXY: got %q, want %q (%s)", httpsProxy, tt.expectedHTTPS, tt.description)
+			}
+			if noProxy != tt.expectedNoProxy {
+				test.Errorf("NO_PROXY: got %q, want %q (%s)", noProxy, tt.expectedNoProxy, tt.description)
+			}
+		})
+	}
+}
+
+func TestBuildCAMounts(test *testing.T) {
+	km := NewKindManager()
+
+	tests := []struct {
+		name     string
+		config   *config.ClusterConfig
+		validate func(*testing.T, []v1alpha4.Mount)
+	}{
+		{
+			name: "no CA certificates",
+			config: &config.ClusterConfig{
+				Name:           "test",
+				CACertificates: []string{},
+			},
+			validate: func(test *testing.T, mounts []v1alpha4.Mount) {
+				if len(mounts) != 0 {
+					test.Errorf("Expected 0 mounts, got %d", len(mounts))
+				}
+			},
+		},
+		{
+			name: "single CA certificate",
+			config: &config.ClusterConfig{
+				Name:           "test",
+				CACertificates: []string{"/etc/ssl/certs/corporate-ca.crt"},
+			},
+			validate: func(test *testing.T, mounts []v1alpha4.Mount) {
+				if len(mounts) != 1 {
+					test.Fatalf("Expected 1 mount, got %d", len(mounts))
+				}
+				if mounts[0].HostPath != "/etc/ssl/certs/corporate-ca.crt" {
+					test.Errorf("HostPath: got %q, want %q", mounts[0].HostPath, "/etc/ssl/certs/corporate-ca.crt")
+				}
+				if mounts[0].ContainerPath != "/usr/local/share/ca-certificates/kraze-ca-0.crt" {
+					test.Errorf("ContainerPath: got %q, want %q", mounts[0].ContainerPath, "/usr/local/share/ca-certificates/kraze-ca-0.crt")
+				}
+				if !mounts[0].Readonly {
+					test.Errorf("Readonly: got false, want true")
+				}
+			},
+		},
+		{
+			name: "multiple CA certificates",
+			config: &config.ClusterConfig{
+				Name: "test",
+				CACertificates: []string{
+					"/etc/ssl/certs/ca1.crt",
+					"/etc/ssl/certs/ca2.crt",
+					"/etc/ssl/certs/ca3.crt",
+				},
+			},
+			validate: func(test *testing.T, mounts []v1alpha4.Mount) {
+				if len(mounts) != 3 {
+					test.Fatalf("Expected 3 mounts, got %d", len(mounts))
+				}
+				for i := 0; i < 3; i++ {
+					expectedContainerPath := "/usr/local/share/ca-certificates/kraze-ca-" + string(rune('0'+i)) + ".crt"
+					if mounts[i].ContainerPath != expectedContainerPath {
+						test.Errorf("Mount[%d].ContainerPath: got %q, want %q", i, mounts[i].ContainerPath, expectedContainerPath)
+					}
+					if !mounts[i].Readonly {
+						test.Errorf("Mount[%d].Readonly: got false, want true", i)
+					}
+				}
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		test.Run(tt.name, func(test *testing.T) {
+			result := km.buildCAMounts(tt.config)
+			tt.validate(test, result)
+		})
+	}
+}
+
+func TestBuildContainerdConfigPatches(test *testing.T) {
+	km := NewKindManager()
+
+	tests := []struct {
+		name     string
+		config   *config.ClusterConfig
+		validate func(*testing.T, []string)
+	}{
+		{
+			name: "no insecure registries",
+			config: &config.ClusterConfig{
+				Name:               "test",
+				InsecureRegistries: []string{},
+			},
+			validate: func(test *testing.T, patches []string) {
+				if len(patches) != 0 {
+					test.Errorf("Expected 0 patches, got %d", len(patches))
+				}
+			},
+		},
+		{
+			name: "single insecure registry",
+			config: &config.ClusterConfig{
+				Name:               "test",
+				InsecureRegistries: []string{"ghcr.io"},
+			},
+			validate: func(test *testing.T, patches []string) {
+				if len(patches) != 1 {
+					test.Fatalf("Expected 1 patch, got %d", len(patches))
+				}
+				if !containsString(patches[0], "ghcr.io") {
+					test.Errorf("Patch doesn't contain 'ghcr.io': %s", patches[0])
+				}
+				if !containsString(patches[0], "insecure_skip_verify = true") {
+					test.Errorf("Patch doesn't contain 'insecure_skip_verify = true': %s", patches[0])
+				}
+			},
+		},
+		{
+			name: "multiple insecure registries",
+			config: &config.ClusterConfig{
+				Name:               "test",
+				InsecureRegistries: []string{"ghcr.io", "registry.corp.com", "docker.io"},
+			},
+			validate: func(test *testing.T, patches []string) {
+				if len(patches) != 3 {
+					test.Fatalf("Expected 3 patches, got %d", len(patches))
+				}
+				registries := []string{"ghcr.io", "registry.corp.com", "docker.io"}
+				for i, registry := range registries {
+					if !containsString(patches[i], registry) {
+						test.Errorf("Patch[%d] doesn't contain %q: %s", i, registry, patches[i])
+					}
+				}
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		test.Run(tt.name, func(test *testing.T) {
+			result := km.buildContainerdConfigPatches(tt.config)
+			tt.validate(test, result)
+		})
+	}
+}
+
+func TestBuildKindConfigWithCorporateFeatures(test *testing.T) {
+	km := NewKindManager()
+
+	tests := []struct {
+		name     string
+		config   *config.ClusterConfig
+		validate func(*testing.T, *v1alpha4.Cluster)
+	}{
+		{
+			name: "config with CA certificates",
+			config: &config.ClusterConfig{
+				Name:           "test",
+				CACertificates: []string{"/etc/ssl/certs/ca.crt"},
+			},
+			validate: func(test *testing.T, cluster *v1alpha4.Cluster) {
+				// Should have CA mounts on the default control-plane node
+				if len(cluster.Nodes) != 1 {
+					test.Fatalf("Expected 1 node, got %d", len(cluster.Nodes))
+				}
+				if len(cluster.Nodes[0].ExtraMounts) != 1 {
+					test.Errorf("Expected 1 extra mount, got %d", len(cluster.Nodes[0].ExtraMounts))
+				}
+			},
+		},
+		{
+			name: "config with insecure registries",
+			config: &config.ClusterConfig{
+				Name:               "test",
+				InsecureRegistries: []string{"ghcr.io"},
+			},
+			validate: func(test *testing.T, cluster *v1alpha4.Cluster) {
+				// Should have containerd config patches
+				if len(cluster.ContainerdConfigPatches) != 1 {
+					test.Errorf("Expected 1 containerd config patch, got %d", len(cluster.ContainerdConfigPatches))
+				}
+			},
+		},
+		{
+			name: "config with proxy",
+			config: &config.ClusterConfig{
+				Name: "test",
+				Proxy: &config.ProxyConfig{
+					HTTPProxy:  "http://proxy:8080",
+					HTTPSProxy: "http://proxy:8080",
+					NoProxy:    "localhost",
+				},
+			},
+			validate: func(test *testing.T, cluster *v1alpha4.Cluster) {
+				// Should have kubeadm config patches
+				if len(cluster.KubeadmConfigPatches) == 0 {
+					test.Error("Expected kubeadm config patches, got 0")
+				}
+			},
+		},
+		{
+			name: "config with all corporate features",
+			config: &config.ClusterConfig{
+				Name:               "test",
+				CACertificates:     []string{"/etc/ssl/certs/ca.crt"},
+				InsecureRegistries: []string{"ghcr.io"},
+				Proxy: &config.ProxyConfig{
+					HTTPProxy: "http://proxy:8080",
+				},
+			},
+			validate: func(test *testing.T, cluster *v1alpha4.Cluster) {
+				if len(cluster.Nodes[0].ExtraMounts) == 0 {
+					test.Error("Expected CA certificate mounts")
+				}
+				if len(cluster.ContainerdConfigPatches) == 0 {
+					test.Error("Expected containerd config patches")
+				}
+				if len(cluster.KubeadmConfigPatches) == 0 {
+					test.Error("Expected kubeadm config patches")
+				}
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		test.Run(tt.name, func(test *testing.T) {
+			result := km.buildKindConfig(tt.config)
+			tt.validate(test, result)
+		})
+	}
+}
+
+// Helper functions
+
+func boolPtr(bl bool) *bool {
+	return &bl
+}
+
+func containsString(str, substr string) bool {
+	return len(str) > 0 && len(substr) > 0 && (str == substr || len(str) > len(substr) && (str[:len(substr)] == substr || str[len(str)-len(substr):] == substr || findInString(str, substr)))
+}
+
+func findInString(str, substr string) bool {
+	for iter := 0; iter <= len(str)-len(substr); iter++ {
+		if str[iter:iter+len(substr)] == substr {
+			return true
+		}
+	}
+	return false
+}

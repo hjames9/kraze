@@ -1,0 +1,30 @@
+cluster:
+  name: corporate-cluster
+  version: "1.29.0"
+
+  # CA Certificates - Trust corporate CA certificates
+  # These will be mounted to /usr/local/share/ca-certificates/ and added to the system trust store
+  ca_certificates:
+    - /etc/ssl/certs/corporate-ca.crt
+    # - /path/to/another-ca.crt
+
+  # Insecure Registries - Skip TLS verification for specific registries
+  # Use this as a quick workaround (not recommended for production)
+  insecure_registries:
+    - ghcr.io
+    # - registry.corp.com
+
+  # HTTP/HTTPS Proxy Configuration
+  # These settings are passed to kubelet and control plane components
+  proxy:
+    http_proxy: http://proxy.corp.com:8080
+    https_proxy: http://proxy.corp.com:8080
+    no_proxy: localhost,127.0.0.1,.svc,.cluster.local,10.0.0.0/8
+
+services:
+  example-service:
+    type: helm
+    repo: https://charts.example.com
+    chart: example
+    version: 1.0.0
+    namespace: default

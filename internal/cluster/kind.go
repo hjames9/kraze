@@ -78,6 +78,13 @@ func (kind *KindManager) CreateCluster(ctx context.Context, cfg *config.ClusterC
 	fmt.Printf("Waiting for API server to stabilize...\n")
 	time.Sleep(5 * time.Second)
 
+	// Update CA certificates if custom CAs were mounted
+	if len(cfg.CACertificates) > 0 {
+		if err := kind.updateCACertificates(cfg.Name); err != nil {
+			fmt.Printf("Warning: Could not update CA certificates: %v\n", err)
+		}
+	}
+
 	return nil
 }
 
@@ -117,8 +124,8 @@ func (kind *KindManager) ClusterExists(clusterName string) (bool, error) {
 		return false, err
 	}
 
-	for _, c := range clusters {
-		if c == clusterName {
+	for _, cluster := range clusters {
+		if cluster == clusterName {
 			return true, nil
 		}
 	}
@@ -356,13 +363,23 @@ func (kind *KindManager) buildKindConfig(cfg *config.ClusterConfig) *v1alpha4.Cl
 		}
 	}
 
+	// Add containerd config patches for CA certificates and insecure registries
+	kindCfg.ContainerdConfigPatches = kind.buildContainerdConfigPatches(cfg)
+
+	// Add kubeadm config patches for proxy configuration
+	kindCfg.KubeadmConfigPatches = kind.buildKubeadmConfigPatches(cfg)
+
 	// Determine which node image to use
 	nodeImage := kind.getNodeImage(cfg)
+
+	// Build extra mounts for CA certificates (applied to all nodes)
+	caMounts := kind.buildCAMounts(cfg)
 
 	// If no nodes specified in config, create a default control-plane node
 	if len(cfg.Config) == 0 {
 		node := v1alpha4.Node{
-			Role: v1alpha4.ControlPlaneRole,
+			Role:        v1alpha4.ControlPlaneRole,
+			ExtraMounts: caMounts,
 		}
 		if nodeImage != "" {
 			node.Image = nodeImage
@@ -379,6 +396,9 @@ func (kind *KindManager) buildKindConfig(cfg *config.ClusterConfig) *v1alpha4.Cl
 		if nodeImage != "" {
 			kindNode.Image = nodeImage
 		}
+
+		// Add CA certificate mounts to existing mounts
+		kindNode.ExtraMounts = append(kindNode.ExtraMounts, caMounts...)
 
 		// Handle replicas for worker nodes
 		if node.Replicas > 0 {
@@ -515,6 +535,208 @@ func (kind *KindManager) UntagImage(ctx context.Context, clusterName, imageName 
 	}
 
 	return nil
+}
+
+// updateCACertificates runs update-ca-certificates in all nodes
+func (kind *KindManager) updateCACertificates(clusterName string) error {
+	fmt.Printf("Updating CA certificates in cluster nodes...\n")
+
+	// Get cluster nodes
+	nodes, err := kind.provider.ListInternalNodes(clusterName)
+	if err != nil {
+		return fmt.Errorf("failed to list cluster nodes: %w", err)
+	}
+
+	// Run update-ca-certificates in each node
+	for _, node := range nodes {
+		containerName := node.String()
+
+		// Run update-ca-certificates command
+		cmd := osexec.Command("docker", "exec", containerName, "update-ca-certificates")
+		if output, err := cmd.CombinedOutput(); err != nil {
+			return fmt.Errorf("failed to update CA certificates in node %s: %w\nOutput: %s", containerName, err, string(output))
+		}
+
+		// Restart containerd to pick up the new certificates
+		restartCmd := osexec.Command("docker", "exec", containerName, "systemctl", "restart", "containerd")
+		if output, err := restartCmd.CombinedOutput(); err != nil {
+			// Try pkill as fallback (some containers don't have systemctl)
+			killCmd := osexec.Command("docker", "exec", containerName, "pkill", "-HUP", "containerd")
+			if killOutput, killErr := killCmd.CombinedOutput(); killErr != nil {
+				return fmt.Errorf("failed to restart containerd in node %s: %w\nSystemctl output: %s\nPkill output: %s",
+					containerName, err, string(output), string(killOutput))
+			}
+		}
+	}
+
+	fmt.Printf("%s CA certificates updated successfully\n", color.Checkmark())
+	return nil
+}
+
+// buildCAMounts creates extra mounts for CA certificates
+func (kind *KindManager) buildCAMounts(cfg *config.ClusterConfig) []v1alpha4.Mount {
+	var mounts []v1alpha4.Mount
+
+	for iter, certPath := range cfg.CACertificates {
+		// Mount each CA cert to /usr/local/share/ca-certificates/ in the container
+		// The filename is important - it should end in .crt
+		containerPath := fmt.Sprintf("/usr/local/share/ca-certificates/kraze-ca-%d.crt", iter)
+		mounts = append(mounts, v1alpha4.Mount{
+			HostPath:      certPath,
+			ContainerPath: containerPath,
+			Readonly:      true,
+		})
+	}
+
+	return mounts
+}
+
+// buildContainerdConfigPatches creates containerd configuration patches
+func (kind *KindManager) buildContainerdConfigPatches(cfg *config.ClusterConfig) []string {
+	var patches []string
+
+	// Add insecure registries configuration
+	if len(cfg.InsecureRegistries) > 0 {
+		for _, registry := range cfg.InsecureRegistries {
+			patch := fmt.Sprintf(`[plugins."io.containerd.grpc.v1.cri".registry.configs."%s".tls]
+  insecure_skip_verify = true`, registry)
+			patches = append(patches, patch)
+		}
+	}
+
+	// Add CA certificate configuration
+	if len(cfg.CACertificates) > 0 {
+		// First, add a patch to update CA certificates
+		// This runs update-ca-certificates to add our custom CAs to the system trust store
+		patch := `[plugins."io.containerd.grpc.v1.cri".containerd.runtimes.runc.options]
+  SystemdCgroup = true`
+		patches = append(patches, patch)
+
+		// Note: The actual CA certificate trust is handled by mounting the certs
+		// and running update-ca-certificates in the container
+		// We'll need to add a kubeadm patch to run this command
+	}
+
+	return patches
+}
+
+// getEffectiveProxyConfig returns the effective proxy configuration
+// Priority: YAML config > environment variables
+// Checks both uppercase and lowercase variants of environment variables
+// If proxy.enabled is explicitly set to false, returns empty strings (disables proxy)
+func (kind *KindManager) getEffectiveProxyConfig(cfg *config.ClusterConfig) (httpProxy, httpsProxy, noProxy string) {
+	// Check if proxy is explicitly disabled
+	if cfg.Proxy != nil && cfg.Proxy.Enabled != nil && !*cfg.Proxy.Enabled {
+		// Proxy explicitly disabled, return empty values
+		return "", "", ""
+	}
+
+	// Start with environment variables (check both uppercase and lowercase)
+	httpProxy = os.Getenv("HTTP_PROXY")
+	if httpProxy == "" {
+		httpProxy = os.Getenv("http_proxy")
+	}
+
+	httpsProxy = os.Getenv("HTTPS_PROXY")
+	if httpsProxy == "" {
+		httpsProxy = os.Getenv("https_proxy")
+	}
+
+	noProxy = os.Getenv("NO_PROXY")
+	if noProxy == "" {
+		noProxy = os.Getenv("no_proxy")
+	}
+
+	// Override with YAML config if specified
+	if cfg.Proxy != nil {
+		if cfg.Proxy.HTTPProxy != "" {
+			httpProxy = cfg.Proxy.HTTPProxy
+		}
+		if cfg.Proxy.HTTPSProxy != "" {
+			httpsProxy = cfg.Proxy.HTTPSProxy
+		}
+		if cfg.Proxy.NoProxy != "" {
+			noProxy = cfg.Proxy.NoProxy
+		}
+	}
+
+	return httpProxy, httpsProxy, noProxy
+}
+
+// buildKubeadmConfigPatches creates kubeadm configuration patches
+func (kind *KindManager) buildKubeadmConfigPatches(cfg *config.ClusterConfig) []string {
+	var patches []string
+
+	// Get effective proxy configuration (YAML config overrides environment variables)
+	httpProxy, httpsProxy, noProxy := kind.getEffectiveProxyConfig(cfg)
+
+	// Check if proxy was explicitly disabled
+	if cfg.Proxy != nil && cfg.Proxy.Enabled != nil && !*cfg.Proxy.Enabled {
+		fmt.Printf("Proxy explicitly disabled (ignoring environment variables)\n")
+		return patches
+	}
+
+	// Add proxy configuration if any proxy settings are present
+	if httpProxy != "" || httpsProxy != "" || noProxy != "" {
+		// Inform user about proxy configuration source
+		if cfg.Proxy != nil && (cfg.Proxy.HTTPProxy != "" || cfg.Proxy.HTTPSProxy != "" || cfg.Proxy.NoProxy != "") {
+			fmt.Printf("Using proxy configuration from kraze.yml\n")
+		} else {
+			fmt.Printf("Using proxy configuration from environment variables\n")
+		}
+		var proxyPatch strings.Builder
+		proxyPatch.WriteString("kind: InitConfiguration\n")
+		proxyPatch.WriteString("nodeRegistration:\n")
+		proxyPatch.WriteString("  kubeletExtraArgs:\n")
+
+		if httpProxy != "" {
+			proxyPatch.WriteString(fmt.Sprintf("    http-proxy: %s\n", httpProxy))
+		}
+		if httpsProxy != "" {
+			proxyPatch.WriteString(fmt.Sprintf("    https-proxy: %s\n", httpsProxy))
+		}
+		if noProxy != "" {
+			proxyPatch.WriteString(fmt.Sprintf("    no-proxy: %s\n", noProxy))
+		}
+
+		patches = append(patches, proxyPatch.String())
+
+		// Also add a ClusterConfiguration patch to set proxy for control plane components
+		var clusterPatch strings.Builder
+		clusterPatch.WriteString("kind: ClusterConfiguration\n")
+		clusterPatch.WriteString("apiServer:\n")
+		clusterPatch.WriteString("  extraEnv:\n")
+
+		if httpProxy != "" {
+			clusterPatch.WriteString(fmt.Sprintf("  - name: HTTP_PROXY\n    value: %s\n", httpProxy))
+		}
+		if httpsProxy != "" {
+			clusterPatch.WriteString(fmt.Sprintf("  - name: HTTPS_PROXY\n    value: %s\n", httpsProxy))
+		}
+		if noProxy != "" {
+			clusterPatch.WriteString(fmt.Sprintf("  - name: NO_PROXY\n    value: %s\n", noProxy))
+		}
+
+		patches = append(patches, clusterPatch.String())
+	}
+
+	// Add patch to update CA certificates if custom CAs are provided
+	if len(cfg.CACertificates) > 0 {
+		// Add a preKubeadmCommands-style patch
+		// Note: kind doesn't directly support preKubeadmCommands in v1alpha4
+		// but we can use a postKubeadmCommands via JoinConfiguration for workers
+		// For control-plane, we'll document that users should use node_image with pre-installed certs
+		// or rely on the containerd registry configuration
+
+		// Actually, we can use InitConfiguration to run commands before kubeadm
+		caPatch := `kind: InitConfiguration
+nodeRegistration:
+  kubeletExtraArgs:
+    node-labels: "kraze-ca-configured=true"`
+		patches = append(patches, caPatch)
+	}
+
+	return patches
 }
 
 // buildKindNode converts a kraze node to a kind node

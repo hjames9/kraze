@@ -13,16 +13,19 @@ type Config struct {
 
 // ClusterConfig represents the cluster configuration
 type ClusterConfig struct {
-	Name          string                 `yaml:"name"`
-	Version       string                 `yaml:"version,omitempty"`
-	NodeImage     string                 `yaml:"node_image,omitempty"`
-	Config        []KindNode             `yaml:"config,omitempty"`
-	Networking    *NetworkingConfig      `yaml:"networking,omitempty"`
-	PreloadImages []string               `yaml:"preload_images,omitempty"`
-	External      *ExternalClusterConfig `yaml:"external,omitempty"`
-	Network       string                 `yaml:"network,omitempty"`       // Docker network name (optional, auto-detected if not specified)
-	IPv4Address   string                 `yaml:"ipv4_address,omitempty"`  // Static IPv4 address for cluster container on Docker network
-	Subnet        string                 `yaml:"subnet,omitempty"`        // Docker network subnet (e.g., "172.1.0.0/16") - creates network if it doesn't exist
+	Name               string                 `yaml:"name"`
+	Version            string                 `yaml:"version,omitempty"`
+	NodeImage          string                 `yaml:"node_image,omitempty"`
+	Config             []KindNode             `yaml:"config,omitempty"`
+	Networking         *NetworkingConfig      `yaml:"networking,omitempty"`
+	PreloadImages      []string               `yaml:"preload_images,omitempty"`
+	External           *ExternalClusterConfig `yaml:"external,omitempty"`
+	Network            string                 `yaml:"network,omitempty"`            // Docker network name (optional, auto-detected if not specified)
+	IPv4Address        string                 `yaml:"ipv4_address,omitempty"`       // Static IPv4 address for cluster container on Docker network
+	Subnet             string                 `yaml:"subnet,omitempty"`             // Docker network subnet (e.g., "172.1.0.0/16") - creates network if it doesn't exist
+	CACertificates     []string               `yaml:"ca_certificates,omitempty"`    // Paths to CA certificate files to trust in cluster nodes
+	InsecureRegistries []string               `yaml:"insecure_registries,omitempty"` // Registries to skip TLS verification (e.g., ["registry.corp.com"])
+	Proxy              *ProxyConfig           `yaml:"proxy,omitempty"`              // HTTP/HTTPS proxy configuration
 }
 
 // KindNode represents a kind node configuration
@@ -54,6 +57,14 @@ type NetworkingConfig struct {
 	DisableDefaultCNI bool   `yaml:"disableDefaultCNI,omitempty"`
 	PodSubnet         string `yaml:"podSubnet,omitempty"`
 	ServiceSubnet     string `yaml:"serviceSubnet,omitempty"`
+}
+
+// ProxyConfig represents HTTP/HTTPS proxy configuration for cluster nodes
+type ProxyConfig struct {
+	Enabled    *bool  `yaml:"enabled,omitempty"`     // Enable/disable proxy (nil = auto-detect from env vars, true = force enable, false = force disable)
+	HTTPProxy  string `yaml:"http_proxy,omitempty"`  // HTTP proxy URL (e.g., "http://proxy.corp.com:8080")
+	HTTPSProxy string `yaml:"https_proxy,omitempty"` // HTTPS proxy URL (e.g., "http://proxy.corp.com:8080")
+	NoProxy    string `yaml:"no_proxy,omitempty"`    // Comma-separated list of hosts to exclude from proxy
 }
 
 // ExternalClusterConfig represents configuration for using an existing cluster
