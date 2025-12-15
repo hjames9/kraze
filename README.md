@@ -386,7 +386,9 @@ cluster:
   #   - /etc/ssl/certs/corporate-ca.crt
   # insecure_registries:              # Skip TLS verification for specific registries
   #   - registry.corp.com
-  # proxy:                            # HTTP/HTTPS proxy (also auto-detected from env vars)
+  # proxy:                            # HTTP/HTTPS proxy (opt-in)
+  #   enabled: true                   # Use HTTP_PROXY, HTTPS_PROXY, NO_PROXY from env
+  #   # Or set explicit values (enabled field not needed):
   #   http_proxy: http://proxy:8080
   #   https_proxy: http://proxy:8080
   #   no_proxy: localhost,127.0.0.1
@@ -519,7 +521,13 @@ kraze will mount the certificate into cluster nodes and configure containerd to 
 
 #### HTTP/HTTPS Proxy
 
-kraze automatically detects and uses proxy settings from environment variables (`HTTP_PROXY`, `HTTPS_PROXY`, `NO_PROXY`):
+Proxy support is **opt-in**. To use environment variables, enable proxy in your config:
+
+```yaml
+cluster:
+  proxy:
+    enabled: true  # Use HTTP_PROXY, HTTPS_PROXY, NO_PROXY from environment
+```
 
 ```bash
 export HTTP_PROXY=http://proxy.corp.com:8080
@@ -528,7 +536,7 @@ export NO_PROXY=localhost,127.0.0.1,.svc,.cluster.local
 kraze up
 ```
 
-Or configure explicitly in YAML to override environment variables:
+Or configure proxy settings directly in YAML (no `enabled` field needed):
 
 ```yaml
 cluster:

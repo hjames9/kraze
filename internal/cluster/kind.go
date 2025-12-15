@@ -621,34 +621,43 @@ func (kind *KindManager) buildContainerdConfigPatches(cfg *config.ClusterConfig)
 }
 
 // getEffectiveProxyConfig returns the effective proxy configuration
+// Proxy is OPT-IN: environment variables are only used if proxy.enabled: true is set
 // Priority: YAML config > environment variables
 // Checks both uppercase and lowercase variants of environment variables
-// If proxy.enabled is explicitly set to false, returns empty strings (disables proxy)
 func (kind *KindManager) getEffectiveProxyConfig(cfg *config.ClusterConfig) (httpProxy, httpsProxy, noProxy string) {
+	// If no proxy config at all, return empty (opt-in behavior)
+	if cfg.Proxy == nil {
+		return "", "", ""
+	}
+
 	// Check if proxy is explicitly disabled
-	if cfg.Proxy != nil && cfg.Proxy.Enabled != nil && !*cfg.Proxy.Enabled {
+	if cfg.Proxy.Enabled != nil && !*cfg.Proxy.Enabled {
 		// Proxy explicitly disabled, return empty values
 		return "", "", ""
 	}
 
-	// Start with environment variables (check both uppercase and lowercase)
-	httpProxy = os.Getenv("HTTP_PROXY")
-	if httpProxy == "" {
-		httpProxy = os.Getenv("http_proxy")
-	}
+	// If any proxy values are explicitly set in YAML, use them (don't need enabled: true)
+	hasExplicitValues := cfg.Proxy.HTTPProxy != "" || cfg.Proxy.HTTPSProxy != "" || cfg.Proxy.NoProxy != ""
 
-	httpsProxy = os.Getenv("HTTPS_PROXY")
-	if httpsProxy == "" {
-		httpsProxy = os.Getenv("https_proxy")
-	}
+	// If proxy is explicitly enabled OR has explicit values, proceed
+	if (cfg.Proxy.Enabled != nil && *cfg.Proxy.Enabled) || hasExplicitValues {
+		// Start with environment variables if enabled (check both uppercase and lowercase)
+		httpProxy = os.Getenv("HTTP_PROXY")
+		if httpProxy == "" {
+			httpProxy = os.Getenv("http_proxy")
+		}
 
-	noProxy = os.Getenv("NO_PROXY")
-	if noProxy == "" {
-		noProxy = os.Getenv("no_proxy")
-	}
+		httpsProxy = os.Getenv("HTTPS_PROXY")
+		if httpsProxy == "" {
+			httpsProxy = os.Getenv("https_proxy")
+		}
 
-	// Override with YAML config if specified
-	if cfg.Proxy != nil {
+		noProxy = os.Getenv("NO_PROXY")
+		if noProxy == "" {
+			noProxy = os.Getenv("no_proxy")
+		}
+
+		// Override with YAML config if specified
 		if cfg.Proxy.HTTPProxy != "" {
 			httpProxy = cfg.Proxy.HTTPProxy
 		}
@@ -658,9 +667,12 @@ func (kind *KindManager) getEffectiveProxyConfig(cfg *config.ClusterConfig) (htt
 		if cfg.Proxy.NoProxy != "" {
 			noProxy = cfg.Proxy.NoProxy
 		}
+
+		return httpProxy, httpsProxy, noProxy
 	}
 
-	return httpProxy, httpsProxy, noProxy
+	// Proxy section exists but not enabled and no explicit values - return empty
+	return "", "", ""
 }
 
 // buildKubeadmConfigPatches creates kubeadm configuration patches

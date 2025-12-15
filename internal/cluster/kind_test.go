@@ -364,7 +364,7 @@ func TestGetEffectiveProxyConfig(test *testing.T) {
 			description:     "should return empty strings when no proxy configured",
 		},
 		{
-			name: "env vars only (uppercase)",
+			name: "env vars present but proxy not enabled (opt-in)",
 			envVars: map[string]string{
 				"HTTP_PROXY":  "http://proxy.corp.com:8080",
 				"HTTPS_PROXY": "http://proxy.corp.com:8080",
@@ -373,13 +373,31 @@ func TestGetEffectiveProxyConfig(test *testing.T) {
 			config: &config.ClusterConfig{
 				Name: "test",
 			},
+			expectedHTTP:    "",
+			expectedHTTPS:   "",
+			expectedNoProxy: "",
+			description:     "should ignore env vars unless explicitly enabled (opt-in)",
+		},
+		{
+			name: "env vars with enabled: true (uppercase)",
+			envVars: map[string]string{
+				"HTTP_PROXY":  "http://proxy.corp.com:8080",
+				"HTTPS_PROXY": "http://proxy.corp.com:8080",
+				"NO_PROXY":    "localhost,127.0.0.1",
+			},
+			config: &config.ClusterConfig{
+				Name: "test",
+				Proxy: &config.ProxyConfig{
+					Enabled: boolPtr(true),
+				},
+			},
 			expectedHTTP:    "http://proxy.corp.com:8080",
 			expectedHTTPS:   "http://proxy.corp.com:8080",
 			expectedNoProxy: "localhost,127.0.0.1",
-			description:     "should use uppercase environment variables",
+			description:     "should use uppercase environment variables when enabled: true",
 		},
 		{
-			name: "env vars only (lowercase)",
+			name: "env vars with enabled: true (lowercase)",
 			envVars: map[string]string{
 				"http_proxy":  "http://proxy.example.com:3128",
 				"https_proxy": "http://proxy.example.com:3128",
@@ -387,11 +405,14 @@ func TestGetEffectiveProxyConfig(test *testing.T) {
 			},
 			config: &config.ClusterConfig{
 				Name: "test",
+				Proxy: &config.ProxyConfig{
+					Enabled: boolPtr(true),
+				},
 			},
 			expectedHTTP:    "http://proxy.example.com:3128",
 			expectedHTTPS:   "http://proxy.example.com:3128",
 			expectedNoProxy: ".internal",
-			description:     "should use lowercase environment variables",
+			description:     "should use lowercase environment variables when enabled: true",
 		},
 		{
 			name: "YAML overrides env vars",
@@ -414,7 +435,25 @@ func TestGetEffectiveProxyConfig(test *testing.T) {
 			description:     "YAML config should override environment variables",
 		},
 		{
-			name: "YAML partial override",
+			name: "explicit YAML values without enabled field",
+			envVars: map[string]string{
+				"HTTP_PROXY": "http://env-proxy:8080",
+			},
+			config: &config.ClusterConfig{
+				Name: "test",
+				Proxy: &config.ProxyConfig{
+					HTTPProxy:  "http://yaml-proxy:3128",
+					HTTPSProxy: "http://yaml-proxy:3128",
+					NoProxy:    ".cluster.local",
+				},
+			},
+			expectedHTTP:    "http://yaml-proxy:3128",
+			expectedHTTPS:   "http://yaml-proxy:3128",
+			expectedNoProxy: ".cluster.local",
+			description:     "explicit YAML values work without enabled: true",
+		},
+		{
+			name: "YAML partial override with enabled: true",
 			envVars: map[string]string{
 				"HTTP_PROXY":  "http://env-proxy:8080",
 				"HTTPS_PROXY": "http://env-proxy:8080",
@@ -423,6 +462,7 @@ func TestGetEffectiveProxyConfig(test *testing.T) {
 			config: &config.ClusterConfig{
 				Name: "test",
 				Proxy: &config.ProxyConfig{
+					Enabled:   boolPtr(true),
 					HTTPProxy: "http://yaml-proxy:3128",
 					// HTTPS_PROXY not set in YAML
 					// NO_PROXY not set in YAML
