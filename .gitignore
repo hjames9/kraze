@@ -37,3 +37,7 @@ go.work
 # OS specific files
 .DS_Store
 Thumbs.db
+
+# No MD files
+*.md
+!README.md

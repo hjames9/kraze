@@ -75,17 +75,26 @@ func (kind *KindManager) CreateCluster(ctx context.Context, cfg *config.ClusterC
 	// Give the API server a few seconds to be fully ready after network changes
 	// kind's CreateWithWaitForReady already waits, but connecting to a new network
 	// might need a moment for routing to stabilize
-	fmt.Printf("Waiting for API server to stabilize...\n")
+	fmt.Printf("Waiting for cluster to fully stabilize...\n")
 	time.Sleep(5 * time.Second)
 
 	// Update CA certificates if custom CAs were mounted
+	// This is done after cluster init to avoid interfering with kubeadm init
+	// Note: We don't reload containerd - the CAs will be picked up on next image pull
 	if len(cfg.CACertificates) > 0 {
+		// Give a bit more time for all systemd services to be fully up
+		// This ensures update-ca-certificates has all dependencies ready
+		fmt.Printf("Preparing to update CA certificates...\n")
+		time.Sleep(3 * time.Second)
+
 		if err := kind.updateCACertificates(cfg.Name); err != nil {
-			fmt.Printf("Warning: Could not update CA certificates: %v\n", err)
+			// This is a critical error - without CA certificates, application images won't pull
+			return fmt.Errorf("failed to update CA certificates: %w", err)
 		}
 	}
 
 	// Configure insecure registries if specified
+	// This is done after cluster init to avoid interfering with kubeadm
 	if len(cfg.InsecureRegistries) > 0 {
 		if err := kind.configureInsecureRegistries(cfg.Name, cfg.InsecureRegistries); err != nil {
 			fmt.Printf("Warning: Could not configure insecure registries: %v\n", err)
@@ -553,6 +562,8 @@ func (kind *KindManager) UntagImage(ctx context.Context, clusterName, imageName 
 }
 
 // updateCACertificates runs update-ca-certificates in all nodes
+// This updates the system CA trust store with custom certificates mounted via extraMounts
+// Note: We don't reload containerd - CAs will be automatically used on next image pull
 func (kind *KindManager) updateCACertificates(clusterName string) error {
 	fmt.Printf("Updating CA certificates in cluster nodes...\n")
 
@@ -566,19 +577,22 @@ func (kind *KindManager) updateCACertificates(clusterName string) error {
 	for _, node := range nodes {
 		containerName := node.String()
 
-		// Run update-ca-certificates command
-		cmd := osexec.Command("docker", "exec", containerName, "update-ca-certificates")
-		if output, err := cmd.CombinedOutput(); err != nil {
-			return fmt.Errorf("failed to update CA certificates in node %s: %w\nOutput: %s", containerName, err, string(output))
-		}
+		// Use timeout to prevent hanging - update-ca-certificates should complete in seconds
+		// We use 30 seconds to be safe, but it typically completes in <1 second
+		cmd := osexec.Command("timeout", "30", "docker", "exec", containerName, "update-ca-certificates")
+		output, err := cmd.CombinedOutput()
 
-		// Send SIGHUP to containerd to reload configuration (less disruptive than restart)
-		// This makes containerd reload its CA certificates without stopping containers
-		killCmd := osexec.Command("docker", "exec", containerName, "pkill", "-HUP", "containerd")
-		if output, err := killCmd.CombinedOutput(); err != nil {
-			return fmt.Errorf("failed to reload containerd configuration in node %s: %w\nOutput: %s",
+		if err != nil {
+			// Check if it was a timeout
+			if exitErr, ok := err.(*osexec.ExitError); ok && exitErr.ExitCode() == 124 {
+				return fmt.Errorf("update-ca-certificates timed out after 30 seconds in node %s\nOutput: %s",
+					containerName, string(output))
+			}
+			return fmt.Errorf("failed to update CA certificates in node %s: %w\nOutput: %s",
 				containerName, err, string(output))
 		}
+
+		fmt.Printf("  Node %s: CA certificates updated\n", containerName)
 	}
 
 	fmt.Printf("%s CA certificates updated successfully\n", color.Checkmark())
@@ -587,6 +601,7 @@ func (kind *KindManager) updateCACertificates(clusterName string) error {
 
 // configureInsecureRegistries configures containerd to skip TLS verification for specified registries
 // Uses the newer containerd v2 config_path format with hosts.toml files
+// This is done AFTER cluster init to avoid breaking Docker Hub access during kubeadm init
 func (kind *KindManager) configureInsecureRegistries(clusterName string, registries []string) error {
 	fmt.Printf("Configuring insecure registries in cluster nodes...\n")
 
@@ -599,6 +614,18 @@ func (kind *KindManager) configureInsecureRegistries(clusterName string, registr
 	// Configure each node
 	for _, node := range nodes {
 		containerName := node.String()
+
+		// First, update containerd config to use config_path for v2 registry format
+		// This must be done before creating the hosts.toml files
+		configPatch := `[plugins."io.containerd.grpc.v1.cri".registry]
+  config_path = "/etc/containerd/certs.d"`
+
+		patchCmd := osexec.Command("docker", "exec", containerName, "sh", "-c",
+			fmt.Sprintf("cat >> /etc/containerd/config.toml << 'EOF'\n%sEOF", configPatch))
+		if output, err := patchCmd.CombinedOutput(); err != nil {
+			return fmt.Errorf("failed to patch containerd config in node %s: %w\nOutput: %s",
+				containerName, err, string(output))
+		}
 
 		// For each registry, create a hosts.toml file
 		for _, registry := range registries {
@@ -733,13 +760,10 @@ func (kind *KindManager) buildCAMounts(cfg *config.ClusterConfig) []v1alpha4.Mou
 func (kind *KindManager) buildContainerdConfigPatches(cfg *config.ClusterConfig) []string {
 	var patches []string
 
-	// Enable containerd v2 registry config_path for insecure registries
-	// This allows us to use /etc/containerd/certs.d/<registry>/hosts.toml files
-	if len(cfg.InsecureRegistries) > 0 {
-		patch := `[plugins."io.containerd.grpc.v1.cri".registry]
-  config_path = "/etc/containerd/certs.d"`
-		patches = append(patches, patch)
-	}
+	// Note: We do NOT configure insecure registries here via config_path
+	// Setting config_path would tell containerd to ONLY use /etc/containerd/certs.d/
+	// which is empty during kubeadm init, breaking Docker Hub access.
+	// Insecure registries are configured AFTER cluster init via configureInsecureRegistries()
 
 	return patches
 }
@@ -802,12 +826,14 @@ func (kind *KindManager) getEffectiveProxyConfig(cfg *config.ClusterConfig) (htt
 // buildKubeadmConfigPatches creates kubeadm configuration patches
 // Note: Proxy configuration is applied AFTER cluster initialization via configureProxy()
 // to avoid interfering with kubeadm init
+//
+// Note: CA certificates are also configured AFTER cluster initialization
+// They are mounted via extraMounts and updated in the post-init phase
 func (kind *KindManager) buildKubeadmConfigPatches(cfg *config.ClusterConfig) []string {
 	var patches []string
 
-	// Note: We intentionally do NOT configure proxy here
-	// Proxy settings are applied after cluster initialization
-	// to avoid breaking internal cluster communication during kubeadm init
+	// Note: We intentionally do NOT configure proxy or CA certificates here
+	// Both are applied after cluster initialization to avoid interfering with kubeadm init
 
 	return patches
 }

@@ -638,15 +638,9 @@ func TestBuildContainerdConfigPatches(test *testing.T) {
 				InsecureRegistries: []string{"ghcr.io"},
 			},
 			validate: func(test *testing.T, patches []string) {
-				if len(patches) != 1 {
-					test.Fatalf("Expected 1 patch (config_path), got %d", len(patches))
-				}
-				// Should set config_path for containerd v2 format
-				if !containsString(patches[0], "config_path") {
-					test.Errorf("Patch doesn't contain 'config_path': %s", patches[0])
-				}
-				if !containsString(patches[0], "/etc/containerd/certs.d") {
-					test.Errorf("Patch doesn't contain '/etc/containerd/certs.d': %s", patches[0])
+				// Insecure registries are now configured post-init, so no patches expected
+				if len(patches) != 0 {
+					test.Fatalf("Expected 0 patches (insecure registries configured post-init), got %d", len(patches))
 				}
 			},
 		},
@@ -657,12 +651,9 @@ func TestBuildContainerdConfigPatches(test *testing.T) {
 				InsecureRegistries: []string{"ghcr.io", "registry.corp.com", "docker.io"},
 			},
 			validate: func(test *testing.T, patches []string) {
-				// Only need one patch to set config_path (not one per registry)
-				if len(patches) != 1 {
-					test.Fatalf("Expected 1 patch (config_path), got %d", len(patches))
-				}
-				if !containsString(patches[0], "config_path") {
-					test.Errorf("Patch doesn't contain 'config_path': %s", patches[0])
+				// Insecure registries are now configured post-init, so no patches expected
+				if len(patches) != 0 {
+					test.Fatalf("Expected 0 patches (insecure registries configured post-init), got %d", len(patches))
 				}
 			},
 		},
@@ -698,6 +689,10 @@ func TestBuildKindConfigWithCorporateFeatures(test *testing.T) {
 				if len(cluster.Nodes[0].ExtraMounts) != 1 {
 					test.Errorf("Expected 1 extra mount, got %d", len(cluster.Nodes[0].ExtraMounts))
 				}
+				// CA certificates are updated post-init, so no kubeadm patches expected
+				if len(cluster.KubeadmConfigPatches) != 0 {
+					test.Errorf("Expected 0 kubeadm config patches, got %d", len(cluster.KubeadmConfigPatches))
+				}
 			},
 		},
 		{
@@ -707,9 +702,9 @@ func TestBuildKindConfigWithCorporateFeatures(test *testing.T) {
 				InsecureRegistries: []string{"ghcr.io"},
 			},
 			validate: func(test *testing.T, cluster *v1alpha4.Cluster) {
-				// Should have containerd config patches
-				if len(cluster.ContainerdConfigPatches) != 1 {
-					test.Errorf("Expected 1 containerd config patch, got %d", len(cluster.ContainerdConfigPatches))
+				// Insecure registries are configured post-init, so no containerd patches expected
+				if len(cluster.ContainerdConfigPatches) != 0 {
+					test.Errorf("Expected 0 containerd config patches, got %d", len(cluster.ContainerdConfigPatches))
 				}
 			},
 		},
@@ -747,11 +742,14 @@ func TestBuildKindConfigWithCorporateFeatures(test *testing.T) {
 				if len(cluster.Nodes[0].ExtraMounts) == 0 {
 					test.Error("Expected CA certificate mounts")
 				}
-				// Insecure registries should have containerd config patch (config_path)
-				if len(cluster.ContainerdConfigPatches) == 0 {
-					test.Error("Expected containerd config patches")
+				// Both insecure registries and CA certs are configured post-init, so no containerd patches expected
+				if len(cluster.ContainerdConfigPatches) != 0 {
+					test.Errorf("Expected 0 containerd config patches, got %d", len(cluster.ContainerdConfigPatches))
 				}
-				// Proxy is configured post-init, so no kubeadm patches expected
+				// Both CA certs and proxy are configured post-init, so no kubeadm patches expected
+				if len(cluster.KubeadmConfigPatches) != 0 {
+					test.Errorf("Expected 0 kubeadm config patches, got %d", len(cluster.KubeadmConfigPatches))
+				}
 			},
 		},
 	}
