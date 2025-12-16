@@ -714,24 +714,18 @@ func (kind *KindManager) configureProxy(clusterName, httpProxy, httpsProxy, noPr
 				containerName, err, string(output))
 		}
 
-		// Reload systemd daemon
+		// Reload systemd daemon to pick up the new drop-in file
 		reloadCmd := osexec.Command("docker", "exec", containerName, "systemctl", "daemon-reload")
 		if output, err := reloadCmd.CombinedOutput(); err != nil {
 			return fmt.Errorf("failed to reload systemd daemon in node %s: %w\nOutput: %s",
 				containerName, err, string(output))
 		}
 
-		// Restart containerd to pick up the new proxy environment variables
-		// Note: This is safe because the cluster is already initialized
-		// Kubelet will automatically restart any affected containers
-		restartCmd := osexec.Command("docker", "exec", containerName, "systemctl", "restart", "containerd")
-		if output, err := restartCmd.CombinedOutput(); err != nil {
-			return fmt.Errorf("failed to restart containerd in node %s: %w\nOutput: %s",
-				containerName, err, string(output))
-		}
-
-		// Wait for containerd to fully restart
-		time.Sleep(3 * time.Second)
+		// Note: We do NOT restart containerd here because it would kill all running containers
+		// (including the Kubernetes API server and other critical components).
+		// The proxy environment variables will be available to containerd's child processes
+		// (like image pulls) without requiring a restart.
+		// If a full restart is needed, the user can destroy and recreate the cluster.
 	}
 
 	fmt.Printf("%s Proxy configured successfully\n", color.Checkmark())
