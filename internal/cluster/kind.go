@@ -49,7 +49,10 @@ func (kind *KindManager) CreateCluster(ctx context.Context, cfg *config.ClusterC
 	}
 
 	// Convert kraze config to kind config
-	kindConfig := kind.buildKindConfig(cfg)
+	kindConfig, err := kind.buildKindConfig(cfg)
+	if err != nil {
+		return fmt.Errorf("failed to build kind config: %w", err)
+	}
 
 	// Create the cluster
 	createOpts := []cluster.CreateOption{
@@ -67,22 +70,13 @@ func (kind *KindManager) CreateCluster(ctx context.Context, cfg *config.ClusterC
 		createErr <- kind.provider.Create(cfg.Name, createOpts...)
 	}()
 
-	// Wait for container to exist, then apply cgroup workaround and GODEBUG setting
+	// Wait for container to exist, then apply cgroup workaround
 	// This prevents Kubernetes 1.34.0+ kubelet failures on cgroup v1 systems
-	// and configures containerd to accept CA certificates with negative serial numbers
 	time.Sleep(10 * time.Second) // Give kind time to create the container
 
 	if err := kind.ensureKubeletCgroupDirectories(cfg.Name); err != nil {
 		// Log but don't fail - cluster might still work without this
 		fmt.Printf("Note: Could not create kubelet cgroup directories (cluster may still succeed): %v\n", err)
-	}
-
-	// If CA certificates are configured, set GODEBUG before kubeadm finishes
-	// This must be done before containerd pulls images from registries with non-standard certificates
-	if len(cfg.CACertificates) > 0 {
-		if err := kind.setupContainerdGODEBUG(cfg.Name); err != nil {
-			return fmt.Errorf("failed to configure containerd GODEBUG: %w", err)
-		}
 	}
 
 	// Wait for cluster creation to complete
@@ -394,7 +388,7 @@ func (kind *KindManager) getNodeImage(cfg *config.ClusterConfig) string {
 }
 
 // buildKindConfig converts kraze cluster config to kind v1alpha4 config
-func (kind *KindManager) buildKindConfig(cfg *config.ClusterConfig) *v1alpha4.Cluster {
+func (kind *KindManager) buildKindConfig(cfg *config.ClusterConfig) (*v1alpha4.Cluster, error) {
 	kindCfg := &v1alpha4.Cluster{
 		TypeMeta: v1alpha4.TypeMeta{
 			APIVersion: "kind.x-k8s.io/v1alpha4",
@@ -422,20 +416,27 @@ func (kind *KindManager) buildKindConfig(cfg *config.ClusterConfig) *v1alpha4.Cl
 	// Determine which node image to use
 	nodeImage := kind.getNodeImage(cfg)
 
-	// Build extra mounts for CA certificates (applied to all nodes)
+	// Build extra mounts for CA certificates and GODEBUG configuration (applied to all nodes)
 	caMounts := kind.buildCAMounts(cfg)
+	godebugMount, err := kind.buildGODEBUGMount(cfg.Name)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create GODEBUG configuration: %w", err)
+	}
+
+	// Combine CA mounts and GODEBUG mount
+	allMounts := append(caMounts, godebugMount)
 
 	// If no nodes specified in config, create a default control-plane node
 	if len(cfg.Config) == 0 {
 		node := v1alpha4.Node{
 			Role:        v1alpha4.ControlPlaneRole,
-			ExtraMounts: caMounts,
+			ExtraMounts: allMounts,
 		}
 		if nodeImage != "" {
 			node.Image = nodeImage
 		}
 		kindCfg.Nodes = append(kindCfg.Nodes, node)
-		return kindCfg
+		return kindCfg, nil
 	}
 
 	// Convert kraze nodes to kind nodes
@@ -447,8 +448,8 @@ func (kind *KindManager) buildKindConfig(cfg *config.ClusterConfig) *v1alpha4.Cl
 			kindNode.Image = nodeImage
 		}
 
-		// Add CA certificate mounts to existing mounts
-		kindNode.ExtraMounts = append(kindNode.ExtraMounts, caMounts...)
+		// Add CA certificate and GODEBUG mounts to existing mounts
+		kindNode.ExtraMounts = append(kindNode.ExtraMounts, allMounts...)
 
 		// Handle replicas for worker nodes
 		if node.Replicas > 0 {
@@ -460,7 +461,7 @@ func (kind *KindManager) buildKindConfig(cfg *config.ClusterConfig) *v1alpha4.Cl
 		}
 	}
 
-	return kindCfg
+	return kindCfg, nil
 }
 
 // PullImage pulls a Docker image from a remote registry
@@ -625,63 +626,6 @@ func (kind *KindManager) ensureKubeletCgroupDirectories(clusterName string) erro
 		}
 	}
 
-	return nil
-}
-
-// setupContainerdGODEBUG configures containerd to accept certificates with negative serial numbers
-// This is called BEFORE kubeadm init completes, so the restart happens before the cluster is fully up
-// This is much safer than restarting containerd after the API server is running
-func (kind *KindManager) setupContainerdGODEBUG(clusterName string) error {
-	fmt.Printf("Configuring containerd to accept certificates with negative serial numbers...\n")
-
-	nodes, err := kind.provider.ListInternalNodes(clusterName)
-	if err != nil {
-		return fmt.Errorf("failed to list cluster nodes: %w", err)
-	}
-
-	for _, node := range nodes {
-		containerName := node.String()
-
-		// Create systemd drop-in directory
-		mkdirCmd := osexec.Command("docker", "exec", containerName, "mkdir", "-p", "/etc/systemd/system/containerd.service.d")
-		if output, err := mkdirCmd.CombinedOutput(); err != nil {
-			return fmt.Errorf("failed to create systemd drop-in directory in node %s: %w\nOutput: %s",
-				containerName, err, string(output))
-		}
-
-		// Write GODEBUG configuration
-		// This allows Go (used by containerd) to accept CA certificates with negative serial numbers
-		godebugConf := `[Service]
-Environment="GODEBUG=x509negativeserial=1"
-`
-		writeCmd := osexec.Command("docker", "exec", containerName, "sh", "-c",
-			fmt.Sprintf("cat > /etc/systemd/system/containerd.service.d/godebug.conf << 'EOF'\n%sEOF", godebugConf))
-		if output, err := writeCmd.CombinedOutput(); err != nil {
-			return fmt.Errorf("failed to write GODEBUG config in node %s: %w\nOutput: %s",
-				containerName, err, string(output))
-		}
-
-		// Reload systemd to pick up the new configuration
-		reloadCmd := osexec.Command("docker", "exec", containerName, "systemctl", "daemon-reload")
-		if output, err := reloadCmd.CombinedOutput(); err != nil {
-			return fmt.Errorf("failed to reload systemd daemon in node %s: %w\nOutput: %s",
-				containerName, err, string(output))
-		}
-
-		// Restart containerd to apply GODEBUG setting
-		// This happens BEFORE kubeadm init completes, so it's safe
-		// kubeadm will use the restarted containerd with GODEBUG already set
-		fmt.Printf("  Node %s: restarting containerd to apply GODEBUG setting (before cluster init completes)...\n", containerName)
-		restartCmd := osexec.Command("docker", "exec", containerName, "systemctl", "restart", "containerd")
-		if output, err := restartCmd.CombinedOutput(); err != nil {
-			return fmt.Errorf("failed to restart containerd in node %s: %w\nOutput: %s",
-				containerName, err, string(output))
-		}
-
-		fmt.Printf("  Node %s: GODEBUG configured\n", containerName)
-	}
-
-	fmt.Printf("%s Containerd configured to accept certificates with negative serial numbers\n", color.Checkmark())
 	return nil
 }
 
@@ -872,6 +816,43 @@ func (kind *KindManager) buildCAMounts(cfg *config.ClusterConfig) []v1alpha4.Mou
 	}
 
 	return mounts
+}
+
+// buildGODEBUGMount creates a systemd drop-in file for containerd with GODEBUG settings
+// This file is mounted into the container BEFORE containerd starts, eliminating the need for restarts
+// GODEBUG=x509negativeserial=1 allows Go to accept X.509 certificates with negative serial numbers
+// This is needed for:
+// - Corporate CA certificates that may have negative serial numbers
+// - SSL-inspecting proxies that inject certificates with negative serial numbers
+// - Registry certificates with non-standard serial numbers
+func (kind *KindManager) buildGODEBUGMount(clusterName string) (v1alpha4.Mount, error) {
+	// Create a cluster-specific directory in ~/.kraze/clusters/<cluster-name>/
+	homeDir, err := os.UserHomeDir()
+	if err != nil {
+		return v1alpha4.Mount{}, fmt.Errorf("failed to get user home directory: %w", err)
+	}
+
+	krazeDir := filepath.Join(homeDir, ".kraze", "clusters", clusterName)
+	if err := os.MkdirAll(krazeDir, 0755); err != nil {
+		return v1alpha4.Mount{}, fmt.Errorf("failed to create kraze directory: %w", err)
+	}
+
+	// Create the systemd drop-in file
+	godebugPath := filepath.Join(krazeDir, "containerd-godebug.conf")
+	godebugContent := `[Service]
+Environment="GODEBUG=x509negativeserial=1"
+`
+	if err := os.WriteFile(godebugPath, []byte(godebugContent), 0644); err != nil {
+		return v1alpha4.Mount{}, fmt.Errorf("failed to write GODEBUG config file: %w", err)
+	}
+
+	// Mount it to the systemd drop-in directory
+	// When the container starts, systemd will read this file before starting containerd
+	return v1alpha4.Mount{
+		HostPath:      godebugPath,
+		ContainerPath: "/etc/systemd/system/containerd.service.d/godebug.conf",
+		Readonly:      true,
+	}, nil
 }
 
 // buildContainerdConfigPatches creates containerd configuration patches
