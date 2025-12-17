@@ -651,6 +651,49 @@ func (kind *KindManager) updateCACertificates(clusterName string) error {
 		}
 
 		fmt.Printf("  Node %s: CA certificates updated\n", containerName)
+
+		// Configure containerd to accept certificates with negative serial numbers
+		// Some corporate CAs have certificates with negative serial numbers, which Go rejects by default
+		// Setting GODEBUG=x509negativeserial=1 allows Go to accept them
+		mkdirCmd := osexec.Command("docker", "exec", containerName, "mkdir", "-p", "/etc/systemd/system/containerd.service.d")
+		if output, err := mkdirCmd.CombinedOutput(); err != nil {
+			return fmt.Errorf("failed to create systemd drop-in directory in node %s: %w\nOutput: %s",
+				containerName, err, string(output))
+		}
+
+		godebugConf := `[Service]
+Environment="GODEBUG=x509negativeserial=1"
+`
+		writeCmd := osexec.Command("docker", "exec", containerName, "sh", "-c",
+			fmt.Sprintf("cat > /etc/systemd/system/containerd.service.d/godebug.conf << 'EOF'\n%sEOF", godebugConf))
+		if output, err := writeCmd.CombinedOutput(); err != nil {
+			return fmt.Errorf("failed to write GODEBUG config in node %s: %w\nOutput: %s",
+				containerName, err, string(output))
+		}
+
+		// Reload systemd to pick up the new configuration
+		reloadCmd := osexec.Command("docker", "exec", containerName, "systemctl", "daemon-reload")
+		if output, err := reloadCmd.CombinedOutput(); err != nil {
+			return fmt.Errorf("failed to reload systemd daemon in node %s: %w\nOutput: %s",
+				containerName, err, string(output))
+		}
+
+		// Restart containerd to apply GODEBUG setting
+		// This happens after cluster init but before service installation
+		// Kubelet will automatically restart the control plane pods (API server, etcd, etc.)
+		fmt.Printf("  Node %s: restarting containerd to apply GODEBUG setting...\n", containerName)
+		restartCmd := osexec.Command("docker", "exec", containerName, "systemctl", "restart", "containerd")
+		if output, err := restartCmd.CombinedOutput(); err != nil {
+			return fmt.Errorf("failed to restart containerd in node %s: %w\nOutput: %s",
+				containerName, err, string(output))
+		}
+
+		// Wait for containerd and kubelet to stabilize
+		// The control plane pods will restart, so we need to wait for the API server
+		fmt.Printf("  Node %s: waiting for cluster to stabilize after containerd restart...\n", containerName)
+		time.Sleep(15 * time.Second)
+
+		fmt.Printf("  Node %s: containerd configured to accept negative serial numbers\n", containerName)
 	}
 
 	fmt.Printf("%s CA certificates updated successfully\n", color.Checkmark())
