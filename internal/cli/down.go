@@ -151,6 +151,10 @@ func runDown(cmd *cobra.Command, args []string) error {
 		Verbose("Warning: failed to load state: %v", err)
 		st = state.New(cfg.Cluster.Name, cfg.Cluster.IsExternal())
 	}
+	if st == nil {
+		// State file doesn't exist yet (Load returns nil, nil in this case)
+		st = state.New(cfg.Cluster.Name, cfg.Cluster.IsExternal())
+	}
 
 	// Collect namespaces to clean up BEFORE uninstalling (since uninstall removes from state)
 	// For local dev environments, aggressively clean up namespaces when uninstalling services
