@@ -194,8 +194,15 @@ func (kind *KindManager) GetKubeConfigQuiet(clusterName string, internal bool, q
 	// On native macOS/Windows, kind's port forwarding (127.0.0.1:PORT) works fine
 	// and container IPs are NOT accessible from the host
 	if !kind.shouldPatchKubeconfig() {
-		// Use kind's original kubeconfig - works on macOS, Windows, Linux native
-		return kubeconfig, nil
+		// On native hosts (macOS, Windows, Linux), we need to ensure the kubeconfig
+		// uses localhost with port forwarding instead of container names/IPs
+		// This is because container IPs are not accessible from the host on macOS/Windows
+		patchedConfig, err := kind.patchKubeconfigForNativeHost(clusterName, kubeconfig, quiet)
+		if err != nil {
+			// If patching fails, fall back to original kubeconfig
+			return kubeconfig, nil
+		}
+		return patchedConfig, nil
 	}
 
 	// Patch the kubeconfig to use the container's IP address
@@ -224,6 +231,56 @@ func (kind *KindManager) shouldPatchKubeconfig() bool {
 	// This works on macOS, Windows, and Linux native hosts where kind sets up port forwarding
 	// On these platforms, 127.0.0.1:PORT works and container IPs are NOT accessible
 	return false
+}
+
+// patchKubeconfigForNativeHost replaces container names/IPs with localhost port mappings
+// This is needed on macOS/Windows where container IPs are not accessible from the host
+// but Docker provides port forwarding (e.g., 127.0.0.1:53549->6443/tcp)
+func (kind *KindManager) patchKubeconfigForNativeHost(clusterName, kubeconfig string, quiet bool) (string, error) {
+	containerName := clusterName + "-control-plane"
+
+	// Check if kubeconfig contains the container name
+	// If kind already returned a kubeconfig with localhost, we don't need to patch it
+	if !strings.Contains(kubeconfig, containerName+":6443") {
+		// Already using localhost or doesn't contain container name - no patching needed
+		return kubeconfig, nil
+	}
+
+	// Get the Docker port mapping for the API server (port 6443)
+	// Docker shows something like: 127.0.0.1:53549->6443/tcp
+	cmd := osexec.Command("docker", "port", containerName, "6443")
+	output, err := cmd.Output()
+	if err != nil {
+		return "", fmt.Errorf("failed to get port mapping for container %s: %w", containerName, err)
+	}
+
+	// Parse the output to extract the host port
+	// Output format: "0.0.0.0:53549" or "127.0.0.1:53549"
+	portMapping := strings.TrimSpace(string(output))
+	if portMapping == "" {
+		return "", fmt.Errorf("no port mapping found for port 6443")
+	}
+
+	// Extract just the port number from the mapping
+	// portMapping could be "0.0.0.0:53549" or "127.0.0.1:53549" or "[::]:53549"
+	parts := strings.Split(portMapping, ":")
+	if len(parts) < 2 {
+		return "", fmt.Errorf("invalid port mapping format: %s", portMapping)
+	}
+	hostPort := parts[len(parts)-1] // Get the last part (the port number)
+
+	// Replace container name with localhost and the mapped port
+	patchedConfig := strings.Replace(kubeconfig,
+		"https://"+containerName+":6443",
+		"https://127.0.0.1:"+hostPort,
+		-1)
+
+	if !quiet {
+		fmt.Printf("%s Using localhost port forwarding: 127.0.0.1:%s -> %s:6443\n",
+			color.Checkmark(), hostPort, containerName)
+	}
+
+	return patchedConfig, nil
 }
 
 // patchKubeconfigWithContainerIP replaces the server address with the container's IP
