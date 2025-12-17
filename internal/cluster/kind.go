@@ -67,13 +67,22 @@ func (kind *KindManager) CreateCluster(ctx context.Context, cfg *config.ClusterC
 		createErr <- kind.provider.Create(cfg.Name, createOpts...)
 	}()
 
-	// Wait for container to exist, then apply cgroup workaround
+	// Wait for container to exist, then apply cgroup workaround and GODEBUG setting
 	// This prevents Kubernetes 1.34.0+ kubelet failures on cgroup v1 systems
+	// and configures containerd to accept CA certificates with negative serial numbers
 	time.Sleep(10 * time.Second) // Give kind time to create the container
 
 	if err := kind.ensureKubeletCgroupDirectories(cfg.Name); err != nil {
 		// Log but don't fail - cluster might still work without this
 		fmt.Printf("Note: Could not create kubelet cgroup directories (cluster may still succeed): %v\n", err)
+	}
+
+	// If CA certificates are configured, set GODEBUG before kubeadm finishes
+	// This must be done before containerd pulls images from registries with non-standard certificates
+	if len(cfg.CACertificates) > 0 {
+		if err := kind.setupContainerdGODEBUG(cfg.Name); err != nil {
+			return fmt.Errorf("failed to configure containerd GODEBUG: %w", err)
+		}
 	}
 
 	// Wait for cluster creation to complete
@@ -619,6 +628,63 @@ func (kind *KindManager) ensureKubeletCgroupDirectories(clusterName string) erro
 	return nil
 }
 
+// setupContainerdGODEBUG configures containerd to accept certificates with negative serial numbers
+// This is called BEFORE kubeadm init completes, so the restart happens before the cluster is fully up
+// This is much safer than restarting containerd after the API server is running
+func (kind *KindManager) setupContainerdGODEBUG(clusterName string) error {
+	fmt.Printf("Configuring containerd to accept certificates with negative serial numbers...\n")
+
+	nodes, err := kind.provider.ListInternalNodes(clusterName)
+	if err != nil {
+		return fmt.Errorf("failed to list cluster nodes: %w", err)
+	}
+
+	for _, node := range nodes {
+		containerName := node.String()
+
+		// Create systemd drop-in directory
+		mkdirCmd := osexec.Command("docker", "exec", containerName, "mkdir", "-p", "/etc/systemd/system/containerd.service.d")
+		if output, err := mkdirCmd.CombinedOutput(); err != nil {
+			return fmt.Errorf("failed to create systemd drop-in directory in node %s: %w\nOutput: %s",
+				containerName, err, string(output))
+		}
+
+		// Write GODEBUG configuration
+		// This allows Go (used by containerd) to accept CA certificates with negative serial numbers
+		godebugConf := `[Service]
+Environment="GODEBUG=x509negativeserial=1"
+`
+		writeCmd := osexec.Command("docker", "exec", containerName, "sh", "-c",
+			fmt.Sprintf("cat > /etc/systemd/system/containerd.service.d/godebug.conf << 'EOF'\n%sEOF", godebugConf))
+		if output, err := writeCmd.CombinedOutput(); err != nil {
+			return fmt.Errorf("failed to write GODEBUG config in node %s: %w\nOutput: %s",
+				containerName, err, string(output))
+		}
+
+		// Reload systemd to pick up the new configuration
+		reloadCmd := osexec.Command("docker", "exec", containerName, "systemctl", "daemon-reload")
+		if output, err := reloadCmd.CombinedOutput(); err != nil {
+			return fmt.Errorf("failed to reload systemd daemon in node %s: %w\nOutput: %s",
+				containerName, err, string(output))
+		}
+
+		// Restart containerd to apply GODEBUG setting
+		// This happens BEFORE kubeadm init completes, so it's safe
+		// kubeadm will use the restarted containerd with GODEBUG already set
+		fmt.Printf("  Node %s: restarting containerd to apply GODEBUG setting (before cluster init completes)...\n", containerName)
+		restartCmd := osexec.Command("docker", "exec", containerName, "systemctl", "restart", "containerd")
+		if output, err := restartCmd.CombinedOutput(); err != nil {
+			return fmt.Errorf("failed to restart containerd in node %s: %w\nOutput: %s",
+				containerName, err, string(output))
+		}
+
+		fmt.Printf("  Node %s: GODEBUG configured\n", containerName)
+	}
+
+	fmt.Printf("%s Containerd configured to accept certificates with negative serial numbers\n", color.Checkmark())
+	return nil
+}
+
 // updateCACertificates runs update-ca-certificates in all nodes
 // This updates the system CA trust store with custom certificates mounted via extraMounts
 // Note: We don't reload containerd - CAs will be automatically used on next image pull
@@ -651,49 +717,6 @@ func (kind *KindManager) updateCACertificates(clusterName string) error {
 		}
 
 		fmt.Printf("  Node %s: CA certificates updated\n", containerName)
-
-		// Configure containerd to accept certificates with negative serial numbers
-		// Some corporate CAs have certificates with negative serial numbers, which Go rejects by default
-		// Setting GODEBUG=x509negativeserial=1 allows Go to accept them
-		mkdirCmd := osexec.Command("docker", "exec", containerName, "mkdir", "-p", "/etc/systemd/system/containerd.service.d")
-		if output, err := mkdirCmd.CombinedOutput(); err != nil {
-			return fmt.Errorf("failed to create systemd drop-in directory in node %s: %w\nOutput: %s",
-				containerName, err, string(output))
-		}
-
-		godebugConf := `[Service]
-Environment="GODEBUG=x509negativeserial=1"
-`
-		writeCmd := osexec.Command("docker", "exec", containerName, "sh", "-c",
-			fmt.Sprintf("cat > /etc/systemd/system/containerd.service.d/godebug.conf << 'EOF'\n%sEOF", godebugConf))
-		if output, err := writeCmd.CombinedOutput(); err != nil {
-			return fmt.Errorf("failed to write GODEBUG config in node %s: %w\nOutput: %s",
-				containerName, err, string(output))
-		}
-
-		// Reload systemd to pick up the new configuration
-		reloadCmd := osexec.Command("docker", "exec", containerName, "systemctl", "daemon-reload")
-		if output, err := reloadCmd.CombinedOutput(); err != nil {
-			return fmt.Errorf("failed to reload systemd daemon in node %s: %w\nOutput: %s",
-				containerName, err, string(output))
-		}
-
-		// Restart containerd to apply GODEBUG setting
-		// This happens after cluster init but before service installation
-		// Kubelet will automatically restart the control plane pods (API server, etcd, etc.)
-		fmt.Printf("  Node %s: restarting containerd to apply GODEBUG setting...\n", containerName)
-		restartCmd := osexec.Command("docker", "exec", containerName, "systemctl", "restart", "containerd")
-		if output, err := restartCmd.CombinedOutput(); err != nil {
-			return fmt.Errorf("failed to restart containerd in node %s: %w\nOutput: %s",
-				containerName, err, string(output))
-		}
-
-		// Wait for containerd and kubelet to stabilize
-		// The control plane pods will restart, so we need to wait for the API server
-		fmt.Printf("  Node %s: waiting for cluster to stabilize after containerd restart...\n", containerName)
-		time.Sleep(15 * time.Second)
-
-		fmt.Printf("  Node %s: containerd configured to accept negative serial numbers\n", containerName)
 	}
 
 	fmt.Printf("%s CA certificates updated successfully\n", color.Checkmark())
