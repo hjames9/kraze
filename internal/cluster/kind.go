@@ -190,6 +190,14 @@ func (kind *KindManager) GetKubeConfigQuiet(clusterName string, internal bool, q
 		return "", fmt.Errorf("failed to get kubeconfig: %w", err)
 	}
 
+	// Only patch kubeconfig if we're in a containerized environment (dev containers, CI)
+	// On native macOS/Windows, kind's port forwarding (127.0.0.1:PORT) works fine
+	// and container IPs are NOT accessible from the host
+	if !kind.shouldPatchKubeconfig() {
+		// Use kind's original kubeconfig - works on macOS, Windows, Linux native
+		return kubeconfig, nil
+	}
+
 	// Patch the kubeconfig to use the container's IP address
 	// This works in dev containers, CI, and other Docker-in-Docker environments
 	patchedConfig, err := kind.patchKubeconfigWithContainerIP(clusterName, kubeconfig, kind.customNetwork, quiet)
@@ -200,6 +208,22 @@ func (kind *KindManager) GetKubeConfigQuiet(clusterName string, internal bool, q
 	}
 
 	return patchedConfig, nil
+}
+
+// shouldPatchKubeconfig determines if we should patch the kubeconfig with container IP
+// Returns true if running in a containerized environment (dev containers, CI)
+// Returns false if running natively on macOS, Windows, or Linux host
+func (kind *KindManager) shouldPatchKubeconfig() bool {
+	// Check if we're running inside a Docker container
+	// The /.dockerenv file exists in Docker containers
+	if _, err := os.Stat("/.dockerenv"); err == nil {
+		return true
+	}
+
+	// Default: don't patch (use kind's original config)
+	// This works on macOS, Windows, and Linux native hosts where kind sets up port forwarding
+	// On these platforms, 127.0.0.1:PORT works and container IPs are NOT accessible
+	return false
 }
 
 // patchKubeconfigWithContainerIP replaces the server address with the container's IP
