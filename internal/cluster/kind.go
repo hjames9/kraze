@@ -60,7 +60,24 @@ func (kind *KindManager) CreateCluster(ctx context.Context, cfg *config.ClusterC
 	}
 
 	fmt.Printf("Creating kind cluster '%s'...\n", cfg.Name)
-	if err := kind.provider.Create(cfg.Name, createOpts...); err != nil {
+
+	// Create cluster in background so we can apply cgroup workaround during init
+	createErr := make(chan error, 1)
+	go func() {
+		createErr <- kind.provider.Create(cfg.Name, createOpts...)
+	}()
+
+	// Wait for container to exist, then apply cgroup workaround
+	// This prevents Kubernetes 1.34.0+ kubelet failures on cgroup v1 systems
+	time.Sleep(10 * time.Second) // Give kind time to create the container
+
+	if err := kind.ensureKubeletCgroupDirectories(cfg.Name); err != nil {
+		// Log but don't fail - cluster might still work without this
+		fmt.Printf("Note: Could not create kubelet cgroup directories (cluster may still succeed): %v\n", err)
+	}
+
+	// Wait for cluster creation to complete
+	if err := <-createErr; err != nil {
 		return fmt.Errorf("failed to create cluster: %w", err)
 	}
 
@@ -556,6 +573,47 @@ func (kind *KindManager) UntagImage(ctx context.Context, clusterName, imageName 
 		}
 		// Other errors are problems
 		return fmt.Errorf("failed to untag image: %w (output: %s)", err, outputStr)
+	}
+
+	return nil
+}
+
+// ensureKubeletCgroupDirectories creates the cgroup directories that kubelet expects
+// This is a workaround for Kubernetes 1.34.0+ race condition on cgroup v1 systems
+// where kubelet fails to start because the cgroup directories don't exist yet
+func (kind *KindManager) ensureKubeletCgroupDirectories(clusterName string) error {
+	nodes, err := kind.provider.ListInternalNodes(clusterName)
+	if err != nil {
+		return fmt.Errorf("failed to list cluster nodes: %w", err)
+	}
+
+	for _, node := range nodes {
+		containerName := node.String()
+
+		// First check if we're using cgroup v1 or v2
+		// Only cgroup v1 needs this workaround
+		checkCmd := osexec.Command("docker", "exec", containerName, "test", "-d", "/sys/fs/cgroup/systemd")
+		if err := checkCmd.Run(); err != nil {
+			// Not cgroup v1 (likely v2), skip this workaround
+			continue
+		}
+
+		// Check if the directory already exists
+		cgroupPath := "/sys/fs/cgroup/systemd/kubelet.slice/kubelet-kubepods.slice"
+		testCmd := osexec.Command("docker", "exec", containerName, "test", "-d", cgroupPath)
+		if err := testCmd.Run(); err == nil {
+			// Directory already exists, no need to create it
+			continue
+		}
+
+		// Create the kubelet cgroup directory structure
+		// This prevents: "Failed to start ContainerManager: cgroup [...] has some missing paths"
+		mkdirCmd := osexec.Command("docker", "exec", containerName, "mkdir", "-p", cgroupPath)
+		if output, err := mkdirCmd.CombinedOutput(); err != nil {
+			// This is a workaround, so we return error but don't fail hard
+			return fmt.Errorf("failed to create kubelet cgroup directory %s in node %s: %w\nOutput: %s",
+				cgroupPath, containerName, err, string(output))
+		}
 	}
 
 	return nil
