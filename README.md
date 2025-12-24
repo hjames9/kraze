@@ -9,6 +9,7 @@
 - [Installation](#installation)
   - [Prerequisites](#prerequisites)
   - [Homebrew (macOS)](#homebrew-macos)
+  - [Prebuilt Binaries](#prebuilt-binaries)
   - [Build from Source](#build-from-source)
   - [Shell Completion](#shell-completion)
 - [Quick Start](#quick-start)
@@ -76,6 +77,22 @@ brew install hjames9/kraze/kraze
 ```
 
 Shell completions are automatically installed and configured.
+
+### Prebuilt Binaries
+
+Download the latest release for your platform from the [releases page](https://github.com/hjames9/kraze/releases).
+
+Available for:
+- Linux (amd64, arm64)
+- macOS (amd64, arm64)
+- Windows (amd64, arm64)
+
+```bash
+# Example: Download and install on Linux/macOS
+curl -L https://github.com/hjames9/kraze/releases/download/v0.5.4/kraze-v0.5.4-linux-amd64 -o kraze
+chmod +x kraze
+sudo mv kraze /usr/local/bin/
+```
 
 ### Build from Source
 
