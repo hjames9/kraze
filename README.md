@@ -8,6 +8,7 @@
 - [Demo](#demo)
 - [Installation](#installation)
   - [Prerequisites](#prerequisites)
+  - [Homebrew (macOS)](#homebrew-macos)
   - [Build from Source](#build-from-source)
   - [Shell Completion](#shell-completion)
 - [Quick Start](#quick-start)
@@ -65,8 +66,16 @@ The interactive UI shows real-time progress with:
 
 ### Prerequisites
 
-- **Docker** - Docker Desktop or Docker Engine must be running
-- **Go 1.25+** - Required to build from source
+- **Docker-compatible runtime** - Docker Desktop, Colima, Podman, or Rancher Desktop must be running
+- **Go 1.25+** - Required to build from source (not needed for Homebrew installation)
+
+### Homebrew (macOS)
+
+```bash
+brew install hjames9/kraze/kraze
+```
+
+Shell completions are automatically installed and configured.
 
 ### Build from Source
 
