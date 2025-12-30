@@ -3,6 +3,8 @@ package cli
 import (
 	"context"
 	"fmt"
+	"sync"
+	"time"
 
 	"github.com/hjames9/kraze/internal/cluster"
 	"github.com/hjames9/kraze/internal/color"
@@ -15,8 +17,9 @@ import (
 )
 
 var (
-	downKeepCRDs bool
-	downLabels   []string
+	downKeepCRDs                 bool
+	downLabels                   []string
+	downNamespaceDeletionTimeout time.Duration
 )
 
 var downCmd = &cobra.Command{
@@ -306,7 +309,9 @@ func runDown(cmd *cobra.Command, args []string) error {
 	// Only delete if no other services are using the namespace
 	if len(namespacesToCleanup) > 0 {
 		fmt.Printf("\nCleaning up namespaces...\n")
-		deletedNamespaces := 0
+
+		// Collect namespaces to delete (filter out those still in use)
+		var namespacesToDelete []string
 		skippedNamespaces := 0
 
 		for ns, otherServicesCount := range namespacesToCleanup {
@@ -316,8 +321,6 @@ func runDown(cmd *cobra.Command, args []string) error {
 				skippedNamespaces++
 				continue
 			}
-
-			progress.Verbose("Cleaning up namespace '%s'...", ns)
 
 			// Check if namespace still exists
 			exists, err := providers.CheckNamespaceExists(ctx, kubeconfig, ns)
@@ -331,24 +334,73 @@ func runDown(cmd *cobra.Command, args []string) error {
 				continue
 			}
 
-			// Delete the namespace (cascades to all resources including secrets, configmaps, etc.)
-			// This is aggressive but appropriate for local dev environments
-			progress.Verbose("Deleting namespace '%s' (including all remaining resources)...", ns)
-			if err := providers.DeleteNamespace(ctx, kubeconfig, ns); err != nil {
-				fmt.Printf("%s Warning: failed to delete namespace '%s': %v\n", color.Warning(), ns, err)
-				continue
-			}
-
-			fmt.Printf("%s Deleted namespace '%s'\n", color.Checkmark(), ns)
-			deletedNamespaces++
+			namespacesToDelete = append(namespacesToDelete, ns)
 		}
 
-		if deletedNamespaces > 0 {
-			fmt.Printf("%s Deleted %d namespace(s)", color.Checkmark(), deletedNamespaces)
-			if skippedNamespaces > 0 {
-				fmt.Printf(" (skipped %d still in use)", skippedNamespaces)
+		// Delete namespaces in parallel
+		if len(namespacesToDelete) > 0 {
+			var wg sync.WaitGroup
+			var mu sync.Mutex
+			deletedCount := 0
+			timeoutCount := 0
+			errorCount := 0
+
+			for _, ns := range namespacesToDelete {
+				wg.Add(1)
+				go func(namespace string) {
+					defer wg.Done()
+
+					progress.Verbose("Deleting namespace '%s' (including all remaining resources)...", namespace)
+
+					// Delete the namespace (cascades to all resources including secrets, configmaps, etc.)
+					if err := providers.DeleteNamespace(ctx, kubeconfig, namespace); err != nil {
+						fmt.Printf("%s Warning: failed to delete namespace '%s': %v\n", color.Warning(), namespace, err)
+						mu.Lock()
+						errorCount++
+						mu.Unlock()
+						return
+					}
+
+					// Wait for deletion (unless timeout is 0)
+					if downNamespaceDeletionTimeout > 0 {
+						if err := providers.WaitForNamespaceDeletion(ctx, kubeconfig, namespace, downNamespaceDeletionTimeout); err != nil {
+							fmt.Printf("%s Warning: namespace '%s' still terminating after %v\n", color.Warning(), namespace, downNamespaceDeletionTimeout)
+							mu.Lock()
+							timeoutCount++
+							mu.Unlock()
+						} else {
+							fmt.Printf("%s Deleted namespace '%s'\n", color.Checkmark(), namespace)
+							mu.Lock()
+							deletedCount++
+							mu.Unlock()
+						}
+					} else {
+						fmt.Printf("%s Namespace '%s' deletion initiated\n", color.Checkmark(), namespace)
+						mu.Lock()
+						deletedCount++
+						mu.Unlock()
+					}
+				}(ns)
 			}
-			fmt.Printf("\n")
+
+			// Wait for all deletions to complete
+			wg.Wait()
+
+			// Print summary
+			if deletedCount > 0 || timeoutCount > 0 {
+				if downNamespaceDeletionTimeout > 0 {
+					fmt.Printf("%s Deleted %d namespace(s)", color.Checkmark(), deletedCount)
+					if timeoutCount > 0 {
+						fmt.Printf(" (%d still terminating)", timeoutCount)
+					}
+				} else {
+					fmt.Printf("%s Initiated deletion of %d namespace(s)", color.Checkmark(), deletedCount)
+				}
+				if skippedNamespaces > 0 {
+					fmt.Printf(" (skipped %d still in use)", skippedNamespaces)
+				}
+				fmt.Printf("\n")
+			}
 		} else if skippedNamespaces > 0 {
 			fmt.Printf("No namespaces deleted (%d still in use by other services)\n", skippedNamespaces)
 		} else {
@@ -362,4 +414,5 @@ func runDown(cmd *cobra.Command, args []string) error {
 func init() {
 	downCmd.Flags().BoolVar(&downKeepCRDs, "keep-crds", false, "Keep CRDs when uninstalling Helm charts")
 	downCmd.Flags().StringSliceVarP(&downLabels, "label", "l", []string{}, "Filter services by label (format: key=value, can be specified multiple times)")
+	downCmd.Flags().DurationVar(&downNamespaceDeletionTimeout, "namespace-deletion-timeout", 30*time.Second, "How long to wait for each namespace to be deleted (0 = don't wait, e.g., 30s, 1m)")
 }

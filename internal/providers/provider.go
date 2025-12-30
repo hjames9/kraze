@@ -354,6 +354,43 @@ func DeleteNamespace(ctx context.Context, kubeconfig, namespace string) error {
 	return nil
 }
 
+// WaitForNamespaceDeletion waits for a namespace to be fully deleted from the cluster
+func WaitForNamespaceDeletion(ctx context.Context, kubeconfig, namespace string, timeout time.Duration) error {
+	restConfig, err := getRESTConfigFromKubeconfig(kubeconfig)
+	if err != nil {
+		return err
+	}
+
+	clientset, err := kubernetes.NewForConfig(restConfig)
+	if err != nil {
+		return fmt.Errorf("failed to create clientset: %w", err)
+	}
+
+	// Create a context with timeout
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
+	// Poll for namespace deletion
+	ticker := time.NewTicker(1 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("timeout waiting for namespace '%s' to be deleted", namespace)
+		case <-ticker.C:
+			_, err := clientset.CoreV1().Namespaces().Get(ctx, namespace, metav1.GetOptions{})
+			if err != nil {
+				if errors.IsNotFound(err) {
+					// Namespace is gone!
+					return nil
+				}
+				// Other error - continue waiting
+			}
+		}
+	}
+}
+
 // WaitForManifests waits for resources defined in YAML manifests to become ready
 // This is a convenience wrapper for WaitForManifestsInNamespace with no default namespace
 func WaitForManifests(ctx context.Context, kubeconfigContent, manifestYAML string, opts *ProviderOptions) error {
