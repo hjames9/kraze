@@ -9,6 +9,7 @@ import (
 	"github.com/hjames9/kraze/internal/color"
 	"github.com/hjames9/kraze/internal/config"
 	"github.com/hjames9/kraze/internal/graph"
+	"github.com/hjames9/kraze/internal/providers"
 	"github.com/hjames9/kraze/internal/state"
 	"github.com/spf13/cobra"
 )
@@ -111,22 +112,80 @@ func runPlan(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("failed to resolve dependencies: %w", err)
 	}
 
-	// Load state to compare
-	stateFilePath := state.GetStateFilePath(".")
-	st, err := state.Load(stateFilePath)
-	if err != nil {
-		return fmt.Errorf("failed to load state: %w", err)
-	}
-	if st == nil {
-		st = state.New(cfg.Cluster.Name, cfg.Cluster.IsExternal())
-	}
+	// Load cluster state to compare
+	var st *state.ClusterState
 
 	// Check cluster existence
 	kindMgr := cluster.NewKindManager()
-	clusterExists, err := kindMgr.ClusterExists(cfg.Cluster.Name)
-	if err != nil {
-		Verbose("Warning: failed to check cluster existence: %v", err)
-		clusterExists = false
+	isExternal := cfg.Cluster.IsExternal()
+
+	// Try to get kubeconfig and load state from cluster
+	var kubeconfig string
+	if isExternal {
+		// External cluster
+		kubeconfig, err = kindMgr.GetKubeconfigForExternalCluster(&cfg.Cluster)
+		if err != nil {
+			Verbose("Warning: failed to get kubeconfig for external cluster: %v", err)
+			Verbose("Treating as empty state (no services installed)")
+			st = state.New(cfg.Cluster.Name, isExternal)
+			kubeconfig = "" // Clear to skip state loading
+		}
+	} else {
+		// Kind cluster
+		exists, err := kindMgr.ClusterExists(cfg.Cluster.Name)
+		if err != nil || !exists {
+			if err != nil {
+				Verbose("Warning: failed to check cluster: %v", err)
+			} else {
+				Verbose("Cluster doesn't exist yet")
+			}
+			Verbose("Treating as empty state (no services installed)")
+			st = state.New(cfg.Cluster.Name, isExternal)
+			kubeconfig = "" // Clear to skip state loading
+		} else {
+			kubeconfig, err = kindMgr.GetKubeConfig(cfg.Cluster.Name, false)
+			if err != nil {
+				Verbose("Warning: failed to get kubeconfig: %v", err)
+				Verbose("Treating as empty state (no services installed)")
+				st = state.New(cfg.Cluster.Name, isExternal)
+				kubeconfig = "" // Clear to skip state loading
+			}
+		}
+	}
+
+	// If we have kubeconfig, try to load state from cluster
+	if kubeconfig != "" {
+		clientset, err := providers.GetClientsetFromKubeconfigContent(kubeconfig, !isExternal)
+		if err != nil {
+			Verbose("Warning: failed to create Kubernetes client: %v", err)
+			Verbose("Treating as empty state (no services installed)")
+			st = state.New(cfg.Cluster.Name, isExternal)
+		} else {
+			st, err = state.Load(ctx, clientset, cfg.Cluster.Name)
+			if err != nil {
+				Verbose("Warning: failed to load cluster state: %v", err)
+				Verbose("Treating as empty state (no services installed)")
+				st = state.New(cfg.Cluster.Name, isExternal)
+			}
+			if st == nil {
+				st = state.New(cfg.Cluster.Name, isExternal)
+			}
+		}
+	}
+
+	// Determine if cluster exists for display purposes
+	clusterExists := false
+	if isExternal {
+		// For external clusters, check if we successfully got kubeconfig
+		clusterExists = (kubeconfig != "")
+	} else {
+		// For kind clusters, check if cluster exists
+		exists, err := kindMgr.ClusterExists(cfg.Cluster.Name)
+		if err != nil {
+			Verbose("Warning: failed to check cluster existence: %v", err)
+		} else {
+			clusterExists = exists
+		}
 	}
 
 	// Print plan header
@@ -223,7 +282,7 @@ func printClusterPlan(cfg *config.Config, exists bool) {
 	}
 }
 
-func analyzeService(ctx context.Context, svc *config.ServiceConfig, st *state.State, cfg *config.Config) *ServicePlanInfo {
+func analyzeService(ctx context.Context, svc *config.ServiceConfig, st *state.ClusterState, cfg *config.Config) *ServicePlanInfo {
 	info := &ServicePlanInfo{
 		Name:       svc.Name,
 		Type:       svc.Type,

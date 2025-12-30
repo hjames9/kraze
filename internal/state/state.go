@@ -1,32 +1,42 @@
 package state
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
-	"os"
-	"path/filepath"
 	"time"
+
+	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/kubernetes"
 )
 
 const (
-	// StateFileName is the name of the state file
-	StateFileName = ".kraze.state"
+	// ConfigMapName is the name of the ConfigMap storing kraze metadata
+	ConfigMapName = "kraze-metadata"
 
-	// CurrentStateVersion is the current version of the state file format
+	// ConfigMapNamespace is the namespace where kraze metadata is stored
+	ConfigMapNamespace = "kube-system"
+
+	// ConfigMapDataKey is the key in the ConfigMap data field
+	ConfigMapDataKey = "metadata"
+
+	// CurrentStateVersion is the current version of the state format
 	CurrentStateVersion = 1
 )
 
-// State represents the state of deployed services
-type State struct {
-	Version     int                     `json:"version"`      // State file format version
-	ClusterName string                  `json:"cluster_name"`
-	IsExternal  bool                    `json:"is_external"`  // Whether this is an external cluster
-	Services    map[string]ServiceState `json:"services"`
-	LastUpdated time.Time               `json:"last_updated"`
+// ClusterState represents the state of deployed services stored in the cluster
+type ClusterState struct {
+	Version     int                        `json:"version"`      // State format version
+	ClusterName string                     `json:"cluster_name"`
+	IsExternal  bool                       `json:"is_external"`  // Whether this is an external cluster
+	Services    map[string]ServiceMetadata `json:"services"`
+	LastUpdated time.Time                  `json:"last_updated"`
 }
 
-// ServiceState represents the state of a single service
-type ServiceState struct {
+// ServiceMetadata represents the metadata for a single service
+type ServiceMetadata struct {
 	Name             string            `json:"name"`
 	Installed        bool              `json:"installed"`
 	UpdatedAt        time.Time         `json:"updated_at"`
@@ -35,105 +45,140 @@ type ServiceState struct {
 	ImageHashes      map[string]string `json:"image_hashes,omitempty"`      // Map of image name to SHA256 hash
 }
 
-// New creates a new empty state
-func New(clusterName string, isExternal bool) *State {
-	return &State{
+// New creates a new empty cluster state
+func New(clusterName string, isExternal bool) *ClusterState {
+	return &ClusterState{
 		Version:     CurrentStateVersion,
 		ClusterName: clusterName,
 		IsExternal:  isExternal,
-		Services:    make(map[string]ServiceState),
+		Services:    make(map[string]ServiceMetadata),
 		LastUpdated: time.Now(),
 	}
 }
 
-// Load reads the state file from disk
-func Load(stateFilePath string) (*State, error) {
-	data, err := os.ReadFile(stateFilePath)
+// Load reads the cluster state from a ConfigMap in the cluster
+func Load(ctx context.Context, clientset kubernetes.Interface, clusterName string) (*ClusterState, error) {
+	// Try to get the ConfigMap
+	cm, err := clientset.CoreV1().ConfigMaps(ConfigMapNamespace).Get(ctx, ConfigMapName, metav1.GetOptions{})
 	if err != nil {
-		if os.IsNotExist(err) {
-			// State file doesn't exist yet, return empty state
+		if errors.IsNotFound(err) {
+			// ConfigMap doesn't exist yet, return nil (caller will create new state)
 			return nil, nil
 		}
-		return nil, fmt.Errorf("failed to read state file: %w", err)
+		// Other errors (connection issues, permission denied, etc.)
+		return nil, fmt.Errorf("failed to read cluster state ConfigMap: %w", err)
 	}
 
-	var state State
-	if err := json.Unmarshal(data, &state); err != nil {
-		return nil, fmt.Errorf("failed to parse state file: %w", err)
+	// Get the metadata from the ConfigMap
+	metadataJSON, exists := cm.Data[ConfigMapDataKey]
+	if !exists {
+		// ConfigMap exists but has no data, return empty state
+		return nil, nil
+	}
+
+	// Unmarshal the JSON
+	var state ClusterState
+	if err := json.Unmarshal([]byte(metadataJSON), &state); err != nil {
+		return nil, fmt.Errorf("failed to parse cluster state: %w", err)
 	}
 
 	// Handle migration from older versions
 	if err := state.migrate(); err != nil {
-		return nil, fmt.Errorf("failed to migrate state file: %w", err)
+		return nil, fmt.Errorf("failed to migrate cluster state: %w", err)
 	}
 
 	return &state, nil
 }
 
-// migrate handles migration from older state file versions to the current version
-func (state *State) migrate() error {
-	originalVersion := state.Version
+// migrate handles migration from older state versions to the current version
+func (cs *ClusterState) migrate() error {
+	originalVersion := cs.Version
 
 	// Migrate from v0 (no version field) to v1
-	if state.Version == 0 {
-		// v0 state files had no version field
+	if cs.Version == 0 {
+		// v0 state had no version field
 		// All existing fields are compatible with v1, just set the version
-		state.Version = 1
+		cs.Version = 1
 	}
 
 	// Check if version is supported
-	if state.Version > CurrentStateVersion {
-		return fmt.Errorf("state file version %d is newer than supported version %d - please upgrade kraze",
-			state.Version, CurrentStateVersion)
+	if cs.Version > CurrentStateVersion {
+		return fmt.Errorf("cluster state version %d is newer than supported version %d - please upgrade kraze",
+			cs.Version, CurrentStateVersion)
 	}
 
 	// Log migration if it occurred
-	if originalVersion != state.Version && originalVersion != 0 {
-		fmt.Printf("Migrated state file from version %d to %d\n", originalVersion, state.Version)
+	if originalVersion != cs.Version && originalVersion != 0 {
+		fmt.Printf("Migrated cluster state from version %d to %d\n", originalVersion, cs.Version)
 	}
 
 	return nil
 }
 
-// Save writes the state file to disk
-func (state *State) Save(stateFilePath string) error {
+// Save writes the cluster state to a ConfigMap in the cluster
+func (cs *ClusterState) Save(ctx context.Context, clientset kubernetes.Interface) error {
 	// Ensure version is set to current version
-	state.Version = CurrentStateVersion
-	state.LastUpdated = time.Now()
+	cs.Version = CurrentStateVersion
+	cs.LastUpdated = time.Now()
 
-	data, err := json.MarshalIndent(state, "", "  ")
+	// Marshal to JSON
+	data, err := json.MarshalIndent(cs, "", "  ")
 	if err != nil {
-		return fmt.Errorf("failed to marshal state: %w", err)
+		return fmt.Errorf("failed to marshal cluster state: %w", err)
 	}
 
-	// Ensure directory exists
-	dir := filepath.Dir(stateFilePath)
-	if err := os.MkdirAll(dir, 0755); err != nil {
-		return fmt.Errorf("failed to create state directory: %w", err)
-	}
-
-	if err := os.WriteFile(stateFilePath, data, 0644); err != nil {
-		return fmt.Errorf("failed to write state file: %w", err)
-	}
-
-	return nil
-}
-
-// Delete removes the state file from disk
-func Delete(stateFilePath string) error {
-	if err := os.Remove(stateFilePath); err != nil {
-		if os.IsNotExist(err) {
-			// File doesn't exist, that's fine
+	// Try to get existing ConfigMap
+	cm, err := clientset.CoreV1().ConfigMaps(ConfigMapNamespace).Get(ctx, ConfigMapName, metav1.GetOptions{})
+	if err != nil {
+		if errors.IsNotFound(err) {
+			// ConfigMap doesn't exist, create it
+			cm = &corev1.ConfigMap{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      ConfigMapName,
+					Namespace: ConfigMapNamespace,
+					Labels: map[string]string{
+						"app.kubernetes.io/managed-by": "kraze",
+					},
+				},
+				Data: map[string]string{
+					ConfigMapDataKey: string(data),
+				},
+			}
+			_, err = clientset.CoreV1().ConfigMaps(ConfigMapNamespace).Create(ctx, cm, metav1.CreateOptions{})
+			if err != nil {
+				return fmt.Errorf("failed to create cluster state ConfigMap: %w", err)
+			}
 			return nil
 		}
-		return fmt.Errorf("failed to delete state file: %w", err)
+		return fmt.Errorf("failed to get cluster state ConfigMap: %w", err)
+	}
+
+	// ConfigMap exists, update it
+	cm.Data[ConfigMapDataKey] = string(data)
+	_, err = clientset.CoreV1().ConfigMaps(ConfigMapNamespace).Update(ctx, cm, metav1.UpdateOptions{})
+	if err != nil {
+		return fmt.Errorf("failed to update cluster state ConfigMap: %w", err)
+	}
+
+	return nil
+}
+
+// Delete removes the cluster state ConfigMap from the cluster
+func Delete(ctx context.Context, clientset kubernetes.Interface) error {
+	err := clientset.CoreV1().ConfigMaps(ConfigMapNamespace).Delete(ctx, ConfigMapName, metav1.DeleteOptions{})
+	if err != nil {
+		if errors.IsNotFound(err) {
+			// ConfigMap doesn't exist, that's fine
+			return nil
+		}
+		return fmt.Errorf("failed to delete cluster state ConfigMap: %w", err)
 	}
 	return nil
 }
 
-// MarkServiceInstalled marks a service as installed
-func (state *State) MarkServiceInstalled(serviceName string) {
-	state.Services[serviceName] = ServiceState{
+// MarkServiceInstalled marks a service as installed (basic version)
+func (cs *ClusterState) MarkServiceInstalled(serviceName string) {
+	cs.Services[serviceName] = ServiceMetadata{
 		Name:      serviceName,
 		Installed: true,
 		UpdatedAt: time.Now(),
@@ -141,15 +186,15 @@ func (state *State) MarkServiceInstalled(serviceName string) {
 }
 
 // MarkServiceInstalledWithNamespace marks a service as installed and tracks namespace info
-func (state *State) MarkServiceInstalledWithNamespace(serviceName, namespace string, createdNamespace bool) {
+func (cs *ClusterState) MarkServiceInstalledWithNamespace(serviceName, namespace string, createdNamespace bool) {
 	// Preserve existing image hashes if they exist
-	existingState, exists := state.Services[serviceName]
+	existingMetadata, exists := cs.Services[serviceName]
 	imageHashes := make(map[string]string)
 	if exists {
-		imageHashes = existingState.ImageHashes
+		imageHashes = existingMetadata.ImageHashes
 	}
 
-	state.Services[serviceName] = ServiceState{
+	cs.Services[serviceName] = ServiceMetadata{
 		Name:             serviceName,
 		Installed:        true,
 		UpdatedAt:        time.Now(),
@@ -160,8 +205,8 @@ func (state *State) MarkServiceInstalledWithNamespace(serviceName, namespace str
 }
 
 // MarkServiceInstalledWithImages marks a service as installed and tracks namespace and image info
-func (state *State) MarkServiceInstalledWithImages(serviceName, namespace string, createdNamespace bool, imageHashes map[string]string) {
-	state.Services[serviceName] = ServiceState{
+func (cs *ClusterState) MarkServiceInstalledWithImages(serviceName, namespace string, createdNamespace bool, imageHashes map[string]string) {
+	cs.Services[serviceName] = ServiceMetadata{
 		Name:             serviceName,
 		Installed:        true,
 		UpdatedAt:        time.Now(),
@@ -172,20 +217,20 @@ func (state *State) MarkServiceInstalledWithImages(serviceName, namespace string
 }
 
 // MarkServiceUninstalled marks a service as uninstalled (removes it from state)
-func (state *State) MarkServiceUninstalled(serviceName string) {
-	delete(state.Services, serviceName)
+func (cs *ClusterState) MarkServiceUninstalled(serviceName string) {
+	delete(cs.Services, serviceName)
 }
 
 // IsServiceInstalled checks if a service is marked as installed
-func (state *State) IsServiceInstalled(serviceName string) bool {
-	svc, exists := state.Services[serviceName]
+func (cs *ClusterState) IsServiceInstalled(serviceName string) bool {
+	svc, exists := cs.Services[serviceName]
 	return exists && svc.Installed
 }
 
 // GetInstalledServices returns a list of all installed service names
-func (state *State) GetInstalledServices() []string {
-	installed := make([]string, 0, len(state.Services))
-	for name, svc := range state.Services {
+func (cs *ClusterState) GetInstalledServices() []string {
+	installed := make([]string, 0, len(cs.Services))
+	for name, svc := range cs.Services {
 		if svc.Installed {
 			installed = append(installed, name)
 		}
@@ -193,16 +238,11 @@ func (state *State) GetInstalledServices() []string {
 	return installed
 }
 
-// GetStateFilePath returns the path to the state file relative to the config file
-func GetStateFilePath(configDir string) string {
-	return filepath.Join(configDir, StateFileName)
-}
-
 // GetCreatedNamespaces returns a map of namespaces we created and should clean up
 // The map key is namespace name, value is count of services using it
-func (state *State) GetCreatedNamespaces() map[string]int {
+func (cs *ClusterState) GetCreatedNamespaces() map[string]int {
 	namespaces := make(map[string]int)
-	for _, svc := range state.Services {
+	for _, svc := range cs.Services {
 		if svc.CreatedNamespace && svc.Namespace != "" {
 			namespaces[svc.Namespace]++
 		}
@@ -213,9 +253,9 @@ func (state *State) GetCreatedNamespaces() map[string]int {
 // GetAllNamespacesUsed returns a map of all namespaces used by installed services
 // The map key is namespace name, value is count of installed services using it
 // This includes namespaces we created AND namespaces that existed before
-func (state *State) GetAllNamespacesUsed() map[string]int {
+func (cs *ClusterState) GetAllNamespacesUsed() map[string]int {
 	namespaces := make(map[string]int)
-	for _, svc := range state.Services {
+	for _, svc := range cs.Services {
 		if svc.Installed && svc.Namespace != "" {
 			namespaces[svc.Namespace]++
 		}
@@ -226,9 +266,9 @@ func (state *State) GetAllNamespacesUsed() map[string]int {
 // GetAllNamespacesUsedForCleanup returns all unique namespaces used by any service
 // For "uninstall all" scenarios, returns map with count 0 for all namespaces
 // since we're uninstalling everything
-func (state *State) GetAllNamespacesUsedForCleanup() map[string]int {
+func (cs *ClusterState) GetAllNamespacesUsedForCleanup() map[string]int {
 	namespaces := make(map[string]int)
-	for _, svc := range state.Services {
+	for _, svc := range cs.Services {
 		if svc.Namespace != "" {
 			// Set count to 0 since we're cleaning up everything
 			namespaces[svc.Namespace] = 0
@@ -240,11 +280,11 @@ func (state *State) GetAllNamespacesUsedForCleanup() map[string]int {
 // GetNamespacesForServices returns namespaces used by specific services
 // For local dev environments, we aggressively clean up namespaces when uninstalling services
 // Returns map of namespace name to count of installed services still using it
-func (state *State) GetNamespacesForServices(serviceNames []string) map[string]int {
+func (cs *ClusterState) GetNamespacesForServices(serviceNames []string) map[string]int {
 	// Get namespaces used by the specified services
 	targetNamespaces := make(map[string]bool)
 	for _, name := range serviceNames {
-		if svc, exists := state.Services[name]; exists && svc.Namespace != "" {
+		if svc, exists := cs.Services[name]; exists && svc.Namespace != "" {
 			targetNamespaces[svc.Namespace] = true
 		}
 	}
@@ -254,7 +294,7 @@ func (state *State) GetNamespacesForServices(serviceNames []string) map[string]i
 	namespaceCounts := make(map[string]int)
 	for ns := range targetNamespaces {
 		count := 0
-		for _, svc := range state.Services {
+		for _, svc := range cs.Services {
 			// Skip the services we're uninstalling
 			isTargetService := false
 			for _, name := range serviceNames {
@@ -279,8 +319,8 @@ func (state *State) GetNamespacesForServices(serviceNames []string) map[string]i
 }
 
 // GetImageHashes returns the stored image hashes for a service
-func (state *State) GetImageHashes(serviceName string) map[string]string {
-	if svc, exists := state.Services[serviceName]; exists {
+func (cs *ClusterState) GetImageHashes(serviceName string) map[string]string {
+	if svc, exists := cs.Services[serviceName]; exists {
 		if svc.ImageHashes == nil {
 			return make(map[string]string)
 		}
@@ -291,8 +331,8 @@ func (state *State) GetImageHashes(serviceName string) map[string]string {
 
 // HasImageHashChanged checks if an image's hash has changed since last installation
 // Returns true if the image is new or the hash has changed
-func (state *State) HasImageHashChanged(serviceName, imageName, currentHash string) bool {
-	storedHashes := state.GetImageHashes(serviceName)
+func (cs *ClusterState) HasImageHashChanged(serviceName, imageName, currentHash string) bool {
+	storedHashes := cs.GetImageHashes(serviceName)
 	storedHash, exists := storedHashes[imageName]
 
 	// If image wasn't tracked before, it's new (changed)
@@ -306,9 +346,9 @@ func (state *State) HasImageHashChanged(serviceName, imageName, currentHash stri
 
 // GetChangedImages compares current image hashes with stored hashes
 // Returns a list of images that are new or have changed
-func (state *State) GetChangedImages(serviceName string, currentHashes map[string]string) []string {
+func (cs *ClusterState) GetChangedImages(serviceName string, currentHashes map[string]string) []string {
 	changed := make([]string, 0)
-	storedHashes := state.GetImageHashes(serviceName)
+	storedHashes := cs.GetImageHashes(serviceName)
 
 	for imageName, currentHash := range currentHashes {
 		storedHash, exists := storedHashes[imageName]

@@ -3,11 +3,11 @@ package cli
 import (
 	"context"
 	"fmt"
-	"path/filepath"
 
 	"github.com/hjames9/kraze/internal/cluster"
 	"github.com/hjames9/kraze/internal/color"
 	"github.com/hjames9/kraze/internal/config"
+	"github.com/hjames9/kraze/internal/providers"
 	"github.com/hjames9/kraze/internal/state"
 	"github.com/spf13/cobra"
 )
@@ -123,16 +123,36 @@ For external clusters (cluster.external.enabled: true):
 			fmt.Printf("\n%s Images preloaded successfully\n", color.Checkmark())
 		}
 
-		// Initialize state file
-		Verbose("Initializing state file...")
-		configDir := filepath.Dir(configFile)
-		stateFilePath := state.GetStateFilePath(configDir)
+		// Initialize cluster state
+		Verbose("Initializing cluster state...")
 
-		st := state.New(cfg.Cluster.Name, isExternal)
-		if err := st.Save(stateFilePath); err != nil {
-			return fmt.Errorf("failed to save state: %w", err)
+		// Get kubeconfig content (not file path)
+		var kubeconfig string
+		if isExternal {
+			kubeconfig, err = kindMgr.GetKubeconfigForExternalCluster(&cfg.Cluster)
+			if err != nil {
+				return fmt.Errorf("failed to get kubeconfig for external cluster: %w", err)
+			}
+		} else {
+			kubeconfig, err = kindMgr.GetKubeConfig(cfg.Cluster.Name, false)
+			if err != nil {
+				return fmt.Errorf("failed to get kubeconfig: %w", err)
+			}
 		}
-		Verbose("State file created: %s", stateFilePath)
+
+		// Create Kubernetes clientset from kubeconfig content
+		// Only skip TLS verification for kind clusters (not external clusters)
+		clientset, err := providers.GetClientsetFromKubeconfigContent(kubeconfig, !isExternal)
+		if err != nil {
+			return fmt.Errorf("failed to create Kubernetes client: %w", err)
+		}
+
+		// Create and save cluster state
+		st := state.New(cfg.Cluster.Name, isExternal)
+		if err := st.Save(ctx, clientset); err != nil {
+			return fmt.Errorf("failed to save cluster state: %w", err)
+		}
+		Verbose("Cluster state ConfigMap created in kube-system namespace")
 
 		if isExternal {
 			fmt.Printf("\n%s External cluster initialized successfully\n", color.Checkmark())

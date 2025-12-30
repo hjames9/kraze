@@ -3,11 +3,11 @@ package cli
 import (
 	"context"
 	"fmt"
-	"path/filepath"
 
 	"github.com/hjames9/kraze/internal/cluster"
 	"github.com/hjames9/kraze/internal/color"
 	"github.com/hjames9/kraze/internal/config"
+	"github.com/hjames9/kraze/internal/providers"
 	"github.com/hjames9/kraze/internal/state"
 	"github.com/spf13/cobra"
 )
@@ -49,11 +49,33 @@ Services do not need to be uninstalled first - the entire cluster is removed.`,
 			return nil
 		}
 
+		// Delete cluster state ConfigMap (must be done before cluster deletion for external clusters)
 		if isExternal {
-			// External cluster - only delete state
+			// External cluster - delete state ConfigMap before cluster is removed
 			fmt.Printf("External cluster '%s' - preserving cluster, deleting state only\n", cfg.Cluster.Name)
+
+			Verbose("Deleting cluster state ConfigMap...")
+			kindMgr := cluster.NewKindManager()
+
+			// Get kubeconfig content for external cluster
+			kubeconfig, err := kindMgr.GetKubeconfigForExternalCluster(&cfg.Cluster)
+			if err != nil {
+				fmt.Printf("Warning: failed to get kubeconfig for external cluster: %v\n", err)
+			} else {
+				// Create clientset from kubeconfig content (external cluster uses TLS verification)
+				clientset, err := providers.GetClientsetFromKubeconfigContent(kubeconfig, false)
+				if err != nil {
+					fmt.Printf("Warning: failed to create Kubernetes client: %v\n", err)
+				} else {
+					if err := state.Delete(ctx, clientset); err != nil {
+						fmt.Printf("Warning: failed to delete cluster state: %v\n", err)
+					} else {
+						Verbose("Cluster state ConfigMap deleted from kube-system namespace")
+					}
+				}
+			}
 		} else {
-			// Kind cluster - delete the cluster
+			// Kind cluster - delete the cluster (ConfigMap will be deleted with cluster)
 			// Check if Docker is available
 			Verbose("Checking Docker availability...")
 			if err := cluster.CheckDockerAvailable(ctx); err != nil {
@@ -66,17 +88,7 @@ Services do not need to be uninstalled first - the entire cluster is removed.`,
 			if err := kindMgr.DeleteCluster(cfg.Cluster.Name); err != nil {
 				return fmt.Errorf("failed to delete cluster: %w", err)
 			}
-		}
-
-		// Delete state file
-		Verbose("Deleting state file...")
-		configDir := filepath.Dir(configFile)
-		stateFilePath := state.GetStateFilePath(configDir)
-		if err := state.Delete(stateFilePath); err != nil {
-			// Log warning but don't fail
-			fmt.Printf("Warning: failed to delete state file: %v\n", err)
-		} else {
-			Verbose("State file deleted: %s", stateFilePath)
+			Verbose("Kind cluster deleted (cluster state ConfigMap deleted with cluster)")
 		}
 
 		// TODO: Clean up cache (Helm chart cache, etc.)

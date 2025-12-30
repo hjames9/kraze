@@ -14,6 +14,7 @@ import (
 	"github.com/hjames9/kraze/internal/state"
 	"github.com/hjames9/kraze/internal/ui"
 	"github.com/spf13/cobra"
+	"k8s.io/client-go/kubernetes"
 )
 
 var (
@@ -175,42 +176,67 @@ func runUp(cmd *cobra.Command, args []string) error {
 
 	// Create or verify cluster
 	kindMgr := cluster.NewKindManager()
+	isExternal := cfg.Cluster.IsExternal()
+	var kubeconfig string
 
-	exists, err := kindMgr.ClusterExists(cfg.Cluster.Name)
-	if err != nil {
-		return fmt.Errorf("failed to check cluster: %w", err)
-	}
+	if isExternal {
+		// External cluster mode - don't create, just verify access
+		Verbose("Using external cluster '%s'", cfg.Cluster.Name)
 
-	if !exists {
-		fmt.Printf("Cluster '%s' does not exist, creating it...\n", cfg.Cluster.Name)
-		if err := kindMgr.CreateCluster(ctx, &cfg.Cluster); err != nil {
-			return fmt.Errorf("failed to create cluster: %w", err)
+		kubeconfig, err = kindMgr.GetKubeconfigForExternalCluster(&cfg.Cluster)
+		if err != nil {
+			return fmt.Errorf("failed to get kubeconfig for external cluster: %w", err)
 		}
 
-		// Update ~/.kube/config with cluster access (Use container IP)
-		Verbose("Updating kubeconfig...")
-		if err := kindMgr.UpdateKubeconfigFile(cfg.Cluster.Name); err != nil {
-			Verbose("Warning: failed to update kubeconfig: %v", err)
-		} else {
-			Verbose("Kubeconfig updated (context: kind-%s)", cfg.Cluster.Name)
+		// Verify cluster is accessible
+		Verbose("Verifying cluster connectivity...")
+		if err := kindMgr.VerifyClusterAccess(ctx, kubeconfig); err != nil {
+			return fmt.Errorf("failed to access external cluster '%s': %w", cfg.Cluster.Name, err)
 		}
+		Verbose("External cluster is accessible")
 	} else {
-		Verbose("Cluster '%s' already exists", cfg.Cluster.Name)
+		// Kind cluster mode - create if doesn't exist
+		exists, err := kindMgr.ClusterExists(cfg.Cluster.Name)
+		if err != nil {
+			return fmt.Errorf("failed to check cluster: %w", err)
+		}
+
+		if !exists {
+			fmt.Printf("Cluster '%s' does not exist, creating it...\n", cfg.Cluster.Name)
+			if err := kindMgr.CreateCluster(ctx, &cfg.Cluster); err != nil {
+				return fmt.Errorf("failed to create cluster: %w", err)
+			}
+
+			// Update ~/.kube/config with cluster access (Use container IP)
+			Verbose("Updating kubeconfig...")
+			if err := kindMgr.UpdateKubeconfigFile(cfg.Cluster.Name); err != nil {
+				Verbose("Warning: failed to update kubeconfig: %v", err)
+			} else {
+				Verbose("Kubeconfig updated (context: kind-%s)", cfg.Cluster.Name)
+			}
+		} else {
+			Verbose("Cluster '%s' already exists", cfg.Cluster.Name)
+		}
+
+		// Get kubeconfig for the cluster (will be patched with container IP)
+		kubeconfig, err = kindMgr.GetKubeConfig(cfg.Cluster.Name, false)
+		if err != nil {
+			return fmt.Errorf("failed to get kubeconfig: %w", err)
+		}
 	}
 
-	// Get kubeconfig for the cluster (will be patched with container IP)
-	kubeconfig, err := kindMgr.GetKubeConfig(cfg.Cluster.Name, false)
+	// Create Kubernetes clientset for cluster state management
+	// Use the kubeconfig content (not file path)
+	// Only skip TLS verification for kind clusters (not external clusters)
+	clientset, err := providers.GetClientsetFromKubeconfigContent(kubeconfig, !isExternal)
 	if err != nil {
-		return fmt.Errorf("failed to get kubeconfig: %w", err)
+		return fmt.Errorf("failed to create Kubernetes client: %w", err)
 	}
 
-	// Get state file path (in same directory as config file)
-	stateFilePath := state.GetStateFilePath(".")
-
-	// Load or create state
-	st, err := state.Load(stateFilePath)
+	// Load or create cluster state
+	st, err := state.Load(ctx, clientset, cfg.Cluster.Name)
 	if err != nil {
-		return fmt.Errorf("failed to load state: %w", err)
+		return fmt.Errorf("failed to load cluster state: %w", err)
 	}
 	if st == nil {
 		st = state.New(cfg.Cluster.Name, cfg.Cluster.IsExternal())
@@ -246,7 +272,7 @@ func runUp(cmd *cobra.Command, args []string) error {
 			svc := level[0]
 			itr := serviceIndex
 
-			if err := installService(ctx, svc, itr, cfg, kubeconfig, st, stateFilePath, kindMgr, imgMgr, progress, globalWait, globalTimeout, verbose); err != nil {
+			if err := installService(ctx, svc, itr, cfg, kubeconfig, st, clientset, kindMgr, imgMgr, progress, globalWait, globalTimeout, verbose); err != nil {
 				return fmt.Errorf("failed to install service '%s' in level %d: %w", svc.Name, levelNum, err)
 			}
 			successCount++
@@ -275,7 +301,7 @@ func runUp(cmd *cobra.Command, args []string) error {
 				go func(service *config.ServiceConfig, idx int) {
 					defer wg.Done()
 
-					if err := installService(levelCtx, service, idx, cfg, kubeconfig, st, stateFilePath, kindMgr, imgMgr, progress, globalWait, globalTimeout, verbose); err != nil {
+					if err := installService(levelCtx, service, idx, cfg, kubeconfig, st, clientset, kindMgr, imgMgr, progress, globalWait, globalTimeout, verbose); err != nil {
 						// Cancel context on first error to stop other installations
 						firstError.Do(func() {
 							progress.Verbose("Service '%s' failed, cancelling other installations in level %d", service.Name, levelNum)
@@ -334,8 +360,8 @@ func installService(
 	serviceIndex int,
 	cfg *config.Config,
 	kubeconfig string,
-	st *state.State,
-	stateFilePath string,
+	st *state.ClusterState,
+	clientset kubernetes.Interface,
 	kindMgr *cluster.KindManager,
 	imgMgr *cluster.ImageManager,
 	progress ui.ProgressManager,
@@ -525,10 +551,12 @@ func installService(
 			defer func(serviceName string, hashes map[string]string) {
 				stateMutex.Lock()
 				defer stateMutex.Unlock()
-				if svc, exists := st.Services[serviceName]; exists {
-					svc.ImageHashes = hashes
-					st.Services[serviceName] = svc
-					st.Save(stateFilePath)
+				if svcMeta, exists := st.Services[serviceName]; exists {
+					svcMeta.ImageHashes = hashes
+					st.Services[serviceName] = svcMeta
+					if err := st.Save(ctx, clientset); err != nil {
+						progress.Verbose("Warning: failed to save cluster state (image hashes): %v", err)
+					}
 				}
 			}(svc.Name, imageHashes)
 		}
@@ -562,11 +590,11 @@ func installService(
 		return fmt.Errorf("failed to install '%s': %w", svc.Name, err)
 	}
 
-	// Update state with namespace tracking (protected by mutex)
+	// Update cluster state with namespace tracking (protected by mutex)
 	stateMutex.Lock()
 	st.MarkServiceInstalledWithNamespace(svc.Name, namespace, willCreateNamespace)
-	if err := st.Save(stateFilePath); err != nil {
-		progress.Verbose("Warning: failed to save state: %v", err)
+	if err := st.Save(ctx, clientset); err != nil {
+		progress.Verbose("Warning: failed to save cluster state: %v", err)
 	}
 	stateMutex.Unlock()
 

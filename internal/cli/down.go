@@ -142,17 +142,61 @@ func runDown(cmd *cobra.Command, args []string) error {
 		}
 	}
 
-	// Get state file path
-	stateFilePath := state.GetStateFilePath(".")
+	// Verify cluster exists and get kubeconfig
+	kindMgr := cluster.NewKindManager()
+	isExternal := cfg.Cluster.IsExternal()
+	var kubeconfig string
 
-	// Load state
-	st, err := state.Load(stateFilePath)
+	if isExternal {
+		// External cluster mode - get kubeconfig from external cluster config
+		Verbose("Using external cluster '%s'", cfg.Cluster.Name)
+
+		kubeconfig, err = kindMgr.GetKubeconfigForExternalCluster(&cfg.Cluster)
+		if err != nil {
+			return fmt.Errorf("failed to get kubeconfig for external cluster: %w", err)
+		}
+
+		// Verify cluster is accessible
+		Verbose("Verifying cluster connectivity...")
+		if err := kindMgr.VerifyClusterAccess(ctx, kubeconfig); err != nil {
+			return fmt.Errorf("failed to access external cluster '%s': %w", cfg.Cluster.Name, err)
+		}
+		Verbose("External cluster is accessible")
+	} else {
+		// Kind cluster mode - verify cluster exists
+		exists, err := kindMgr.ClusterExists(cfg.Cluster.Name)
+		if err != nil {
+			return fmt.Errorf("failed to check cluster: %w", err)
+		}
+
+		if !exists {
+			fmt.Printf("Cluster '%s' does not exist, nothing to uninstall\n", cfg.Cluster.Name)
+			return nil
+		}
+
+		// Get kubeconfig for the cluster
+		kubeconfig, err = kindMgr.GetKubeConfig(cfg.Cluster.Name, false)
+		if err != nil {
+			return fmt.Errorf("failed to get kubeconfig: %w", err)
+		}
+	}
+
+	// Create Kubernetes clientset for cluster state management
+	// Use the kubeconfig content (not file path)
+	// Only skip TLS verification for kind clusters (not external clusters)
+	clientset, err := providers.GetClientsetFromKubeconfigContent(kubeconfig, !isExternal)
 	if err != nil {
-		Verbose("Warning: failed to load state: %v", err)
+		return fmt.Errorf("failed to create Kubernetes client: %w", err)
+	}
+
+	// Load cluster state
+	st, err := state.Load(ctx, clientset, cfg.Cluster.Name)
+	if err != nil {
+		Verbose("Warning: failed to load cluster state: %v", err)
 		st = state.New(cfg.Cluster.Name, cfg.Cluster.IsExternal())
 	}
 	if st == nil {
-		// State file doesn't exist yet (Load returns nil, nil in this case)
+		// ConfigMap doesn't exist yet (Load returns nil, nil in this case)
 		st = state.New(cfg.Cluster.Name, cfg.Cluster.IsExternal())
 	}
 
@@ -170,12 +214,12 @@ func runDown(cmd *cobra.Command, args []string) error {
 		namespacesToCleanup = st.GetNamespacesForServices(serviceNames)
 	} else {
 		// Uninstalling all services - clean up all namespaces (count will be 0 for all)
-		// Get namespaces from state file
+		// Get namespaces from cluster state
 		namespacesToCleanup = st.GetAllNamespacesUsedForCleanup()
 
 		// Also collect namespaces from the services we're actually uninstalling
-		// This handles cases where state file is missing namespace data (e.g., services
-		// installed before namespace tracking was implemented, or corrupted state)
+		// This handles cases where cluster state is missing namespace data (e.g., services
+		// installed before namespace tracking was implemented, or missing state)
 		for _, svc := range orderedServices {
 			ns := svc.GetNamespace()
 			if ns != "" {
@@ -183,25 +227,6 @@ func runDown(cmd *cobra.Command, args []string) error {
 				namespacesToCleanup[ns] = 0
 			}
 		}
-	}
-
-	// Verify cluster exists
-	kindMgr := cluster.NewKindManager()
-
-	exists, err := kindMgr.ClusterExists(cfg.Cluster.Name)
-	if err != nil {
-		return fmt.Errorf("failed to check cluster: %w", err)
-	}
-
-	if !exists {
-		fmt.Printf("Cluster '%s' does not exist, nothing to uninstall\n", cfg.Cluster.Name)
-		return nil
-	}
-
-	// Get kubeconfig for the cluster
-	kubeconfig, err := kindMgr.GetKubeConfig(cfg.Cluster.Name, false)
-	if err != nil {
-		return fmt.Errorf("failed to get kubeconfig: %w", err)
 	}
 
 	// Create progress manager
@@ -262,10 +287,10 @@ func runDown(cmd *cobra.Command, args []string) error {
 			continue
 		}
 
-		// Update state
+		// Update cluster state
 		st.MarkServiceUninstalled(svc.Name)
-		if err := st.Save(stateFilePath); err != nil {
-			progress.Verbose("Warning: failed to save state: %v", err)
+		if err := st.Save(ctx, clientset); err != nil {
+			progress.Verbose("Warning: failed to save cluster state: %v", err)
 		}
 
 		// Mark service as uninstalled

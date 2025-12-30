@@ -1245,7 +1245,7 @@ func (kind *KindManager) getCurrentContainerNetworks() []string {
 	return filtered
 }
 
-// GetKubeconfigForExternalCluster returns the kubeconfig path for an external cluster
+// GetKubeconfigForExternalCluster returns the kubeconfig content for an external cluster
 func (kind *KindManager) GetKubeconfigForExternalCluster(cfg *config.ClusterConfig) (string, error) {
 	if cfg.External == nil || !cfg.External.Enabled {
 		return "", fmt.Errorf("cluster is not configured as external")
@@ -1276,19 +1276,31 @@ func (kind *KindManager) GetKubeconfigForExternalCluster(cfg *config.ClusterConf
 		return "", fmt.Errorf("kubeconfig file not found: %s", kubeconfigPath)
 	}
 
-	return kubeconfigPath, nil
+	// Read the kubeconfig file content
+	content, err := os.ReadFile(kubeconfigPath)
+	if err != nil {
+		return "", fmt.Errorf("failed to read kubeconfig file: %w", err)
+	}
+
+	return string(content), nil
 }
 
 // VerifyClusterAccess verifies that the external cluster is accessible
-func (kind *KindManager) VerifyClusterAccess(ctx context.Context, kubeconfigPath string) error {
-	// Load kubeconfig
-	config, err := clientcmd.BuildConfigFromFlags("", kubeconfigPath)
+func (kind *KindManager) VerifyClusterAccess(ctx context.Context, kubeconfigContent string) error {
+	// Parse kubeconfig from content
+	clientConfig, err := clientcmd.NewClientConfigFromBytes([]byte(kubeconfigContent))
 	if err != nil {
-		return fmt.Errorf("failed to load kubeconfig: %w", err)
+		return fmt.Errorf("failed to parse kubeconfig: %w", err)
+	}
+
+	// Get REST config
+	restConfig, err := clientConfig.ClientConfig()
+	if err != nil {
+		return fmt.Errorf("failed to create REST config: %w", err)
 	}
 
 	// Create Kubernetes client
-	clientset, err := kubernetes.NewForConfig(config)
+	clientset, err := kubernetes.NewForConfig(restConfig)
 	if err != nil {
 		return fmt.Errorf("failed to create Kubernetes client: %w", err)
 	}

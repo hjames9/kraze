@@ -5,6 +5,7 @@
 ## Table of Contents
 
 - [Description](#description)
+- [Breaking Changes (v0.6.0)](#breaking-changes-v060)
 - [Demo](#demo)
 - [Installation](#installation)
   - [Prerequisites](#prerequisites)
@@ -45,9 +46,43 @@ kraze is a Kubernetes development environment manager that brings the familiar d
 - **Helm & Manifest Support** - Deploy Helm charts and raw Kubernetes manifests
 - **Dependency Resolution** - Services are installed in the correct order based on dependencies
 - **Clean Teardown** - Removes all resources including CRDS, namespaces, and PVCs
-- **State Management** - Tracks what's installed to enable incremental updates
+- **State Management** - Cluster-stored state via ConfigMap for team-friendly workflows
 - **docker-compose UX** - Familiar commands: `up`, `down`, `status`
 - **Corporate Network Support** - Works behind proxies with TLS inspection and custom CAs
+
+## Breaking Changes (v0.6.0)
+
+### State File Removed
+
+**kraze v0.6.0+ no longer uses local `.kraze.state` files.** All state is now stored in a ConfigMap (`kraze-metadata`) in the cluster's `kube-system` namespace.
+
+**If upgrading from v0.5.x or earlier:**
+
+1. **Destroy existing clusters** created with old versions:
+   ```bash
+   # Using old kraze version
+   kraze destroy
+   ```
+
+2. **Upgrade kraze** to v0.6.0+
+
+3. **Recreate your clusters**:
+   ```bash
+   # Using new kraze version
+   kraze up
+   ```
+
+**Why this change?**
+- **Team-friendly**: No local state files that don't sync across team members
+- **Portable**: Cluster state travels with the cluster, not tied to your machine
+- **Reliable**: Cluster is the single source of truth, eliminating drift
+- **Simpler**: No cache invalidation or stale state file issues
+
+**Technical Details:**
+- State is stored in `kubectl -n kube-system get cm kraze-metadata`
+- Tracks service installation status, namespaces, and image hashes
+- Automatically created during `kraze init` or first `kraze up`
+- Deleted when running `kraze destroy`
 
 ## Demo
 

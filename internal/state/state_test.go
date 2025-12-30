@@ -1,451 +1,627 @@
 package state
 
 import (
-	"os"
-	"path/filepath"
+	"context"
+	"encoding/json"
 	"testing"
 	"time"
+
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/kubernetes/fake"
 )
 
-func TestNew(test *testing.T) {
-	st := New("test-cluster", false)
+func TestNew(t *testing.T) {
+	cs := New("test-cluster", false)
 
-	if st.ClusterName != "test-cluster" {
-		test.Errorf("Expected cluster name 'test-cluster', got '%s'", st.ClusterName)
+	if cs.ClusterName != "test-cluster" {
+		t.Errorf("Expected cluster name 'test-cluster', got '%s'", cs.ClusterName)
 	}
 
-	if st.Services == nil {
-		test.Error("Expected Services map to be initialized")
+	if cs.IsExternal {
+		t.Error("Expected IsExternal to be false")
 	}
 
-	if st.LastUpdated.IsZero() {
-		test.Error("Expected LastUpdated to be set")
+	if cs.Services == nil {
+		t.Error("Expected Services map to be initialized")
+	}
+
+	if cs.LastUpdated.IsZero() {
+		t.Error("Expected LastUpdated to be set")
+	}
+
+	if cs.Version != CurrentStateVersion {
+		t.Errorf("Expected version %d, got %d", CurrentStateVersion, cs.Version)
 	}
 }
 
-func TestSaveAndLoad(test *testing.T) {
-	tmpDir := test.TempDir()
-	stateFile := filepath.Join(tmpDir, StateFileName)
+func TestSaveAndLoad(t *testing.T) {
+	ctx := context.Background()
+	clientset := fake.NewSimpleClientset()
 
 	// Create and save state
-	st := New("test-cluster", false)
-	st.MarkServiceInstalled("redis")
-	st.MarkServiceInstalled("postgres")
+	cs := New("test-cluster", false)
+	cs.MarkServiceInstalled("redis")
+	cs.MarkServiceInstalled("postgres")
 
-	if err := st.Save(stateFile); err != nil {
-		test.Fatalf("Failed to save state: %v", err)
+	if err := cs.Save(ctx, clientset); err != nil {
+		t.Fatalf("Failed to save state: %v", err)
 	}
 
-	// Verify file exists
-	if _, err := os.Stat(stateFile); os.IsNotExist(err) {
-		test.Fatal("State file was not created")
+	// Verify ConfigMap exists
+	cm, err := clientset.CoreV1().ConfigMaps(ConfigMapNamespace).Get(ctx, ConfigMapName, metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("ConfigMap was not created: %v", err)
+	}
+
+	// Verify ConfigMap has correct labels
+	if cm.Labels["app.kubernetes.io/managed-by"] != "kraze" {
+		t.Error("Expected ConfigMap to have managed-by label")
 	}
 
 	// Load state
-	loaded, err := Load(stateFile)
+	loaded, err := Load(ctx, clientset, "test-cluster")
 	if err != nil {
-		test.Fatalf("Failed to load state: %v", err)
+		t.Fatalf("Failed to load state: %v", err)
 	}
 
 	if loaded.ClusterName != "test-cluster" {
-		test.Errorf("Expected cluster name 'test-cluster', got '%s'", loaded.ClusterName)
+		t.Errorf("Expected cluster name 'test-cluster', got '%s'", loaded.ClusterName)
 	}
 
 	if len(loaded.Services) != 2 {
-		test.Errorf("Expected 2 services, got %d", len(loaded.Services))
+		t.Errorf("Expected 2 services, got %d", len(loaded.Services))
 	}
 
 	if !loaded.IsServiceInstalled("redis") {
-		test.Error("Expected redis to be installed")
+		t.Error("Expected redis to be installed")
 	}
 
 	if !loaded.IsServiceInstalled("postgres") {
-		test.Error("Expected postgres to be installed")
+		t.Error("Expected postgres to be installed")
 	}
 }
 
-func TestLoadNonexistent(test *testing.T) {
-	tmpDir := test.TempDir()
-	stateFile := filepath.Join(tmpDir, "nonexistent.state")
+func TestLoadNonexistent(t *testing.T) {
+	ctx := context.Background()
+	clientset := fake.NewSimpleClientset()
 
-	loaded, err := Load(stateFile)
+	// Load when ConfigMap doesn't exist
+	loaded, err := Load(ctx, clientset, "test-cluster")
 	if err != nil {
-		test.Errorf("Expected no error for nonexistent file, got %v", err)
+		t.Errorf("Expected no error for nonexistent ConfigMap, got %v", err)
 	}
 
 	if loaded != nil {
-		test.Error("Expected nil state for nonexistent file")
+		t.Error("Expected nil state for nonexistent ConfigMap")
 	}
 }
 
-func TestLoadInvalidJSON(test *testing.T) {
-	tmpDir := test.TempDir()
-	stateFile := filepath.Join(tmpDir, StateFileName)
+func TestLoadInvalidJSON(t *testing.T) {
+	ctx := context.Background()
+	clientset := fake.NewSimpleClientset()
 
-	if err := os.WriteFile(stateFile, []byte("invalid json"), 0644); err != nil {
-		test.Fatalf("Failed to write invalid state: %v", err)
+	// Create ConfigMap with invalid JSON
+	cm := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      ConfigMapName,
+			Namespace: ConfigMapNamespace,
+		},
+		Data: map[string]string{
+			ConfigMapDataKey: "invalid json",
+		},
+	}
+	_, err := clientset.CoreV1().ConfigMaps(ConfigMapNamespace).Create(ctx, cm, metav1.CreateOptions{})
+	if err != nil {
+		t.Fatalf("Failed to create ConfigMap: %v", err)
 	}
 
-	_, err := Load(stateFile)
+	_, err = Load(ctx, clientset, "test-cluster")
 	if err == nil {
-		test.Error("Expected error for invalid JSON, got nil")
+		t.Error("Expected error for invalid JSON, got nil")
 	}
 }
 
-func TestDelete(test *testing.T) {
-	tmpDir := test.TempDir()
-	stateFile := filepath.Join(tmpDir, StateFileName)
+func TestDelete(t *testing.T) {
+	ctx := context.Background()
+	clientset := fake.NewSimpleClientset()
 
-	// Create state file
-	st := New("test-cluster", false)
-	if err := st.Save(stateFile); err != nil {
-		test.Fatalf("Failed to save state: %v", err)
+	// Create and save state
+	cs := New("test-cluster", false)
+	if err := cs.Save(ctx, clientset); err != nil {
+		t.Fatalf("Failed to save state: %v", err)
 	}
 
-	// Delete it
-	if err := Delete(stateFile); err != nil {
-		test.Fatalf("Failed to delete state: %v", err)
+	// Verify ConfigMap exists
+	_, err := clientset.CoreV1().ConfigMaps(ConfigMapNamespace).Get(ctx, ConfigMapName, metav1.GetOptions{})
+	if err != nil {
+		t.Fatal("ConfigMap should exist before delete")
 	}
 
-	// Verify it's gone
-	if _, err := os.Stat(stateFile); !os.IsNotExist(err) {
-		test.Error("State file should not exist after delete")
+	// Delete state
+	if err := Delete(ctx, clientset); err != nil {
+		t.Fatalf("Failed to delete state: %v", err)
 	}
 
-	// Deleting nonexistent file should not error
-	if err := Delete(stateFile); err != nil {
-		test.Errorf("Expected no error deleting nonexistent file, got %v", err)
+	// Verify ConfigMap is gone
+	_, err = clientset.CoreV1().ConfigMaps(ConfigMapNamespace).Get(ctx, ConfigMapName, metav1.GetOptions{})
+	if err == nil {
+		t.Error("ConfigMap should be deleted")
 	}
 }
 
-func TestMarkServiceInstalled(test *testing.T) {
-	st := New("test-cluster", false)
+func TestDeleteNonexistent(t *testing.T) {
+	ctx := context.Background()
+	clientset := fake.NewSimpleClientset()
 
-	st.MarkServiceInstalled("redis")
+	// Delete when ConfigMap doesn't exist (should not error)
+	if err := Delete(ctx, clientset); err != nil {
+		t.Errorf("Expected no error for deleting nonexistent ConfigMap, got %v", err)
+	}
+}
 
-	if !st.IsServiceInstalled("redis") {
-		test.Error("Expected redis to be installed")
+func TestMarkServiceInstalled(t *testing.T) {
+	cs := New("test-cluster", false)
+
+	cs.MarkServiceInstalled("backend")
+
+	if !cs.IsServiceInstalled("backend") {
+		t.Error("Expected backend to be installed")
 	}
 
-	svc, ok := st.Services["redis"]
-	if !ok {
-		test.Fatal("Expected redis in services map")
+	svc, exists := cs.Services["backend"]
+	if !exists {
+		t.Fatal("Expected backend service to exist")
 	}
 
-	if svc.Name != "redis" {
-		test.Errorf("Expected service name 'redis', got '%s'", svc.Name)
+	if svc.Name != "backend" {
+		t.Errorf("Expected service name 'backend', got '%s'", svc.Name)
 	}
 
 	if !svc.Installed {
-		test.Error("Expected service to be marked as installed")
+		t.Error("Expected Installed to be true")
 	}
 
 	if svc.UpdatedAt.IsZero() {
-		test.Error("Expected UpdatedAt to be set")
+		t.Error("Expected UpdatedAt to be set")
 	}
 }
 
-func TestMarkServiceUninstalled(test *testing.T) {
-	st := New("test-cluster", false)
+func TestMarkServiceInstalledWithNamespace(t *testing.T) {
+	cs := New("test-cluster", false)
 
-	st.MarkServiceInstalled("redis")
-	if !st.IsServiceInstalled("redis") {
-		test.Error("Expected redis to be installed")
+	cs.MarkServiceInstalledWithNamespace("backend", "default", true)
+
+	svc, exists := cs.Services["backend"]
+	if !exists {
+		t.Fatal("Expected backend service to exist")
 	}
 
-	st.MarkServiceUninstalled("redis")
-	if st.IsServiceInstalled("redis") {
-		test.Error("Expected redis to be uninstalled")
+	if svc.Namespace != "default" {
+		t.Errorf("Expected namespace 'default', got '%s'", svc.Namespace)
 	}
 
-	if _, ok := st.Services["redis"]; ok {
-		test.Error("Expected redis to be removed from services map")
-	}
-}
-
-func TestIsServiceInstalled(test *testing.T) {
-	st := New("test-cluster", false)
-
-	if st.IsServiceInstalled("redis") {
-		test.Error("Expected redis to not be installed initially")
-	}
-
-	st.MarkServiceInstalled("redis")
-
-	if !st.IsServiceInstalled("redis") {
-		test.Error("Expected redis to be installed")
+	if !svc.CreatedNamespace {
+		t.Error("Expected CreatedNamespace to be true")
 	}
 }
 
-func TestGetInstalledServices(test *testing.T) {
-	st := New("test-cluster", false)
+func TestMarkServiceInstalledWithNamespacePreservesImageHashes(t *testing.T) {
+	cs := New("test-cluster", false)
 
-	st.MarkServiceInstalled("redis")
-	st.MarkServiceInstalled("postgres")
-	st.MarkServiceInstalled("api")
+	// First install with image hashes
+	imageHashes := map[string]string{
+		"myapp:latest": "sha256:abc123",
+	}
+	cs.MarkServiceInstalledWithImages("backend", "default", true, imageHashes)
 
-	installed := st.GetInstalledServices()
+	// Update without image hashes (should preserve)
+	cs.MarkServiceInstalledWithNamespace("backend", "default", false)
+
+	svc := cs.Services["backend"]
+	if len(svc.ImageHashes) != 1 {
+		t.Errorf("Expected image hashes to be preserved, got %d hashes", len(svc.ImageHashes))
+	}
+
+	if svc.ImageHashes["myapp:latest"] != "sha256:abc123" {
+		t.Error("Expected image hash to be preserved")
+	}
+}
+
+func TestMarkServiceInstalledWithImages(t *testing.T) {
+	cs := New("test-cluster", false)
+
+	imageHashes := map[string]string{
+		"myapp:latest":   "sha256:abc123",
+		"postgres:15":    "sha256:def456",
+	}
+
+	cs.MarkServiceInstalledWithImages("backend", "default", true, imageHashes)
+
+	svc, exists := cs.Services["backend"]
+	if !exists {
+		t.Fatal("Expected backend service to exist")
+	}
+
+	if len(svc.ImageHashes) != 2 {
+		t.Errorf("Expected 2 image hashes, got %d", len(svc.ImageHashes))
+	}
+
+	if svc.ImageHashes["myapp:latest"] != "sha256:abc123" {
+		t.Error("Expected correct image hash for myapp:latest")
+	}
+}
+
+func TestMarkServiceUninstalled(t *testing.T) {
+	cs := New("test-cluster", false)
+
+	cs.MarkServiceInstalled("backend")
+	if !cs.IsServiceInstalled("backend") {
+		t.Fatal("Expected backend to be installed")
+	}
+
+	cs.MarkServiceUninstalled("backend")
+	if cs.IsServiceInstalled("backend") {
+		t.Error("Expected backend to be uninstalled")
+	}
+
+	if _, exists := cs.Services["backend"]; exists {
+		t.Error("Expected backend service to be removed from map")
+	}
+}
+
+func TestGetInstalledServices(t *testing.T) {
+	cs := New("test-cluster", false)
+
+	cs.MarkServiceInstalled("redis")
+	cs.MarkServiceInstalled("postgres")
+	cs.MarkServiceInstalled("backend")
+
+	installed := cs.GetInstalledServices()
 
 	if len(installed) != 3 {
-		test.Errorf("Expected 3 installed services, got %d", len(installed))
+		t.Errorf("Expected 3 installed services, got %d", len(installed))
 	}
 
-	// Verify all services are present (order doesn't matter)
-	found := make(map[string]bool)
+	// Check all services are present (order doesn't matter)
+	serviceMap := make(map[string]bool)
 	for _, name := range installed {
-		found[name] = true
+		serviceMap[name] = true
 	}
 
-	for _, expected := range []string{"redis", "postgres", "api"} {
-		if !found[expected] {
-			test.Errorf("Expected '%s' in installed services", expected)
-		}
+	if !serviceMap["redis"] || !serviceMap["postgres"] || !serviceMap["backend"] {
+		t.Error("Expected all services in installed list")
 	}
 }
 
-func TestGetNamespacesForServices(test *testing.T) {
-	st := New("test-cluster", false)
+func TestGetCreatedNamespaces(t *testing.T) {
+	cs := New("test-cluster", false)
 
-	// Setup: Install 3 services in 2 namespaces
-	st.MarkServiceInstalledWithNamespace("argocd", "argocd", true)
-	st.MarkServiceInstalledWithNamespace("redis", "data", false)
-	st.MarkServiceInstalledWithNamespace("postgres", "data", true)
+	// Service 1: created namespace "app"
+	cs.MarkServiceInstalledWithNamespace("backend", "app", true)
+	// Service 2: created namespace "app" (same namespace)
+	cs.MarkServiceInstalledWithNamespace("frontend", "app", true)
+	// Service 3: existing namespace "default"
+	cs.MarkServiceInstalledWithNamespace("redis", "default", false)
+	// Service 4: created namespace "data"
+	cs.MarkServiceInstalledWithNamespace("postgres", "data", true)
 
-	// Test 1: Uninstalling argocd (only service in argocd namespace)
-	// Should return argocd namespace with count 0 (no other services using it)
-	namespaces := st.GetNamespacesForServices([]string{"argocd"})
-	if len(namespaces) != 1 {
-		test.Errorf("Expected 1 namespace, got %d", len(namespaces))
-	}
-	if count, exists := namespaces["argocd"]; !exists || count != 0 {
-		test.Errorf("Expected argocd namespace with count 0, got count %d, exists %v", count, exists)
-	}
+	namespaces := cs.GetCreatedNamespaces()
 
-	// Test 2: Uninstalling redis (one of two services in data namespace)
-	// Should return data namespace with count 1 (postgres still using it)
-	namespaces = st.GetNamespacesForServices([]string{"redis"})
-	if len(namespaces) != 1 {
-		test.Errorf("Expected 1 namespace, got %d", len(namespaces))
-	}
-	if count, exists := namespaces["data"]; !exists || count != 1 {
-		test.Errorf("Expected data namespace with count 1, got count %d, exists %v", count, exists)
-	}
-
-	// Test 3: Uninstalling both redis and postgres (all services in data namespace)
-	// Should return data namespace with count 0 (no other services using it)
-	namespaces = st.GetNamespacesForServices([]string{"redis", "postgres"})
-	if len(namespaces) != 1 {
-		test.Errorf("Expected 1 namespace, got %d", len(namespaces))
-	}
-	if count, exists := namespaces["data"]; !exists || count != 0 {
-		test.Errorf("Expected data namespace with count 0, got count %d, exists %v", count, exists)
-	}
-
-	// Test 4: Uninstalling all three services
-	// Should return both namespaces with count 0
-	namespaces = st.GetNamespacesForServices([]string{"argocd", "redis", "postgres"})
+	// Should only include namespaces where CreatedNamespace = true
 	if len(namespaces) != 2 {
-		test.Errorf("Expected 2 namespaces, got %d", len(namespaces))
+		t.Errorf("Expected 2 created namespaces, got %d", len(namespaces))
 	}
-	if count, exists := namespaces["argocd"]; !exists || count != 0 {
-		test.Errorf("Expected argocd namespace with count 0, got count %d, exists %v", count, exists)
+
+	if namespaces["app"] != 2 {
+		t.Errorf("Expected 2 services in 'app' namespace, got %d", namespaces["app"])
 	}
-	if count, exists := namespaces["data"]; !exists || count != 0 {
-		test.Errorf("Expected data namespace with count 0, got count %d, exists %v", count, exists)
+
+	if namespaces["data"] != 1 {
+		t.Errorf("Expected 1 service in 'data' namespace, got %d", namespaces["data"])
+	}
+
+	if _, exists := namespaces["default"]; exists {
+		t.Error("Should not include 'default' namespace (not created by kraze)")
 	}
 }
 
-func TestGetAllNamespacesUsedForCleanup(test *testing.T) {
-	st := New("test-cluster", false)
+func TestGetAllNamespacesUsed(t *testing.T) {
+	cs := New("test-cluster", false)
 
-	// Setup: Install 3 services in 2 namespaces
-	// This simulates the state BEFORE we start uninstalling
-	st.MarkServiceInstalledWithNamespace("argocd", "argocd", true)
-	st.MarkServiceInstalledWithNamespace("metallb", "metallb-system", true)
-	st.MarkServiceInstalledWithNamespace("metallb-l2", "metallb-system", false)
+	cs.MarkServiceInstalledWithNamespace("backend", "app", true)
+	cs.MarkServiceInstalledWithNamespace("frontend", "app", false)
+	cs.MarkServiceInstalledWithNamespace("redis", "data", true)
 
-	// Test: GetAllNamespacesUsedForCleanup should return ALL namespaces with count 0
-	// This is used when uninstalling all services (called BEFORE actual uninstall)
-	namespaces := st.GetAllNamespacesUsedForCleanup()
+	namespaces := cs.GetAllNamespacesUsed()
 
-	// Should include both namespaces with count 0
-	// (count is 0 because we're going to uninstall everything)
 	if len(namespaces) != 2 {
-		test.Errorf("Expected 2 namespaces, got %d", len(namespaces))
+		t.Errorf("Expected 2 namespaces, got %d", len(namespaces))
 	}
 
-	if count, exists := namespaces["argocd"]; !exists || count != 0 {
-		test.Errorf("Expected argocd namespace with count 0, got count %d, exists %v", count, exists)
+	if namespaces["app"] != 2 {
+		t.Errorf("Expected 2 services in 'app', got %d", namespaces["app"])
 	}
 
-	if count, exists := namespaces["metallb-system"]; !exists || count != 0 {
-		test.Errorf("Expected metallb-system namespace with count 0, got count %d, exists %v", count, exists)
-	}
-}
-
-func TestGetAllNamespacesUsed(test *testing.T) {
-	st := New("test-cluster", false)
-
-	// Setup: Install 3 services in 2 namespaces, then uninstall one
-	st.MarkServiceInstalledWithNamespace("argocd", "argocd", true)
-	st.MarkServiceInstalledWithNamespace("metallb", "metallb-system", true)
-	st.MarkServiceInstalledWithNamespace("metallb-l2", "metallb-system", false)
-
-	// Uninstall argocd
-	st.MarkServiceUninstalled("argocd")
-
-	// Test: GetAllNamespacesUsed should only return namespaces with INSTALLED services
-	namespaces := st.GetAllNamespacesUsed()
-
-	// Should only include metallb-system (2 installed services)
-	// argocd namespace should NOT be included (argocd is uninstalled)
-	if len(namespaces) != 1 {
-		test.Errorf("Expected 1 namespace, got %d", len(namespaces))
-	}
-
-	if count, exists := namespaces["metallb-system"]; !exists || count != 2 {
-		test.Errorf("Expected metallb-system namespace with count 2, got count %d, exists %v", count, exists)
-	}
-
-	if _, exists := namespaces["argocd"]; exists {
-		test.Errorf("Did not expect argocd namespace (service is uninstalled)")
+	if namespaces["data"] != 1 {
+		t.Errorf("Expected 1 service in 'data', got %d", namespaces["data"])
 	}
 }
 
-func TestGetStateFilePath(test *testing.T) {
-	path := GetStateFilePath("/test/dir")
-	expected := filepath.Join("/test/dir", StateFileName)
+func TestGetAllNamespacesUsedForCleanup(t *testing.T) {
+	cs := New("test-cluster", false)
 
-	if path != expected {
-		test.Errorf("Expected '%s', got '%s'", expected, path)
+	cs.MarkServiceInstalledWithNamespace("backend", "app", true)
+	cs.MarkServiceInstalledWithNamespace("redis", "data", false)
+
+	namespaces := cs.GetAllNamespacesUsedForCleanup()
+
+	if len(namespaces) != 2 {
+		t.Errorf("Expected 2 namespaces, got %d", len(namespaces))
+	}
+
+	// All counts should be 0 for cleanup
+	if namespaces["app"] != 0 {
+		t.Errorf("Expected count 0 for 'app', got %d", namespaces["app"])
+	}
+
+	if namespaces["data"] != 0 {
+		t.Errorf("Expected count 0 for 'data', got %d", namespaces["data"])
 	}
 }
 
-func TestSaveUpdatesTimestamp(test *testing.T) {
-	tmpDir := test.TempDir()
-	stateFile := filepath.Join(tmpDir, StateFileName)
+func TestGetNamespacesForServices(t *testing.T) {
+	cs := New("test-cluster", false)
 
-	st := New("test-cluster", false)
-	originalTime := st.LastUpdated
+	// Three services in "app" namespace
+	cs.MarkServiceInstalledWithNamespace("backend", "app", true)
+	cs.MarkServiceInstalledWithNamespace("frontend", "app", true)
+	cs.MarkServiceInstalledWithNamespace("api", "app", true)
 
-	// Wait a bit to ensure timestamp difference
-	time.Sleep(10 * time.Millisecond)
+	// One service in "data" namespace
+	cs.MarkServiceInstalledWithNamespace("redis", "data", true)
 
-	if err := st.Save(stateFile); err != nil {
-		test.Fatalf("Failed to save state: %v", err)
+	// Uninstalling backend and frontend (2 out of 3 in "app")
+	namespaces := cs.GetNamespacesForServices([]string{"backend", "frontend"})
+
+	// "app" namespace should have count 1 (api still using it)
+	if namespaces["app"] != 1 {
+		t.Errorf("Expected 1 other service in 'app', got %d", namespaces["app"])
 	}
 
-	if !st.LastUpdated.After(originalTime) {
-		test.Error("Expected LastUpdated to be updated on save")
+	// Uninstalling redis (only service in "data")
+	namespaces = cs.GetNamespacesForServices([]string{"redis"})
+
+	// "data" namespace should have count 0 (can be deleted)
+	if namespaces["data"] != 0 {
+		t.Errorf("Expected 0 other services in 'data', got %d", namespaces["data"])
 	}
 }
 
-func TestStateVersioning(test *testing.T) {
-	// New state should have current version
-	st := New("test-cluster", false)
-	if st.Version != CurrentStateVersion {
-		test.Errorf("Expected version %d, got %d", CurrentStateVersion, st.Version)
+func TestGetImageHashes(t *testing.T) {
+	cs := New("test-cluster", false)
+
+	imageHashes := map[string]string{
+		"myapp:latest": "sha256:abc123",
+		"postgres:15":  "sha256:def456",
 	}
 
-	// Saved state should have current version
-	tmpDir := test.TempDir()
-	stateFile := filepath.Join(tmpDir, StateFileName)
+	cs.MarkServiceInstalledWithImages("backend", "default", false, imageHashes)
 
-	if err := st.Save(stateFile); err != nil {
-		test.Fatalf("Failed to save state: %v", err)
+	// Get hashes for existing service
+	hashes := cs.GetImageHashes("backend")
+	if len(hashes) != 2 {
+		t.Errorf("Expected 2 hashes, got %d", len(hashes))
 	}
 
-	loaded, err := Load(stateFile)
+	if hashes["myapp:latest"] != "sha256:abc123" {
+		t.Error("Expected correct hash for myapp:latest")
+	}
+
+	// Get hashes for non-existent service
+	emptyHashes := cs.GetImageHashes("nonexistent")
+	if len(emptyHashes) != 0 {
+		t.Errorf("Expected empty map for nonexistent service, got %d hashes", len(emptyHashes))
+	}
+}
+
+func TestHasImageHashChanged(t *testing.T) {
+	cs := New("test-cluster", false)
+
+	imageHashes := map[string]string{
+		"myapp:latest": "sha256:abc123",
+	}
+	cs.MarkServiceInstalledWithImages("backend", "default", false, imageHashes)
+
+	// Same hash - not changed
+	if cs.HasImageHashChanged("backend", "myapp:latest", "sha256:abc123") {
+		t.Error("Expected hash to be unchanged")
+	}
+
+	// Different hash - changed
+	if !cs.HasImageHashChanged("backend", "myapp:latest", "sha256:xyz789") {
+		t.Error("Expected hash to be changed")
+	}
+
+	// New image - changed
+	if !cs.HasImageHashChanged("backend", "newimage:v1", "sha256:new") {
+		t.Error("Expected new image to be marked as changed")
+	}
+
+	// Nonexistent service - changed
+	if !cs.HasImageHashChanged("nonexistent", "myapp:latest", "sha256:abc123") {
+		t.Error("Expected nonexistent service to be marked as changed")
+	}
+}
+
+func TestGetChangedImages(t *testing.T) {
+	cs := New("test-cluster", false)
+
+	storedHashes := map[string]string{
+		"myapp:latest":  "sha256:abc123",
+		"postgres:15":   "sha256:def456",
+	}
+	cs.MarkServiceInstalledWithImages("backend", "default", false, storedHashes)
+
+	// Test with no changes
+	currentHashes := map[string]string{
+		"myapp:latest":  "sha256:abc123",
+		"postgres:15":   "sha256:def456",
+	}
+	changed := cs.GetChangedImages("backend", currentHashes)
+	if len(changed) != 0 {
+		t.Errorf("Expected no changed images, got %d", len(changed))
+	}
+
+	// Test with one changed hash
+	currentHashes = map[string]string{
+		"myapp:latest":  "sha256:xyz789", // Changed
+		"postgres:15":   "sha256:def456",
+	}
+	changed = cs.GetChangedImages("backend", currentHashes)
+	if len(changed) != 1 {
+		t.Errorf("Expected 1 changed image, got %d", len(changed))
+	}
+	if changed[0] != "myapp:latest" {
+		t.Errorf("Expected 'myapp:latest' to be changed, got '%s'", changed[0])
+	}
+
+	// Test with new image
+	currentHashes = map[string]string{
+		"myapp:latest":  "sha256:abc123",
+		"postgres:15":   "sha256:def456",
+		"redis:7":       "sha256:newimage", // New
+	}
+	changed = cs.GetChangedImages("backend", currentHashes)
+	if len(changed) != 1 {
+		t.Errorf("Expected 1 changed image, got %d", len(changed))
+	}
+	if changed[0] != "redis:7" {
+		t.Errorf("Expected 'redis:7' to be new, got '%s'", changed[0])
+	}
+}
+
+func TestStatePersistence(t *testing.T) {
+	ctx := context.Background()
+	clientset := fake.NewSimpleClientset()
+
+	// Create complex state
+	cs := New("test-cluster", true)
+	cs.MarkServiceInstalledWithImages("backend", "app", true, map[string]string{
+		"myapp:latest": "sha256:abc123",
+	})
+	cs.MarkServiceInstalledWithNamespace("redis", "data", false)
+
+	// Save
+	if err := cs.Save(ctx, clientset); err != nil {
+		t.Fatalf("Failed to save state: %v", err)
+	}
+
+	// Load and verify all fields
+	loaded, err := Load(ctx, clientset, "test-cluster")
 	if err != nil {
-		test.Fatalf("Failed to load state: %v", err)
-	}
-
-	if loaded.Version != CurrentStateVersion {
-		test.Errorf("Expected loaded version %d, got %d", CurrentStateVersion, loaded.Version)
-	}
-}
-
-func TestMigrateFromV0(test *testing.T) {
-	tmpDir := test.TempDir()
-	stateFile := filepath.Join(tmpDir, StateFileName)
-
-	// Create a v0 state file (no version field)
-	v0State := `{
-  "cluster_name": "test-cluster",
-  "is_external": false,
-  "services": {
-    "redis": {
-      "name": "redis",
-      "installed": true,
-      "updated_at": "2024-01-01T00:00:00Z",
-      "namespace": "data",
-      "created_namespace": true
-    }
-  },
-  "last_updated": "2024-01-01T00:00:00Z"
-}`
-
-	if err := os.WriteFile(stateFile, []byte(v0State), 0644); err != nil {
-		test.Fatalf("Failed to write v0 state: %v", err)
-	}
-
-	// Load and verify it migrates to v1
-	loaded, err := Load(stateFile)
-	if err != nil {
-		test.Fatalf("Failed to load v0 state: %v", err)
-	}
-
-	if loaded.Version != 1 {
-		test.Errorf("Expected migrated version to be 1, got %d", loaded.Version)
+		t.Fatalf("Failed to load state: %v", err)
 	}
 
 	if loaded.ClusterName != "test-cluster" {
-		test.Errorf("Expected cluster name 'test-cluster', got '%s'", loaded.ClusterName)
+		t.Error("ClusterName not persisted")
 	}
 
-	if !loaded.IsServiceInstalled("redis") {
-		test.Error("Expected redis to be installed after migration")
+	if !loaded.IsExternal {
+		t.Error("IsExternal not persisted")
 	}
 
-	// Save and verify version is persisted
-	if err := loaded.Save(stateFile); err != nil {
-		test.Fatalf("Failed to save migrated state: %v", err)
+	if len(loaded.Services) != 2 {
+		t.Errorf("Expected 2 services, got %d", len(loaded.Services))
 	}
 
-	reloaded, err := Load(stateFile)
-	if err != nil {
-		test.Fatalf("Failed to reload state: %v", err)
+	backend := loaded.Services["backend"]
+	if backend.Namespace != "app" {
+		t.Error("Service namespace not persisted")
 	}
-
-	if reloaded.Version != CurrentStateVersion {
-		test.Errorf("Expected reloaded version %d, got %d", CurrentStateVersion, reloaded.Version)
+	if !backend.CreatedNamespace {
+		t.Error("CreatedNamespace flag not persisted")
+	}
+	if backend.ImageHashes["myapp:latest"] != "sha256:abc123" {
+		t.Error("Image hashes not persisted")
 	}
 }
 
-func TestLoadNewerVersion(test *testing.T) {
-	tmpDir := test.TempDir()
-	stateFile := filepath.Join(tmpDir, StateFileName)
+func TestMigration(t *testing.T) {
+	ctx := context.Background()
+	clientset := fake.NewSimpleClientset()
 
-	// Create a state file with a future version
-	futureState := `{
-  "version": 999,
-  "cluster_name": "test-cluster",
-  "is_external": false,
-  "services": {},
-  "last_updated": "2024-01-01T00:00:00Z"
-}`
-
-	if err := os.WriteFile(stateFile, []byte(futureState), 0644); err != nil {
-		test.Fatalf("Failed to write future state: %v", err)
+	// Create ConfigMap with v0 state (no version field)
+	v0State := map[string]interface{}{
+		"cluster_name": "test-cluster",
+		"is_external":  false,
+		"services":     map[string]interface{}{},
+		"last_updated": time.Now().Format(time.RFC3339),
+		// No version field
 	}
 
-	// Load should fail with helpful error
-	_, err := Load(stateFile)
-	if err == nil {
-		test.Error("Expected error loading newer version, got nil")
+	v0JSON, err := json.Marshal(v0State)
+	if err != nil {
+		t.Fatalf("Failed to marshal v0 state: %v", err)
 	}
 
-	if err != nil && err.Error() != "failed to migrate state file: state file version 999 is newer than supported version 1 - please upgrade kraze" {
-		test.Errorf("Expected upgrade error message, got: %v", err)
+	cm := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      ConfigMapName,
+			Namespace: ConfigMapNamespace,
+		},
+		Data: map[string]string{
+			ConfigMapDataKey: string(v0JSON),
+		},
+	}
+	_, err = clientset.CoreV1().ConfigMaps(ConfigMapNamespace).Create(ctx, cm, metav1.CreateOptions{})
+	if err != nil {
+		t.Fatalf("Failed to create ConfigMap: %v", err)
+	}
+
+	// Load should auto-migrate to v1
+	loaded, err := Load(ctx, clientset, "test-cluster")
+	if err != nil {
+		t.Fatalf("Failed to load v0 state: %v", err)
+	}
+
+	if loaded.Version != CurrentStateVersion {
+		t.Errorf("Expected version %d after migration, got %d", CurrentStateVersion, loaded.Version)
+	}
+}
+
+func TestUpdateExistingConfigMap(t *testing.T) {
+	ctx := context.Background()
+	clientset := fake.NewSimpleClientset()
+
+	// Create and save initial state
+	cs1 := New("test-cluster", false)
+	cs1.MarkServiceInstalled("redis")
+
+	if err := cs1.Save(ctx, clientset); err != nil {
+		t.Fatalf("Failed to save initial state: %v", err)
+	}
+
+	// Update state with new service
+	cs2 := New("test-cluster", false)
+	cs2.MarkServiceInstalled("redis")
+	cs2.MarkServiceInstalled("postgres")
+
+	if err := cs2.Save(ctx, clientset); err != nil {
+		t.Fatalf("Failed to update state: %v", err)
+	}
+
+	// Load and verify both services
+	loaded, err := Load(ctx, clientset, "test-cluster")
+	if err != nil {
+		t.Fatalf("Failed to load updated state: %v", err)
+	}
+
+	if len(loaded.Services) != 2 {
+		t.Errorf("Expected 2 services after update, got %d", len(loaded.Services))
+	}
+
+	if !loaded.IsServiceInstalled("postgres") {
+		t.Error("Expected postgres to be installed after update")
 	}
 }

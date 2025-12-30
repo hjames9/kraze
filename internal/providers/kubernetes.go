@@ -18,6 +18,64 @@ import (
 	"k8s.io/client-go/transport/spdy"
 )
 
+// GetClientsetFromKubeconfig creates a Kubernetes clientset from a kubeconfig file path
+func GetClientsetFromKubeconfig(kubeconfigPath string) (kubernetes.Interface, error) {
+	if kubeconfigPath == "" {
+		return nil, fmt.Errorf("kubeconfig path is empty")
+	}
+
+	// Load kubeconfig from file
+	config, err := clientcmd.BuildConfigFromFlags("", kubeconfigPath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to build config from kubeconfig: %w", err)
+	}
+
+	// Create clientset
+	clientset, err := kubernetes.NewForConfig(config)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create clientset: %w", err)
+	}
+
+	return clientset, nil
+}
+
+// GetClientsetFromKubeconfigContent creates a Kubernetes clientset from kubeconfig content (YAML string)
+// skipTLSVerify should only be set to true for local kind clusters where IPs may be patched for custom networks.
+// For external clusters (Docker Desktop, Minikube, etc.) this should be false to maintain proper TLS verification.
+func GetClientsetFromKubeconfigContent(kubeconfigContent string, skipTLSVerify bool) (kubernetes.Interface, error) {
+	if kubeconfigContent == "" {
+		return nil, fmt.Errorf("kubeconfig content is empty")
+	}
+
+	// Parse kubeconfig from bytes
+	clientConfig, err := clientcmd.NewClientConfigFromBytes([]byte(kubeconfigContent))
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse kubeconfig: %w", err)
+	}
+
+	// Get REST config
+	restConfig, err := clientConfig.ClientConfig()
+	if err != nil {
+		return nil, fmt.Errorf("failed to create REST config: %w", err)
+	}
+
+	// Skip TLS verification only for kind clusters where IP patching may cause cert hostname mismatches
+	// This is safe for local development but should NEVER be used for external/production clusters
+	if skipTLSVerify {
+		restConfig.TLSClientConfig.Insecure = true
+		restConfig.TLSClientConfig.CAData = nil
+		restConfig.TLSClientConfig.CAFile = ""
+	}
+
+	// Create clientset
+	clientset, err := kubernetes.NewForConfig(restConfig)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create clientset: %w", err)
+	}
+
+	return clientset, nil
+}
+
 // GetPodsForService returns pod names for a given service
 // For Helm services: uses helm release labels
 // For manifest services: uses user-specified labels or service name
