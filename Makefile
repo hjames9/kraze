@@ -80,9 +80,9 @@ release: ## Build release binaries, create git tag, and draft GitHub release
 	else \
 		echo "Creating git tag $(VERSION)..."; \
 		git tag -a $(VERSION) -m "Release $(VERSION)"; \
-		echo "Pushing git tag $(VERSION) to origin..."; \
-		git push origin $(VERSION); \
 	fi
+	@echo "Pushing git tag $(VERSION) to origin..."
+	git push origin $(VERSION)
 	@echo ""
 	@echo "Release $(VERSION) built successfully!"
 	@echo ""
