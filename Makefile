@@ -52,10 +52,9 @@ release: ## Build release binaries, create git tag, and draft GitHub release
 		echo "  make bump-major  # for breaking changes (0.4.1 -> 1.0.0)"; \
 		exit 1; \
 	fi
-	@echo "Checking if git tag $(VERSION) already exists..."
-	@if git rev-parse $(VERSION) >/dev/null 2>&1; then \
-		echo "Error: Git tag $(VERSION) already exists!"; \
-		echo "If you need to create a new release, bump the version first."; \
+	@echo "Checking if GitHub release $(VERSION) already exists..."
+	@if $(GHCMD) release view $(VERSION) >/dev/null 2>&1; then \
+		echo "Error: GitHub release $(VERSION) already exists!"; \
 		exit 1; \
 	fi
 	@echo "Checking for uncommitted changes..."
@@ -76,10 +75,14 @@ release: ## Build release binaries, create git tag, and draft GitHub release
 	@echo "Generating checksums..."
 	@cd $(BUILD_DIR) && sha256sum $(BINARY_NAME)-$(VERSION)-* > $(BINARY_NAME)-$(VERSION)-checksums.txt
 	@echo ""
-	@echo "Creating git tag $(VERSION)..."
-	git tag -a $(VERSION) -m "Release $(VERSION)"
-	@echo "Pushing git tag $(VERSION) to origin..."
-	git push origin $(VERSION)
+	@if git rev-parse $(VERSION) >/dev/null 2>&1; then \
+		echo "Git tag $(VERSION) already exists, skipping tag creation..."; \
+	else \
+		echo "Creating git tag $(VERSION)..."; \
+		git tag -a $(VERSION) -m "Release $(VERSION)"; \
+		echo "Pushing git tag $(VERSION) to origin..."; \
+		git push origin $(VERSION); \
+	fi
 	@echo ""
 	@echo "Release $(VERSION) built successfully!"
 	@echo ""
