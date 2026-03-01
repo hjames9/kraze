@@ -23,9 +23,9 @@ CMD_DIR=./cmd/$(BINARY_NAME)
 # Platform targets for cross-compilation
 PLATFORMS=linux/amd64 linux/arm64 darwin/amd64 darwin/arm64 windows/amd64 windows/arm64
 
-all: test build ## Run tests and build the binary
+all: help ## Show help (default)
 
-build: ## Build the binary for the current platform
+build: fmt vet ## Build the binary for the current platform
 	@echo "Building $(BINARY_NAME)..."
 	@mkdir -p $(BUILD_DIR)
 	CGO_ENABLED=0 $(GOBUILD) $(LDFLAGS) -o $(BUILD_DIR)/$(BINARY_NAME) $(CMD_DIR)

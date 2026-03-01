@@ -22,8 +22,8 @@ import (
 	v2loader "helm.sh/helm/v4/pkg/chart/v2/loader"
 	"helm.sh/helm/v4/pkg/cli"
 	"helm.sh/helm/v4/pkg/engine"
-	ri "helm.sh/helm/v4/pkg/release"
 	"helm.sh/helm/v4/pkg/registry"
+	ri "helm.sh/helm/v4/pkg/release"
 )
 
 // ImageReference represents a parsed Docker image reference

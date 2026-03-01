@@ -20,12 +20,12 @@ type ClusterConfig struct {
 	Networking         *NetworkingConfig      `yaml:"networking,omitempty"`
 	PreloadImages      []string               `yaml:"preload_images,omitempty"`
 	External           *ExternalClusterConfig `yaml:"external,omitempty"`
-	Network            string                 `yaml:"network,omitempty"`            // Docker network name (optional, auto-detected if not specified)
-	IPv4Address        string                 `yaml:"ipv4_address,omitempty"`       // Static IPv4 address for cluster container on Docker network
-	Subnet             string                 `yaml:"subnet,omitempty"`             // Docker network subnet (e.g., "172.1.0.0/16") - creates network if it doesn't exist
-	CACertificates     []string               `yaml:"ca_certificates,omitempty"`    // Paths to CA certificate files to trust in cluster nodes
+	Network            string                 `yaml:"network,omitempty"`             // Docker network name (optional, auto-detected if not specified)
+	IPv4Address        string                 `yaml:"ipv4_address,omitempty"`        // Static IPv4 address for cluster container on Docker network
+	Subnet             string                 `yaml:"subnet,omitempty"`              // Docker network subnet (e.g., "172.1.0.0/16") - creates network if it doesn't exist
+	CACertificates     []string               `yaml:"ca_certificates,omitempty"`     // Paths to CA certificate files to trust in cluster nodes
 	InsecureRegistries []string               `yaml:"insecure_registries,omitempty"` // Registries to skip TLS verification (e.g., ["registry.corp.com"])
-	Proxy              *ProxyConfig           `yaml:"proxy,omitempty"`              // HTTP/HTTPS proxy configuration
+	Proxy              *ProxyConfig           `yaml:"proxy,omitempty"`               // HTTP/HTTPS proxy configuration
 }
 
 // KindNode represents a kind node configuration
@@ -138,8 +138,8 @@ type ServiceConfig struct {
 	// Common fields
 	CreateNamespace *bool             `yaml:"create_namespace,omitempty"` // Defaults to true
 	Labels          map[string]string `yaml:"labels,omitempty"`
-	Wait            *bool             `yaml:"wait,omitempty"`           // Wait for resources to be ready (defaults to CLI flag)
-	WaitTimeout     string            `yaml:"wait_timeout,omitempty"`   // Timeout for wait operations (e.g., "10m", "5m")
+	Wait            *bool             `yaml:"wait,omitempty"`             // Wait for resources to be ready (defaults to CLI flag)
+	WaitTimeout     string            `yaml:"wait_timeout,omitempty"`     // Timeout for wait operations (e.g., "10m", "5m")
 	PostReadyDelay  string            `yaml:"post_ready_delay,omitempty"` // Delay after service is ready before continuing (e.g., "3s", "5s")
 
 	// Helm-specific fields

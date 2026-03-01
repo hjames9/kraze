@@ -232,8 +232,8 @@ func TestMarkServiceInstalledWithImages(t *testing.T) {
 	cs := New("test-cluster", false)
 
 	imageHashes := map[string]string{
-		"myapp:latest":   "sha256:abc123",
-		"postgres:15":    "sha256:def456",
+		"myapp:latest": "sha256:abc123",
+		"postgres:15":  "sha256:def456",
 	}
 
 	cs.MarkServiceInstalledWithImages("backend", "default", true, imageHashes)
@@ -458,15 +458,15 @@ func TestGetChangedImages(t *testing.T) {
 	cs := New("test-cluster", false)
 
 	storedHashes := map[string]string{
-		"myapp:latest":  "sha256:abc123",
-		"postgres:15":   "sha256:def456",
+		"myapp:latest": "sha256:abc123",
+		"postgres:15":  "sha256:def456",
 	}
 	cs.MarkServiceInstalledWithImages("backend", "default", false, storedHashes)
 
 	// Test with no changes
 	currentHashes := map[string]string{
-		"myapp:latest":  "sha256:abc123",
-		"postgres:15":   "sha256:def456",
+		"myapp:latest": "sha256:abc123",
+		"postgres:15":  "sha256:def456",
 	}
 	changed := cs.GetChangedImages("backend", currentHashes)
 	if len(changed) != 0 {
@@ -475,8 +475,8 @@ func TestGetChangedImages(t *testing.T) {
 
 	// Test with one changed hash
 	currentHashes = map[string]string{
-		"myapp:latest":  "sha256:xyz789", // Changed
-		"postgres:15":   "sha256:def456",
+		"myapp:latest": "sha256:xyz789", // Changed
+		"postgres:15":  "sha256:def456",
 	}
 	changed = cs.GetChangedImages("backend", currentHashes)
 	if len(changed) != 1 {
@@ -488,9 +488,9 @@ func TestGetChangedImages(t *testing.T) {
 
 	// Test with new image
 	currentHashes = map[string]string{
-		"myapp:latest":  "sha256:abc123",
-		"postgres:15":   "sha256:def456",
-		"redis:7":       "sha256:newimage", // New
+		"myapp:latest": "sha256:abc123",
+		"postgres:15":  "sha256:def456",
+		"redis:7":      "sha256:newimage", // New
 	}
 	changed = cs.GetChangedImages("backend", currentHashes)
 	if len(changed) != 1 {

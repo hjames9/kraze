@@ -351,16 +351,16 @@ func TestGetEffectiveProxyConfig(test *testing.T) {
 	km := NewKindManager()
 
 	tests := []struct {
-		name              string
-		envVars           map[string]string
-		config            *config.ClusterConfig
-		expectedHTTP      string
-		expectedHTTPS     string
-		expectedNoProxy   string
-		description       string
+		name            string
+		envVars         map[string]string
+		config          *config.ClusterConfig
+		expectedHTTP    string
+		expectedHTTPS   string
+		expectedNoProxy string
+		description     string
 	}{
 		{
-			name: "no proxy config, no env vars",
+			name:    "no proxy config, no env vars",
 			envVars: map[string]string{},
 			config: &config.ClusterConfig{
 				Name: "test",

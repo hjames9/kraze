@@ -284,10 +284,10 @@ func printClusterPlan(cfg *config.Config, exists bool) {
 
 func analyzeService(ctx context.Context, svc *config.ServiceConfig, st *state.ClusterState, cfg *config.Config) *ServicePlanInfo {
 	info := &ServicePlanInfo{
-		Name:       svc.Name,
-		Type:       svc.Type,
-		Namespace:  svc.GetNamespace(),
-		DependsOn:  svc.DependsOn,
+		Name:      svc.Name,
+		Type:      svc.Type,
+		Namespace: svc.GetNamespace(),
+		DependsOn: svc.DependsOn,
 	}
 
 	// Determine if service is installed

@@ -28,9 +28,9 @@ const (
 
 // ClusterState represents the state of deployed services stored in the cluster
 type ClusterState struct {
-	Version     int                        `json:"version"`      // State format version
+	Version     int                        `json:"version"` // State format version
 	ClusterName string                     `json:"cluster_name"`
-	IsExternal  bool                       `json:"is_external"`  // Whether this is an external cluster
+	IsExternal  bool                       `json:"is_external"` // Whether this is an external cluster
 	Services    map[string]ServiceMetadata `json:"services"`
 	LastUpdated time.Time                  `json:"last_updated"`
 }
