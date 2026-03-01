@@ -259,6 +259,7 @@ func (helm *HelmProvider) Uninstall(ctx context.Context, service *config.Service
 	client.KeepHistory = false
 	// DisableHooks is false by default (run hooks)
 	client.DisableHooks = false
+	client.WaitStrategy = kube.HookOnlyStrategy
 
 	if !helm.opts.Quiet {
 		fmt.Printf("Uninstalling Helm release '%s' from namespace '%s'...\n", service.Name, service.GetNamespace())
