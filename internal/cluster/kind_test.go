@@ -4,6 +4,7 @@ import (
 	"testing"
 
 	"github.com/hjames9/kraze/internal/config"
+	"sigs.k8s.io/kind/pkg/apis/config/defaults"
 	"sigs.k8s.io/kind/pkg/apis/config/v1alpha4"
 )
 
@@ -796,4 +797,49 @@ func findInString(str, substr string) bool {
 		}
 	}
 	return false
+}
+
+func TestParseK8sVersion(test *testing.T) {
+	km := NewKindManager()
+
+	tests := []struct {
+		name     string
+		cfg      config.ClusterConfig
+		expected string
+	}{
+		{
+			name:     "no version configured uses kind default",
+			cfg:      config.ClusterConfig{},
+			expected: "v1.35.0",
+		},
+		{
+			name:     "version field set",
+			cfg:      config.ClusterConfig{Version: "1.33.0"},
+			expected: "v1.33.0",
+		},
+		{
+			name:     "node_image with digest",
+			cfg:      config.ClusterConfig{NodeImage: "kindest/node:v1.32.0@sha256:c48c62eac5da28cdadcf560d1675ac2d9b09d2a4e5d4cdf2a7a4ee6f6781f38"},
+			expected: "v1.32.0",
+		},
+		{
+			name:     "node_image without digest",
+			cfg:      config.ClusterConfig{NodeImage: "kindest/node:v1.31.0"},
+			expected: "v1.31.0",
+		},
+		{
+			name:     "default image constant parses correctly",
+			cfg:      config.ClusterConfig{NodeImage: defaults.Image},
+			expected: "v1.35.0",
+		},
+	}
+
+	for _, tt := range tests {
+		test.Run(tt.name, func(test *testing.T) {
+			got := km.parseK8sVersion(&tt.cfg)
+			if got != tt.expected {
+				test.Errorf("parseK8sVersion() = %q, want %q", got, tt.expected)
+			}
+		})
+	}
 }

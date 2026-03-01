@@ -9,16 +9,21 @@ import (
 	"strings"
 	"time"
 
+	"io"
+	"log/slog"
+
 	"github.com/hjames9/kraze/internal/color"
 	"github.com/hjames9/kraze/internal/config"
 	"gopkg.in/yaml.v3"
-	"helm.sh/helm/v3/pkg/action"
-	"helm.sh/helm/v3/pkg/chart/loader"
-	"helm.sh/helm/v3/pkg/cli"
-	"helm.sh/helm/v3/pkg/getter"
-	"helm.sh/helm/v3/pkg/registry"
-	"helm.sh/helm/v3/pkg/release"
-	"helm.sh/helm/v3/pkg/repo"
+	"helm.sh/helm/v4/pkg/action"
+	"helm.sh/helm/v4/pkg/chart/loader"
+	"helm.sh/helm/v4/pkg/cli"
+	"helm.sh/helm/v4/pkg/getter"
+	"helm.sh/helm/v4/pkg/kube"
+	ri "helm.sh/helm/v4/pkg/release"
+	rcommon "helm.sh/helm/v4/pkg/release/common"
+	"helm.sh/helm/v4/pkg/registry"
+	repov1 "helm.sh/helm/v4/pkg/repo/v1"
 	apiextv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
@@ -59,7 +64,13 @@ func NewHelmProvider(opts *ProviderOptions) (*HelmProvider, error) {
 // getActionConfig creates an action.Configuration for a specific namespace
 // This ensures Helm stores release metadata in the correct namespace
 func (helm *HelmProvider) getActionConfig(namespace string) (*action.Configuration, error) {
-	actionConfig := new(action.Configuration)
+	var logHandler slog.Handler
+	if helm.opts.Verbose {
+		logHandler = slog.Default().Handler()
+	} else {
+		logHandler = slog.NewTextHandler(io.Discard, nil)
+	}
+	actionConfig := action.NewConfiguration(action.ConfigurationSetLogger(logHandler))
 
 	// Create a REST client getter with our config
 	restGetter := &restClientGetter{
@@ -69,11 +80,7 @@ func (helm *HelmProvider) getActionConfig(namespace string) (*action.Configurati
 
 	// Initialize action config with the target namespace
 	// This ensures Helm stores release secrets in the same namespace as the chart
-	if err := actionConfig.Init(restGetter, namespace, os.Getenv("HELM_DRIVER"), func(format string, v ...interface{}) {
-		if helm.opts.Verbose {
-			fmt.Printf("[HELM] "+format+"\n", v...)
-		}
-	}); err != nil {
+	if err := actionConfig.Init(restGetter, namespace, os.Getenv("HELM_DRIVER")); err != nil {
 		return nil, fmt.Errorf("failed to initialize Helm action config: %w", err)
 	}
 
@@ -121,13 +128,13 @@ func (helm *HelmProvider) Install(ctx context.Context, service *config.ServiceCo
 		return fmt.Errorf("failed to load values: %w", err)
 	}
 
-	var rel *release.Release
+	var rel ri.Releaser
 
 	if releaseExists {
 		// Upgrade existing release
 		upgradeClient := action.NewUpgrade(actionConfig)
 		upgradeClient.Namespace = service.GetNamespace()
-		upgradeClient.Wait = false
+		upgradeClient.WaitStrategy = kube.HookOnlyStrategy
 		upgradeClient.WaitForJobs = false
 
 		if helm.opts.Timeout != "" {
@@ -157,7 +164,7 @@ func (helm *HelmProvider) Install(ctx context.Context, service *config.ServiceCo
 		installClient.ReleaseName = service.Name
 		installClient.Namespace = service.GetNamespace()
 		installClient.CreateNamespace = service.ShouldCreateNamespace()
-		installClient.Wait = false
+		installClient.WaitStrategy = kube.HookOnlyStrategy
 		installClient.WaitForJobs = false
 
 		if helm.opts.Timeout != "" {
@@ -183,15 +190,22 @@ func (helm *HelmProvider) Install(ctx context.Context, service *config.ServiceCo
 		}
 	}
 
+	var manifest string
+	if rel != nil {
+		if acc, accErr := ri.NewAccessor(rel); accErr == nil {
+			manifest = acc.Manifest()
+		}
+	}
+
 	// Inject config checksums to force rollouts when ConfigMaps/Secrets change
-	if rel != nil && rel.Manifest != "" {
-		checksum, err := calculateConfigChecksum(rel.Manifest)
+	if manifest != "" {
+		checksum, err := calculateConfigChecksum(manifest)
 		if err != nil {
 			if helm.opts.Verbose {
 				fmt.Printf("Warning: failed to calculate config checksum: %v\n", err)
 			}
 		} else if checksum != "" {
-			if err := helm.injectConfigChecksums(ctx, service.GetNamespace(), rel.Manifest, checksum); err != nil {
+			if err := helm.injectConfigChecksums(ctx, service.GetNamespace(), manifest, checksum); err != nil {
 				if helm.opts.Verbose {
 					fmt.Printf("Warning: failed to inject config checksums: %v\n", err)
 				}
@@ -200,9 +214,9 @@ func (helm *HelmProvider) Install(ctx context.Context, service *config.ServiceCo
 	}
 
 	// Wait for resources to be ready using our shared wait logic
-	if helm.opts.Wait && rel != nil && rel.Manifest != "" {
+	if helm.opts.Wait && manifest != "" {
 		// Use WaitForManifestsInNamespace to apply the release namespace to resources
-		if err := WaitForManifestsInNamespace(ctx, helm.opts.KubeConfig, rel.Manifest, service.GetNamespace(), helm.opts); err != nil {
+		if err := WaitForManifestsInNamespace(ctx, helm.opts.KubeConfig, manifest, service.GetNamespace(), helm.opts); err != nil {
 			return fmt.Errorf("failed waiting for resources: %w", err)
 		}
 	}
@@ -266,10 +280,14 @@ func (helm *HelmProvider) Uninstall(ctx context.Context, service *config.Service
 	if !keepCRDs {
 		// Get release to find associated CRDs
 		statusClient := action.NewStatus(actionConfig)
-		rel, err := statusClient.Run(service.Name)
-		if err == nil && rel != nil && rel.Manifest != "" {
-			// Parse manifest to find CRDs
-			releaseCRDs = helm.extractCRDsFromManifest(rel.Manifest)
+		relRaw, err := statusClient.Run(service.Name)
+		if err == nil && relRaw != nil {
+			if acc, accErr := ri.NewAccessor(relRaw); accErr == nil {
+				if m := acc.Manifest(); m != "" {
+					// Parse manifest to find CRDs
+					releaseCRDs = helm.extractCRDsFromManifest(m)
+				}
+			}
 		}
 	}
 
@@ -308,7 +326,7 @@ func (helm *HelmProvider) Status(ctx context.Context, service *config.ServiceCon
 
 	client := action.NewStatus(actionConfig)
 
-	rel, err := client.Run(service.Name)
+	relRaw, err := client.Run(service.Name)
 	if err != nil {
 		return &ServiceStatus{
 			Name:      service.Name,
@@ -318,11 +336,16 @@ func (helm *HelmProvider) Status(ctx context.Context, service *config.ServiceCon
 		}, nil
 	}
 
+	acc, err := ri.NewAccessor(relRaw)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read release status: %w", err)
+	}
+
 	status := &ServiceStatus{
 		Name:      service.Name,
 		Installed: true,
-		Ready:     rel.Info.Status == release.StatusDeployed,
-		Message:   string(rel.Info.Status),
+		Ready:     acc.Status() == string(rcommon.StatusDeployed),
+		Message:   acc.Status(),
 	}
 
 	return status, nil
@@ -344,8 +367,12 @@ func (helm *HelmProvider) IsInstalled(ctx context.Context, service *config.Servi
 		return false, fmt.Errorf("failed to list releases: %w", err)
 	}
 
-	for _, rel := range releases {
-		if rel.Name == service.Name {
+	for _, relRaw := range releases {
+		acc, accErr := ri.NewAccessor(relRaw)
+		if accErr != nil {
+			continue
+		}
+		if acc.Name() == service.Name {
 			return true, nil
 		}
 	}
@@ -408,7 +435,7 @@ func (helm *HelmProvider) pullHTTPChart(service *config.ServiceConfig) (string, 
 	chartRef := fmt.Sprintf("%s/%s", repoName, service.Chart)
 
 	// Create Pull action
-	actionConfig := new(action.Configuration)
+	actionConfig := action.NewConfiguration()
 
 	// Initialize registry client for OCI support (for consistency)
 	registryClient, err := registry.NewClient(
@@ -420,7 +447,7 @@ func (helm *HelmProvider) pullHTTPChart(service *config.ServiceConfig) (string, 
 	}
 	actionConfig.RegistryClient = registryClient
 
-	pull := action.NewPullWithOpts(action.WithConfig(actionConfig))
+	pull := action.NewPull(action.WithConfig(actionConfig))
 	pull.Settings = helm.settings
 	pull.DestDir = tmpDir
 	pull.Untar = true
@@ -482,7 +509,7 @@ func (helm *HelmProvider) addHTTPRepository(repoURL string) (string, error) {
 	repoName := generateRepoName(repoURL)
 
 	// Create repository entry
-	chartRepo := &repo.Entry{
+	chartRepo := &repov1.Entry{
 		Name: repoName,
 		URL:  repoURL,
 	}
@@ -497,12 +524,12 @@ func (helm *HelmProvider) addHTTPRepository(repoURL string) (string, error) {
 	}
 
 	// Load existing repositories or create new file
-	var file *repo.File
+	var file *repov1.File
 	if _, err := os.Stat(repoFile); os.IsNotExist(err) {
-		file = repo.NewFile()
+		file = repov1.NewFile()
 	} else {
 		var err error
-		file, err = repo.LoadFile(repoFile)
+		file, err = repov1.LoadFile(repoFile)
 		if err != nil {
 			return "", fmt.Errorf("failed to load repository file: %w", err)
 		}
@@ -518,7 +545,7 @@ func (helm *HelmProvider) addHTTPRepository(repoURL string) (string, error) {
 
 	// Add repository
 	getters := getter.All(helm.settings)
-	chartRepoClient, err := repo.NewChartRepository(chartRepo, getters)
+	chartRepoClient, err := repov1.NewChartRepository(chartRepo, getters)
 	if err != nil {
 		return "", fmt.Errorf("failed to create chart repository: %w", err)
 	}

@@ -10,14 +10,20 @@ import (
 	"regexp"
 	"strings"
 
+	"io"
+	"log/slog"
+
 	"github.com/hjames9/kraze/internal/config"
 	"gopkg.in/yaml.v3"
-	"helm.sh/helm/v3/pkg/action"
-	"helm.sh/helm/v3/pkg/chart/loader"
-	"helm.sh/helm/v3/pkg/chartutil"
-	"helm.sh/helm/v3/pkg/cli"
-	"helm.sh/helm/v3/pkg/engine"
-	"helm.sh/helm/v3/pkg/registry"
+	"helm.sh/helm/v4/pkg/action"
+	chartcommon "helm.sh/helm/v4/pkg/chart/common"
+	chartcommonutil "helm.sh/helm/v4/pkg/chart/common/util"
+	"helm.sh/helm/v4/pkg/chart/loader"
+	v2loader "helm.sh/helm/v4/pkg/chart/v2/loader"
+	"helm.sh/helm/v4/pkg/cli"
+	"helm.sh/helm/v4/pkg/engine"
+	ri "helm.sh/helm/v4/pkg/release"
+	"helm.sh/helm/v4/pkg/registry"
 )
 
 // ImageReference represents a parsed Docker image reference
@@ -315,15 +321,17 @@ func (im *ImageManager) ExtractImagesFromHelmChart(ctx context.Context, svc *con
 	settings := cli.New()
 
 	// Create action configuration
-	actionConfig := new(action.Configuration)
+	var logHandler slog.Handler
+	if im.verbose {
+		logHandler = slog.Default().Handler()
+	} else {
+		logHandler = slog.NewTextHandler(io.Discard, nil)
+	}
+	actionConfig := action.NewConfiguration(action.ConfigurationSetLogger(logHandler))
 
 	// Initialize with namespace
 	namespace := svc.GetNamespace()
-	if err := actionConfig.Init(settings.RESTClientGetter(), namespace, os.Getenv("HELM_DRIVER"), func(format string, v ...interface{}) {
-		if im.verbose {
-			fmt.Printf(format+"\n", v...)
-		}
-	}); err != nil {
+	if err := actionConfig.Init(settings.RESTClientGetter(), namespace, os.Getenv("HELM_DRIVER")); err != nil {
 		return nil, fmt.Errorf("failed to initialize helm config: %w", err)
 	}
 
@@ -344,11 +352,10 @@ func (im *ImageManager) ExtractImagesFromHelmChart(ctx context.Context, svc *con
 
 	// For remote charts, we need to render the template
 	client := action.NewInstall(actionConfig)
-	client.DryRun = true
+	client.DryRunStrategy = action.DryRunClient
 	client.ReleaseName = svc.Name
 	client.Namespace = namespace
 	client.Replace = true
-	client.ClientOnly = true
 
 	// Locate chart
 	chartPath := svc.Path
@@ -387,13 +394,19 @@ func (im *ImageManager) ExtractImagesFromHelmChart(ctx context.Context, svc *con
 	}
 
 	// Render the chart
-	rel, err := client.Run(chart, vals)
+	relRaw, err := client.Run(chart, vals)
 	if err != nil {
 		return nil, fmt.Errorf("failed to render chart: %w", err)
 	}
 
 	// Extract images from the rendered manifest
-	return im.extractImagesFromManifest(rel.Manifest), nil
+	var manifest string
+	if relRaw != nil {
+		if acc, accErr := ri.NewAccessor(relRaw); accErr == nil {
+			manifest = acc.Manifest()
+		}
+	}
+	return im.extractImagesFromManifest(manifest), nil
 }
 
 // extractImagesFromLocalChart extracts images from a local Helm chart
@@ -412,7 +425,7 @@ func (im *ImageManager) extractImagesFromRemoteChart(ctx context.Context, svc *c
 	settings := cli.New()
 
 	// Create action configuration (minimal, no K8s connection needed for pull/template)
-	actionConfig := new(action.Configuration)
+	actionConfig := action.NewConfiguration()
 
 	// Initialize registry client for OCI support
 	registryClient, err := registry.NewClient(
@@ -425,7 +438,7 @@ func (im *ImageManager) extractImagesFromRemoteChart(ctx context.Context, svc *c
 	actionConfig.RegistryClient = registryClient
 
 	// Create pull action
-	pull := action.NewPullWithOpts(action.WithConfig(actionConfig))
+	pull := action.NewPull(action.WithConfig(actionConfig))
 	pull.Settings = settings
 	pull.DestDir = tmpDir
 	pull.Untar = true
@@ -465,8 +478,8 @@ func (im *ImageManager) extractImagesFromRemoteChart(ctx context.Context, svc *c
 		return nil, fmt.Errorf("no chart found after pull")
 	}
 
-	// Load the chart
-	chart, err := loader.Load(chartPath)
+	// Load the chart using v2 loader to get concrete type with Values field
+	chart, err := v2loader.Load(chartPath)
 	if err != nil {
 		return nil, fmt.Errorf("failed to load chart: %w", err)
 	}
@@ -478,14 +491,14 @@ func (im *ImageManager) extractImagesFromRemoteChart(ctx context.Context, svc *c
 	}
 
 	// Create release options for rendering
-	releaseOptions := chartutil.ReleaseOptions{
+	releaseOptions := chartcommon.ReleaseOptions{
 		Name:      "kraze-temp",
 		Namespace: svc.Namespace,
 		IsInstall: true,
 	}
 
 	// Compute values with built-in objects
-	valuesToRender, err := chartutil.ToRenderValues(chart, values, releaseOptions, nil)
+	valuesToRender, err := chartcommonutil.ToRenderValues(chart, values, releaseOptions, nil)
 	if err != nil {
 		return nil, fmt.Errorf("failed to prepare values: %w", err)
 	}

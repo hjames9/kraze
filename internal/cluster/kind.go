@@ -14,6 +14,7 @@ import (
 	"github.com/hjames9/kraze/internal/config"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/clientcmd"
+	"sigs.k8s.io/kind/pkg/apis/config/defaults"
 	"sigs.k8s.io/kind/pkg/apis/config/v1alpha4"
 	"sigs.k8s.io/kind/pkg/cluster"
 	"sigs.k8s.io/kind/pkg/cluster/nodeutils"
@@ -62,7 +63,7 @@ func (kind *KindManager) CreateCluster(ctx context.Context, cfg *config.ClusterC
 		cluster.CreateWithDisplaySalutation(false),
 	}
 
-	fmt.Printf("Creating kind cluster '%s'...\n", cfg.Name)
+	fmt.Printf("Creating kind cluster '%s' (Kubernetes %s)...\n", cfg.Name, kind.parseK8sVersion(cfg))
 
 	// Create cluster in background so we can apply cgroup workaround during init
 	createErr := make(chan error, 1)
@@ -449,6 +450,24 @@ func (kind *KindManager) WaitForClusterReady(ctx context.Context, clusterName st
 	}
 
 	return fmt.Errorf("cluster API server not ready after %v", timeout)
+}
+
+// parseK8sVersion returns a human-readable Kubernetes version string for display.
+// Extracts the version tag from the node image, or returns "default" if none is configured.
+func (kind *KindManager) parseK8sVersion(cfg *config.ClusterConfig) string {
+	image := kind.getNodeImage(cfg)
+	if image == "" {
+		image = defaults.Image
+	}
+	// Strip digest first (e.g. "kindest/node:v1.35.0@sha256:abc" -> "kindest/node:v1.35.0")
+	if atIdx := strings.Index(image, "@"); atIdx != -1 {
+		image = image[:atIdx]
+	}
+	// Extract tag (e.g. "kindest/node:v1.35.0" -> "v1.35.0")
+	if colonIdx := strings.LastIndex(image, ":"); colonIdx != -1 {
+		return image[colonIdx+1:]
+	}
+	return image
 }
 
 // getNodeImage determines which node image to use based on configuration
