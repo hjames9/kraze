@@ -1,0 +1,45 @@
+# vLLM example — downloads model from HuggingFace on first start
+#
+# The model is configurable via the VLLM_MODEL env var in vllm.yml (default: Qwen/Qwen3.5-0.8B).
+# For gated models (e.g. Meta Llama), set your HuggingFace token after deploying:
+#   kubectl set env deployment/vllm -n vllm HUGGING_FACE_HUB_TOKEN=hf_...
+#
+# The model is cached inside the cluster at /root/.cache/huggingface.
+# First startup will be slow while the model downloads. Subsequent starts
+# within the same cluster are fast since the cache persists on the node.
+#
+# Usage:
+#   kraze up
+#   kraze port-forward vllm 8000:8000
+#   curl http://localhost:8000/v1/models
+
+cluster:
+  name: vllm
+
+  gpu:
+    nvidia:
+      enabled: true
+
+services:
+  nvidia-device-plugin:
+    type: helm
+    repo: https://nvidia.github.io/k8s-device-plugin
+    chart: nvidia-device-plugin
+    namespace: nvidia
+    version: "0.19.0"
+    values_inline: |
+      # Remove NFD-based nodeAffinity so the plugin runs without Node Feature Discovery
+      affinity: null
+      # Mount the kind node's root filesystem so the plugin can find NVIDIA libraries
+      nvidiaDriverRoot: "/"
+      # Privileged is required to open /dev/nvidiactl for NVML initialization
+      securityContext:
+        privileged: true
+
+  vllm:
+    type: manifests
+    path: vllm.yml
+    namespace: vllm
+    wait: true
+    depends_on:
+      - nvidia-device-plugin

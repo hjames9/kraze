@@ -1,0 +1,39 @@
+# AMD ROCm info example
+#
+# Runs rocminfo to verify AMD GPU passthrough is working correctly.
+# This is the simplest possible end-to-end GPU test for an AMD kind cluster.
+#
+# Prerequisites on the host:
+#   - AMD GPU drivers and ROCm runtime installed
+#   - /dev/kfd and /dev/dri/renderD* devices present
+#
+# Find your GPU count:
+#   ls /dev/dri/renderD* | wc -l
+#
+# Usage:
+#   kraze up
+#   kubectl logs amd-rocminfo    # should list your GPU(s) under "ROCk - Kernel Fusion Driver"
+#   kraze down
+
+cluster:
+  name: amd-rocminfo
+
+  gpu:
+    amd:
+      enabled: true
+      count: 1
+
+services:
+  amd-device-plugin:
+    type: helm
+    repo: https://rocm.github.io/k8s-device-plugin
+    chart: amd-gpu
+    namespace: amd
+    version: "0.21.0"
+
+  amd-rocminfo:
+    type: manifests
+    path: amd-rocminfo.yml
+    wait: true
+    depends_on:
+      - amd-device-plugin

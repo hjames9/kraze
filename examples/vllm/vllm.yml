@@ -1,0 +1,57 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vllm
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: vllm
+  template:
+    metadata:
+      labels:
+        app: vllm
+    spec:
+      runtimeClassName: nvidia
+      enableServiceLinks: false
+      containers:
+        - name: vllm
+          image: vllm/vllm-openai:v0.18.0
+          args:
+            - --model
+            - $(VLLM_MODEL)
+            - --port
+            - "8000"
+            # Uncomment to skip CUDA graph capture — reduces startup from ~90s to ~50s,
+            # at the cost of slightly lower inference throughput. Useful for dev/iteration.
+            #- --enforce-eager
+          env:
+            - name: VLLM_MODEL
+              value: "Qwen/Qwen3.5-0.8B"
+            # For gated models (e.g. Meta Llama), set your HuggingFace token:
+            #   kubectl set env deployment/vllm HUGGING_FACE_HUB_TOKEN=hf_...
+            - name: HUGGING_FACE_HUB_TOKEN
+              value: ""
+          resources:
+            limits:
+              nvidia.com/gpu: 1
+          ports:
+            - containerPort: 8000
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            failureThreshold: 30
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: vllm
+spec:
+  selector:
+    app: vllm
+  ports:
+    - port: 8000
+      targetPort: 8000

@@ -1,0 +1,43 @@
+# vLLM on AMD GPU example
+#
+# Deploys vLLM using the ROCm build, backed by an AMD GPU.
+# The model is downloaded from HuggingFace on first start.
+#
+# Prerequisites on the host:
+#   - AMD GPU drivers and ROCm runtime installed
+#   - /dev/kfd and /dev/dri/renderD* devices present
+#
+# Find your GPU count:
+#   ls /dev/dri/renderD* | wc -l
+#
+# For gated models (e.g. Meta Llama), set your HuggingFace token after deploying:
+#   kubectl set env deployment/vllm -n vllm HUGGING_FACE_HUB_TOKEN=hf_...
+#
+# Usage:
+#   kraze up
+#   kraze port-forward vllm 8000:8000
+#   curl http://localhost:8000/v1/models
+
+cluster:
+  name: vllm-amd
+
+  gpu:
+    amd:
+      enabled: true
+      count: 1
+
+services:
+  amd-device-plugin:
+    type: helm
+    repo: https://rocm.github.io/k8s-device-plugin
+    chart: amd-gpu
+    namespace: amd
+    version: "0.21.0"
+
+  vllm:
+    type: manifests
+    path: vllm.yml
+    namespace: vllm
+    wait: true
+    depends_on:
+      - amd-device-plugin

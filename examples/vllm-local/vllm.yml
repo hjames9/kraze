@@ -1,0 +1,66 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vllm
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: vllm
+  template:
+    metadata:
+      labels:
+        app: vllm
+    spec:
+      runtimeClassName: nvidia
+      enableServiceLinks: false
+      containers:
+        - name: vllm
+          image: vllm/vllm-openai:v0.18.0
+          args:
+            - --model
+            - $(VLLM_MODEL)
+            - --port
+            - "8000"
+            # Uncomment to skip CUDA graph capture — reduces startup from ~90s to ~50s,
+            # at the cost of slightly lower inference throughput. Useful for dev/iteration.
+            #- --enforce-eager
+          env:
+            - name: VLLM_MODEL
+              value: "Qwen/Qwen3.5-0.8B"
+            - name: HF_HOME
+              value: /opt/models/huggingface
+            - name: HF_HUB_OFFLINE
+              value: "1"
+          resources:
+            limits:
+              nvidia.com/gpu: 1
+          volumeMounts:
+            - name: model-cache
+              mountPath: /opt/models/huggingface
+              readOnly: true
+          ports:
+            - containerPort: 8000
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            failureThreshold: 30
+      volumes:
+        - name: model-cache
+          hostPath:
+            path: /opt/models/huggingface
+            type: Directory
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: vllm
+spec:
+  selector:
+    app: vllm
+  ports:
+    - port: 8000
+      targetPort: 8000

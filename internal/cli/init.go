@@ -148,7 +148,17 @@ For external clusters (cluster.external.enabled: true):
 		}
 
 		// Create and save cluster state
-		st := state.New(cfg.Cluster.Name, isExternal)
+		nvidiaEnabled := cfg.Cluster.GPU.IsNvidiaEnabled()
+		nvidiaCount := 0
+		if nvidiaEnabled {
+			nvidiaCount = cfg.Cluster.GPU.Nvidia.Count
+		}
+		amdEnabled := cfg.Cluster.GPU.IsAMDEnabled()
+		amdCount := 0
+		if amdEnabled {
+			amdCount = cfg.Cluster.GPU.AMD.Count
+		}
+		st := state.New(cfg.Cluster.Name, isExternal, nvidiaEnabled, nvidiaCount, amdEnabled, amdCount)
 		if err := st.Save(ctx, clientset); err != nil {
 			return fmt.Errorf("failed to save cluster state: %w", err)
 		}

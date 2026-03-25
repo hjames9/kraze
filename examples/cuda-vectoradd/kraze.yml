@@ -1,0 +1,42 @@
+# CUDA Vector Add example
+#
+# Runs NVIDIA's vectorAdd sample to verify GPU passthrough is working correctly.
+# This is the simplest possible end-to-end GPU test for a kind cluster.
+#
+# Prerequisites: nvidia-container-toolkit installed on the host
+#   https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/install-guide.html
+#
+# Usage:
+#   kraze up
+#   kubectl logs cuda-vectoradd    # should print "Test PASSED"
+#   kraze down
+
+cluster:
+  name: cuda-vectoradd
+
+  gpu:
+    nvidia:
+      enabled: true
+
+services:
+  nvidia-device-plugin:
+    type: helm
+    repo: https://nvidia.github.io/k8s-device-plugin
+    chart: nvidia-device-plugin
+    namespace: nvidia
+    version: "0.19.0"
+    values_inline: |
+      # Remove NFD-based nodeAffinity so the plugin runs without Node Feature Discovery
+      affinity: null
+      # Mount the kind node's root filesystem so the plugin can find NVIDIA libraries
+      nvidiaDriverRoot: "/"
+      # Privileged is required to open /dev/nvidiactl for NVML initialization
+      securityContext:
+        privileged: true
+
+  cuda-vectoradd:
+    type: manifests
+    path: cuda-vectoradd.yml
+    wait: true
+    depends_on:
+      - nvidia-device-plugin

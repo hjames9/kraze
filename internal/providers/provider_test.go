@@ -4,6 +4,7 @@ import (
 	"testing"
 
 	"github.com/hjames9/kraze/internal/config"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 )
 
 func TestNewProvider(test *testing.T) {
@@ -41,6 +42,81 @@ func TestNewProvider(test *testing.T) {
 
 			if err != nil {
 				test.Errorf("Unexpected error: %v", err)
+			}
+		})
+	}
+}
+
+func TestIsPodReady(test *testing.T) {
+	tests := []struct {
+		name       string
+		phase      string
+		conditions []map[string]interface{}
+		wantReady  bool
+	}{
+		{
+			name:      "Succeeded is ready (batch/job pod completed)",
+			phase:     "Succeeded",
+			wantReady: true,
+		},
+		{
+			name:  "Running with Ready=True is ready (service pod)",
+			phase: "Running",
+			conditions: []map[string]interface{}{
+				{"type": "Ready", "status": "True"},
+			},
+			wantReady: true,
+		},
+		{
+			name:  "Running with Ready=False is not ready",
+			phase: "Running",
+			conditions: []map[string]interface{}{
+				{"type": "Ready", "status": "False"},
+			},
+			wantReady: false,
+		},
+		{
+			name:      "Running with no conditions is not ready",
+			phase:     "Running",
+			wantReady: false,
+		},
+		{
+			name:      "Pending is not ready",
+			phase:     "Pending",
+			wantReady: false,
+		},
+		{
+			name:      "Failed is not ready",
+			phase:     "Failed",
+			wantReady: false,
+		},
+		{
+			name:      "Unknown is not ready",
+			phase:     "Unknown",
+			wantReady: false,
+		},
+	}
+
+	for _, tt := range tests {
+		test.Run(tt.name, func(test *testing.T) {
+			obj := &unstructured.Unstructured{}
+			status := map[string]interface{}{
+				"phase": tt.phase,
+			}
+			if len(tt.conditions) > 0 {
+				conds := make([]interface{}, len(tt.conditions))
+				for i, c := range tt.conditions {
+					conds[i] = c
+				}
+				status["conditions"] = conds
+			}
+
+			ready, err := isPodReady(obj, status)
+			if err != nil {
+				test.Fatalf("unexpected error: %v", err)
+			}
+			if ready != tt.wantReady {
+				test.Errorf("isPodReady(%q) = %v, want %v", tt.phase, ready, tt.wantReady)
 			}
 		})
 	}

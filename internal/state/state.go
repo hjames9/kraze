@@ -23,16 +23,20 @@ const (
 	ConfigMapDataKey = "metadata"
 
 	// CurrentStateVersion is the current version of the state format
-	CurrentStateVersion = 1
+	CurrentStateVersion = 2
 )
 
 // ClusterState represents the state of deployed services stored in the cluster
 type ClusterState struct {
-	Version     int                        `json:"version"` // State format version
-	ClusterName string                     `json:"cluster_name"`
-	IsExternal  bool                       `json:"is_external"` // Whether this is an external cluster
-	Services    map[string]ServiceMetadata `json:"services"`
-	LastUpdated time.Time                  `json:"last_updated"`
+	Version          int                        `json:"version"` // State format version
+	ClusterName      string                     `json:"cluster_name"`
+	IsExternal       bool                       `json:"is_external"`                  // Whether this is an external cluster
+	NvidiaGPUEnabled bool                       `json:"nvidia_gpu_enabled,omitempty"` // Whether cluster was created with NVIDIA GPU support
+	NvidiaGPUCount   int                        `json:"nvidia_gpu_count,omitempty"`   // Number of NVIDIA GPUs configured at creation
+	AMDGPUEnabled    bool                       `json:"amd_gpu_enabled,omitempty"`    // Whether cluster was created with AMD GPU support
+	AMDGPUCount      int                        `json:"amd_gpu_count,omitempty"`      // Number of AMD GPUs configured at creation
+	Services         map[string]ServiceMetadata `json:"services"`
+	LastUpdated      time.Time                  `json:"last_updated"`
 }
 
 // ServiceMetadata represents the metadata for a single service
@@ -46,13 +50,17 @@ type ServiceMetadata struct {
 }
 
 // New creates a new empty cluster state
-func New(clusterName string, isExternal bool) *ClusterState {
+func New(clusterName string, isExternal bool, nvidiaGPUEnabled bool, nvidiaGPUCount int, amdGPUEnabled bool, amdGPUCount int) *ClusterState {
 	return &ClusterState{
-		Version:     CurrentStateVersion,
-		ClusterName: clusterName,
-		IsExternal:  isExternal,
-		Services:    make(map[string]ServiceMetadata),
-		LastUpdated: time.Now(),
+		Version:          CurrentStateVersion,
+		ClusterName:      clusterName,
+		IsExternal:       isExternal,
+		NvidiaGPUEnabled: nvidiaGPUEnabled,
+		NvidiaGPUCount:   nvidiaGPUCount,
+		AMDGPUEnabled:    amdGPUEnabled,
+		AMDGPUCount:      amdGPUCount,
+		Services:         make(map[string]ServiceMetadata),
+		LastUpdated:      time.Now(),
 	}
 }
 
@@ -99,6 +107,14 @@ func (cs *ClusterState) migrate() error {
 		// v0 state had no version field
 		// All existing fields are compatible with v1, just set the version
 		cs.Version = 1
+	}
+
+	// Migrate from v1 to v2
+	if cs.Version == 1 {
+		// v1 state had no GPU fields.
+		// NvidiaGPUEnabled, NvidiaGPUCount, AMDGPUEnabled, AMDGPUCount all default
+		// to zero values (no GPU), which is correct for pre-GPU clusters.
+		cs.Version = 2
 	}
 
 	// Check if version is supported

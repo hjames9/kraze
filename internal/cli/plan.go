@@ -127,7 +127,7 @@ func runPlan(cmd *cobra.Command, args []string) error {
 		if err != nil {
 			Verbose("Warning: failed to get kubeconfig for external cluster: %v", err)
 			Verbose("Treating as empty state (no services installed)")
-			st = state.New(cfg.Cluster.Name, isExternal)
+			st = state.New(cfg.Cluster.Name, isExternal, false, 0, false, 0)
 			kubeconfig = "" // Clear to skip state loading
 		}
 	} else {
@@ -140,14 +140,14 @@ func runPlan(cmd *cobra.Command, args []string) error {
 				Verbose("Cluster doesn't exist yet")
 			}
 			Verbose("Treating as empty state (no services installed)")
-			st = state.New(cfg.Cluster.Name, isExternal)
+			st = state.New(cfg.Cluster.Name, isExternal, false, 0, false, 0)
 			kubeconfig = "" // Clear to skip state loading
 		} else {
 			kubeconfig, err = kindMgr.GetKubeConfig(cfg.Cluster.Name, false)
 			if err != nil {
 				Verbose("Warning: failed to get kubeconfig: %v", err)
 				Verbose("Treating as empty state (no services installed)")
-				st = state.New(cfg.Cluster.Name, isExternal)
+				st = state.New(cfg.Cluster.Name, isExternal, false, 0, false, 0)
 				kubeconfig = "" // Clear to skip state loading
 			}
 		}
@@ -159,16 +159,16 @@ func runPlan(cmd *cobra.Command, args []string) error {
 		if err != nil {
 			Verbose("Warning: failed to create Kubernetes client: %v", err)
 			Verbose("Treating as empty state (no services installed)")
-			st = state.New(cfg.Cluster.Name, isExternal)
+			st = state.New(cfg.Cluster.Name, isExternal, false, 0, false, 0)
 		} else {
 			st, err = state.Load(ctx, clientset, cfg.Cluster.Name)
 			if err != nil {
 				Verbose("Warning: failed to load cluster state: %v", err)
 				Verbose("Treating as empty state (no services installed)")
-				st = state.New(cfg.Cluster.Name, isExternal)
+				st = state.New(cfg.Cluster.Name, isExternal, false, 0, false, 0)
 			}
 			if st == nil {
-				st = state.New(cfg.Cluster.Name, isExternal)
+				st = state.New(cfg.Cluster.Name, isExternal, false, 0, false, 0)
 			}
 		}
 	}

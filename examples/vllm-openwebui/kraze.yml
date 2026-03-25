@@ -1,0 +1,51 @@
+# vLLM + Open WebUI example — a complete local AI stack
+#
+# Deploys vLLM as the inference backend and Open WebUI as a chat interface.
+# The model is downloaded from HuggingFace on first start.
+#
+# For gated models (e.g. Meta Llama), set your HuggingFace token after deploying:
+#   kubectl set env deployment/vllm -n vllm HUGGING_FACE_HUB_TOKEN=hf_...
+#
+# Usage:
+#   kraze up
+#   kraze port-forward open-webui 8080:8080
+#   open http://localhost:8080
+
+cluster:
+  name: vllm-openwebui
+
+  gpu:
+    nvidia:
+      enabled: true
+
+services:
+  nvidia-device-plugin:
+    type: helm
+    repo: https://nvidia.github.io/k8s-device-plugin
+    chart: nvidia-device-plugin
+    namespace: nvidia
+    version: "0.19.0"
+    values_inline: |
+      # Remove NFD-based nodeAffinity so the plugin runs without Node Feature Discovery
+      affinity: null
+      # Mount the kind node's root filesystem so the plugin can find NVIDIA libraries
+      nvidiaDriverRoot: "/"
+      # Privileged is required to open /dev/nvidiactl for NVML initialization
+      securityContext:
+        privileged: true
+
+  vllm:
+    type: manifests
+    path: vllm.yml
+    namespace: vllm
+    wait: true
+    depends_on:
+      - nvidia-device-plugin
+
+  open-webui:
+    type: manifests
+    path: open-webui.yml
+    namespace: open-webui
+    wait: true
+    depends_on:
+      - vllm

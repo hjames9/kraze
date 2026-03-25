@@ -30,6 +30,7 @@
     - [Disabling Services](#disabling-services)
   - [Environment Variables](#environment-variables)
   - [Corporate Network Support](#corporate-network-support)
+  - [GPU Support](#gpu-support)
   - [Global Flags](#global-flags)
 - [Examples](#examples)
 - [Development](#development)
@@ -49,6 +50,7 @@ kraze is a Kubernetes development environment manager that brings the familiar d
 - **State Management** - Cluster-stored state via ConfigMap for team-friendly workflows
 - **docker-compose UX** - Familiar commands: `up`, `down`, `status`
 - **Corporate Network Support** - Works behind proxies with TLS inspection and custom CAs
+- **GPU Support** - Run NVIDIA and AMD GPU workloads in kind clusters (v0.7.0+)
 
 ## Breaking Changes (v0.6.0)
 
@@ -454,6 +456,15 @@ cluster:
   #   https_proxy: http://proxy:8080
   #   no_proxy: localhost,127.0.0.1
 
+  # Optional: GPU support (v0.7.0+, kind clusters only)
+  # gpu:
+  #   nvidia:
+  #     enabled: true
+  #     count: 1                      # nvidia-smi -L | wc -l
+  #   amd:
+  #     enabled: true
+  #     count: 1                      # ls /dev/dri/renderD* | wc -l
+
   # Optional: Use existing cluster (Docker Desktop, Minikube, remote)
   # external:
   #   enabled: true
@@ -630,6 +641,87 @@ cluster:
 
 See [examples/corporate-network/](./examples/corporate-network) for complete examples and troubleshooting.
 
+### GPU Support
+
+> **Requires kraze v0.7.0+. Only supported for kind clusters (not external clusters).**
+
+kraze can configure kind clusters to expose NVIDIA and/or AMD GPUs to pods. Both vendors can be enabled simultaneously.
+
+#### NVIDIA GPUs
+
+kraze uses Docker's `--gpus all` flag (via DeviceRequests) when creating kind node containers. This works with the standard Docker runtime — the default runtime does **not** need to be changed to `nvidia`.
+
+**Host prerequisites:**
+
+- `nvidia-container-toolkit` installed: https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/install-guide.html
+
+Verify the setup:
+```bash
+nvidia-ctk --version
+nvidia-container-runtime --version
+docker run --rm --gpus all nvidia/cuda:12.0-base nvidia-smi
+```
+
+**Configuration:**
+
+```yaml
+cluster:
+  name: gpu-cluster
+
+  gpu:
+    nvidia:
+      enabled: true
+```
+
+After cluster creation, kraze registers the `nvidia` RuntimeClass so pods can use `runtimeClassName: nvidia`.
+
+#### AMD GPUs
+
+For AMD GPUs, kraze bind-mounts `/dev/kfd` (the ROCm Kernel Fusion Driver, shared across all GPUs) and `/dev/dri/renderD<128+i>` (one per GPU) into each kind node. No Docker runtime changes are needed — standard `runc` handles AMD device bind-mounts.
+
+**Host prerequisites:**
+
+- AMD GPU drivers and ROCm runtime installed
+- `/dev/kfd` and `/dev/dri/renderD*` devices present
+
+Verify the setup:
+```bash
+ls /dev/kfd              # should exist
+ls /dev/dri/renderD*     # should list one device per GPU
+```
+
+Find your GPU count:
+```bash
+ls /dev/dri/renderD* | wc -l
+```
+
+**Configuration:**
+
+```yaml
+cluster:
+  name: amd-gpu-cluster
+
+  gpu:
+    amd:
+      enabled: true
+      count: 1  # Number of GPUs to assign to worker nodes
+```
+
+#### Multi-node clusters
+
+In a multi-node cluster, GPU mounts are applied only to worker nodes. In a single-node (default) cluster, they are applied to the control-plane node.
+
+#### Mismatch detection
+
+GPU configuration is stored in cluster state at creation time. If you change GPU settings after the cluster was created, kraze returns a clear error:
+
+```
+GPU configuration has changed since cluster 'gpu-cluster' was created.
+GPU support requires cluster recreation. Run: kraze destroy && kraze up
+```
+
+See [examples/nvidia-gpu/](./examples/nvidia-gpu) and [examples/amd-gpu/](./examples/amd-gpu) for complete examples.
+
 ### Wait Behavior and Dependencies
 
 kraze automatically handles service dependencies and ensures services are ready before starting dependent services.
@@ -713,6 +805,15 @@ See the [examples/](./examples) directory for complete working examples:
 - **[external-cluster/](./examples/external-cluster)** - Use existing clusters (Docker Desktop, Minikube, remote)
 - **[labels/](./examples/labels)** - Filter services by labels (env, tier, team)
 - **[corporate-network/](./examples/corporate-network)** - Corporate environments (proxies, CA certificates, TLS inspection)
+- **[nvidia-gpu/](./examples/nvidia-gpu)** - NVIDIA GPU support for kind clusters (v0.7.0+)
+- **[amd-gpu/](./examples/amd-gpu)** - AMD GPU support for kind clusters (v0.7.0+)
+- **[amd-rocminfo/](./examples/amd-rocminfo)** - End-to-end GPU verification with rocminfo for AMD GPUs (v0.7.0+)
+- **[vllm-amd/](./examples/vllm-amd)** - vLLM on AMD GPU using the ROCm build (v0.7.0+)
+- **[cuda-vectoradd/](./examples/cuda-vectoradd)** - End-to-end GPU verification with NVIDIA's CUDA vectorAdd sample (v0.7.0+)
+- **[vllm/](./examples/vllm)** - vLLM serving an LLM with HuggingFace model download (v0.7.0+)
+- **[vllm-local/](./examples/vllm-local)** - vLLM serving an LLM from a local model cache (v0.7.0+)
+- **[vllm-openwebui/](./examples/vllm-openwebui)** - vLLM + Open WebUI complete local AI stack (v0.7.0+)
+- **[vllm-rag/](./examples/vllm-rag)** - vLLM + pgvector + Open WebUI RAG stack for document-grounded chat (v0.7.0+)
 
 Validate all examples:
 ```bash

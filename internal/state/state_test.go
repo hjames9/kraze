@@ -12,7 +12,7 @@ import (
 )
 
 func TestNew(t *testing.T) {
-	cs := New("test-cluster", false)
+	cs := New("test-cluster", false, false, 0, false, 0)
 
 	if cs.ClusterName != "test-cluster" {
 		t.Errorf("Expected cluster name 'test-cluster', got '%s'", cs.ClusterName)
@@ -33,6 +33,74 @@ func TestNew(t *testing.T) {
 	if cs.Version != CurrentStateVersion {
 		t.Errorf("Expected version %d, got %d", CurrentStateVersion, cs.Version)
 	}
+
+	if cs.NvidiaGPUEnabled {
+		t.Error("Expected NvidiaGPUEnabled to be false")
+	}
+
+	if cs.NvidiaGPUCount != 0 {
+		t.Errorf("Expected NvidiaGPUCount to be 0, got %d", cs.NvidiaGPUCount)
+	}
+
+	if cs.AMDGPUEnabled {
+		t.Error("Expected AMDGPUEnabled to be false")
+	}
+
+	if cs.AMDGPUCount != 0 {
+		t.Errorf("Expected AMDGPUCount to be 0, got %d", cs.AMDGPUCount)
+	}
+}
+
+func TestNewWithNvidiaGPU(t *testing.T) {
+	cs := New("gpu-cluster", false, true, 4, false, 0)
+
+	if !cs.NvidiaGPUEnabled {
+		t.Error("Expected NvidiaGPUEnabled to be true")
+	}
+
+	if cs.NvidiaGPUCount != 4 {
+		t.Errorf("Expected NvidiaGPUCount to be 4, got %d", cs.NvidiaGPUCount)
+	}
+
+	if cs.AMDGPUEnabled {
+		t.Error("Expected AMDGPUEnabled to be false")
+	}
+}
+
+func TestNewWithAMDGPU(t *testing.T) {
+	cs := New("gpu-cluster", false, false, 0, true, 2)
+
+	if cs.NvidiaGPUEnabled {
+		t.Error("Expected NvidiaGPUEnabled to be false")
+	}
+
+	if !cs.AMDGPUEnabled {
+		t.Error("Expected AMDGPUEnabled to be true")
+	}
+
+	if cs.AMDGPUCount != 2 {
+		t.Errorf("Expected AMDGPUCount to be 2, got %d", cs.AMDGPUCount)
+	}
+}
+
+func TestNewWithBothGPUs(t *testing.T) {
+	cs := New("gpu-cluster", false, true, 4, true, 2)
+
+	if !cs.NvidiaGPUEnabled {
+		t.Error("Expected NvidiaGPUEnabled to be true")
+	}
+
+	if cs.NvidiaGPUCount != 4 {
+		t.Errorf("Expected NvidiaGPUCount to be 4, got %d", cs.NvidiaGPUCount)
+	}
+
+	if !cs.AMDGPUEnabled {
+		t.Error("Expected AMDGPUEnabled to be true")
+	}
+
+	if cs.AMDGPUCount != 2 {
+		t.Errorf("Expected AMDGPUCount to be 2, got %d", cs.AMDGPUCount)
+	}
 }
 
 func TestSaveAndLoad(t *testing.T) {
@@ -40,7 +108,7 @@ func TestSaveAndLoad(t *testing.T) {
 	clientset := fake.NewSimpleClientset()
 
 	// Create and save state
-	cs := New("test-cluster", false)
+	cs := New("test-cluster", false, false, 0, false, 0)
 	cs.MarkServiceInstalled("redis")
 	cs.MarkServiceInstalled("postgres")
 
@@ -127,7 +195,7 @@ func TestDelete(t *testing.T) {
 	clientset := fake.NewSimpleClientset()
 
 	// Create and save state
-	cs := New("test-cluster", false)
+	cs := New("test-cluster", false, false, 0, false, 0)
 	if err := cs.Save(ctx, clientset); err != nil {
 		t.Fatalf("Failed to save state: %v", err)
 	}
@@ -161,7 +229,7 @@ func TestDeleteNonexistent(t *testing.T) {
 }
 
 func TestMarkServiceInstalled(t *testing.T) {
-	cs := New("test-cluster", false)
+	cs := New("test-cluster", false, false, 0, false, 0)
 
 	cs.MarkServiceInstalled("backend")
 
@@ -188,7 +256,7 @@ func TestMarkServiceInstalled(t *testing.T) {
 }
 
 func TestMarkServiceInstalledWithNamespace(t *testing.T) {
-	cs := New("test-cluster", false)
+	cs := New("test-cluster", false, false, 0, false, 0)
 
 	cs.MarkServiceInstalledWithNamespace("backend", "default", true)
 
@@ -207,7 +275,7 @@ func TestMarkServiceInstalledWithNamespace(t *testing.T) {
 }
 
 func TestMarkServiceInstalledWithNamespacePreservesImageHashes(t *testing.T) {
-	cs := New("test-cluster", false)
+	cs := New("test-cluster", false, false, 0, false, 0)
 
 	// First install with image hashes
 	imageHashes := map[string]string{
@@ -229,7 +297,7 @@ func TestMarkServiceInstalledWithNamespacePreservesImageHashes(t *testing.T) {
 }
 
 func TestMarkServiceInstalledWithImages(t *testing.T) {
-	cs := New("test-cluster", false)
+	cs := New("test-cluster", false, false, 0, false, 0)
 
 	imageHashes := map[string]string{
 		"myapp:latest": "sha256:abc123",
@@ -253,7 +321,7 @@ func TestMarkServiceInstalledWithImages(t *testing.T) {
 }
 
 func TestMarkServiceUninstalled(t *testing.T) {
-	cs := New("test-cluster", false)
+	cs := New("test-cluster", false, false, 0, false, 0)
 
 	cs.MarkServiceInstalled("backend")
 	if !cs.IsServiceInstalled("backend") {
@@ -271,7 +339,7 @@ func TestMarkServiceUninstalled(t *testing.T) {
 }
 
 func TestGetInstalledServices(t *testing.T) {
-	cs := New("test-cluster", false)
+	cs := New("test-cluster", false, false, 0, false, 0)
 
 	cs.MarkServiceInstalled("redis")
 	cs.MarkServiceInstalled("postgres")
@@ -295,7 +363,7 @@ func TestGetInstalledServices(t *testing.T) {
 }
 
 func TestGetCreatedNamespaces(t *testing.T) {
-	cs := New("test-cluster", false)
+	cs := New("test-cluster", false, false, 0, false, 0)
 
 	// Service 1: created namespace "app"
 	cs.MarkServiceInstalledWithNamespace("backend", "app", true)
@@ -327,7 +395,7 @@ func TestGetCreatedNamespaces(t *testing.T) {
 }
 
 func TestGetAllNamespacesUsed(t *testing.T) {
-	cs := New("test-cluster", false)
+	cs := New("test-cluster", false, false, 0, false, 0)
 
 	cs.MarkServiceInstalledWithNamespace("backend", "app", true)
 	cs.MarkServiceInstalledWithNamespace("frontend", "app", false)
@@ -349,7 +417,7 @@ func TestGetAllNamespacesUsed(t *testing.T) {
 }
 
 func TestGetAllNamespacesUsedForCleanup(t *testing.T) {
-	cs := New("test-cluster", false)
+	cs := New("test-cluster", false, false, 0, false, 0)
 
 	cs.MarkServiceInstalledWithNamespace("backend", "app", true)
 	cs.MarkServiceInstalledWithNamespace("redis", "data", false)
@@ -371,7 +439,7 @@ func TestGetAllNamespacesUsedForCleanup(t *testing.T) {
 }
 
 func TestGetNamespacesForServices(t *testing.T) {
-	cs := New("test-cluster", false)
+	cs := New("test-cluster", false, false, 0, false, 0)
 
 	// Three services in "app" namespace
 	cs.MarkServiceInstalledWithNamespace("backend", "app", true)
@@ -399,7 +467,7 @@ func TestGetNamespacesForServices(t *testing.T) {
 }
 
 func TestGetImageHashes(t *testing.T) {
-	cs := New("test-cluster", false)
+	cs := New("test-cluster", false, false, 0, false, 0)
 
 	imageHashes := map[string]string{
 		"myapp:latest": "sha256:abc123",
@@ -426,7 +494,7 @@ func TestGetImageHashes(t *testing.T) {
 }
 
 func TestHasImageHashChanged(t *testing.T) {
-	cs := New("test-cluster", false)
+	cs := New("test-cluster", false, false, 0, false, 0)
 
 	imageHashes := map[string]string{
 		"myapp:latest": "sha256:abc123",
@@ -455,7 +523,7 @@ func TestHasImageHashChanged(t *testing.T) {
 }
 
 func TestGetChangedImages(t *testing.T) {
-	cs := New("test-cluster", false)
+	cs := New("test-cluster", false, false, 0, false, 0)
 
 	storedHashes := map[string]string{
 		"myapp:latest": "sha256:abc123",
@@ -501,12 +569,44 @@ func TestGetChangedImages(t *testing.T) {
 	}
 }
 
+func TestGPUFieldsPersistence(t *testing.T) {
+	ctx := context.Background()
+	clientset := fake.NewSimpleClientset()
+
+	cs := New("gpu-cluster", false, true, 2, true, 1)
+
+	if err := cs.Save(ctx, clientset); err != nil {
+		t.Fatalf("Failed to save state: %v", err)
+	}
+
+	loaded, err := Load(ctx, clientset, "gpu-cluster")
+	if err != nil {
+		t.Fatalf("Failed to load state: %v", err)
+	}
+
+	if !loaded.NvidiaGPUEnabled {
+		t.Error("NvidiaGPUEnabled not persisted")
+	}
+
+	if loaded.NvidiaGPUCount != 2 {
+		t.Errorf("NvidiaGPUCount not persisted: got %d, want 2", loaded.NvidiaGPUCount)
+	}
+
+	if !loaded.AMDGPUEnabled {
+		t.Error("AMDGPUEnabled not persisted")
+	}
+
+	if loaded.AMDGPUCount != 1 {
+		t.Errorf("AMDGPUCount not persisted: got %d, want 1", loaded.AMDGPUCount)
+	}
+}
+
 func TestStatePersistence(t *testing.T) {
 	ctx := context.Background()
 	clientset := fake.NewSimpleClientset()
 
 	// Create complex state
-	cs := New("test-cluster", true)
+	cs := New("test-cluster", true, false, 0, false, 0)
 	cs.MarkServiceInstalledWithImages("backend", "app", true, map[string]string{
 		"myapp:latest": "sha256:abc123",
 	})
@@ -547,17 +647,16 @@ func TestStatePersistence(t *testing.T) {
 	}
 }
 
-func TestMigration(t *testing.T) {
+func TestMigrationV0ToCurrentVersion(t *testing.T) {
 	ctx := context.Background()
 	clientset := fake.NewSimpleClientset()
 
-	// Create ConfigMap with v0 state (no version field)
+	// v0 state has no version field
 	v0State := map[string]interface{}{
 		"cluster_name": "test-cluster",
 		"is_external":  false,
 		"services":     map[string]interface{}{},
 		"last_updated": time.Now().Format(time.RFC3339),
-		// No version field
 	}
 
 	v0JSON, err := json.Marshal(v0State)
@@ -579,7 +678,6 @@ func TestMigration(t *testing.T) {
 		t.Fatalf("Failed to create ConfigMap: %v", err)
 	}
 
-	// Load should auto-migrate to v1
 	loaded, err := Load(ctx, clientset, "test-cluster")
 	if err != nil {
 		t.Fatalf("Failed to load v0 state: %v", err)
@@ -588,6 +686,113 @@ func TestMigration(t *testing.T) {
 	if loaded.Version != CurrentStateVersion {
 		t.Errorf("Expected version %d after migration, got %d", CurrentStateVersion, loaded.Version)
 	}
+
+	// GPU fields should default to zero values (no GPU) after migration
+	if loaded.NvidiaGPUEnabled {
+		t.Error("Expected NvidiaGPUEnabled to be false after migration from v0")
+	}
+	if loaded.NvidiaGPUCount != 0 {
+		t.Errorf("Expected NvidiaGPUCount to be 0 after migration from v0, got %d", loaded.NvidiaGPUCount)
+	}
+	if loaded.AMDGPUEnabled {
+		t.Error("Expected AMDGPUEnabled to be false after migration from v0")
+	}
+	if loaded.AMDGPUCount != 0 {
+		t.Errorf("Expected AMDGPUCount to be 0 after migration from v0, got %d", loaded.AMDGPUCount)
+	}
+}
+
+func TestMigrationV1ToV2(t *testing.T) {
+	ctx := context.Background()
+	clientset := fake.NewSimpleClientset()
+
+	// v1 state has version=1 but no GPU fields
+	v1State := map[string]interface{}{
+		"version":      1,
+		"cluster_name": "test-cluster",
+		"is_external":  false,
+		"services":     map[string]interface{}{},
+		"last_updated": time.Now().Format(time.RFC3339),
+	}
+
+	v1JSON, err := json.Marshal(v1State)
+	if err != nil {
+		t.Fatalf("Failed to marshal v1 state: %v", err)
+	}
+
+	cm := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      ConfigMapName,
+			Namespace: ConfigMapNamespace,
+		},
+		Data: map[string]string{
+			ConfigMapDataKey: string(v1JSON),
+		},
+	}
+	_, err = clientset.CoreV1().ConfigMaps(ConfigMapNamespace).Create(ctx, cm, metav1.CreateOptions{})
+	if err != nil {
+		t.Fatalf("Failed to create ConfigMap: %v", err)
+	}
+
+	loaded, err := Load(ctx, clientset, "test-cluster")
+	if err != nil {
+		t.Fatalf("Failed to load v1 state: %v", err)
+	}
+
+	if loaded.Version != 2 {
+		t.Errorf("Expected version 2 after v1→v2 migration, got %d", loaded.Version)
+	}
+
+	// GPU fields should default to zero values (no GPU) — correct for pre-GPU clusters
+	if loaded.NvidiaGPUEnabled {
+		t.Error("Expected NvidiaGPUEnabled to be false after migration from v1")
+	}
+	if loaded.NvidiaGPUCount != 0 {
+		t.Errorf("Expected NvidiaGPUCount to be 0 after migration from v1, got %d", loaded.NvidiaGPUCount)
+	}
+	if loaded.AMDGPUEnabled {
+		t.Error("Expected AMDGPUEnabled to be false after migration from v1")
+	}
+	if loaded.AMDGPUCount != 0 {
+		t.Errorf("Expected AMDGPUCount to be 0 after migration from v1, got %d", loaded.AMDGPUCount)
+	}
+}
+
+func TestMigrationVersionTooNew(t *testing.T) {
+	ctx := context.Background()
+	clientset := fake.NewSimpleClientset()
+
+	futureState := map[string]interface{}{
+		"version":      999,
+		"cluster_name": "test-cluster",
+		"is_external":  false,
+		"services":     map[string]interface{}{},
+		"last_updated": time.Now().Format(time.RFC3339),
+	}
+
+	futureJSON, err := json.Marshal(futureState)
+	if err != nil {
+		t.Fatalf("Failed to marshal future state: %v", err)
+	}
+
+	cm := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      ConfigMapName,
+			Namespace: ConfigMapNamespace,
+		},
+		Data: map[string]string{
+			ConfigMapDataKey: string(futureJSON),
+		},
+	}
+	_, err = clientset.CoreV1().ConfigMaps(ConfigMapNamespace).Create(ctx, cm, metav1.CreateOptions{})
+	if err != nil {
+		t.Fatalf("Failed to create ConfigMap: %v", err)
+	}
+
+	_, err = Load(ctx, clientset, "test-cluster")
+	if err == nil {
+		t.Error("Expected error for state version newer than supported, got nil")
+	}
 }
 
 func TestUpdateExistingConfigMap(t *testing.T) {
@@ -595,7 +800,7 @@ func TestUpdateExistingConfigMap(t *testing.T) {
 	clientset := fake.NewSimpleClientset()
 
 	// Create and save initial state
-	cs1 := New("test-cluster", false)
+	cs1 := New("test-cluster", false, false, 0, false, 0)
 	cs1.MarkServiceInstalled("redis")
 
 	if err := cs1.Save(ctx, clientset); err != nil {
@@ -603,7 +808,7 @@ func TestUpdateExistingConfigMap(t *testing.T) {
 	}
 
 	// Update state with new service
-	cs2 := New("test-cluster", false)
+	cs2 := New("test-cluster", false, false, 0, false, 0)
 	cs2.MarkServiceInstalled("redis")
 	cs2.MarkServiceInstalled("postgres")
 

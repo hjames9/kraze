@@ -1,6 +1,7 @@
 package cluster
 
 import (
+	"fmt"
 	"testing"
 
 	"github.com/hjames9/kraze/internal/config"
@@ -618,6 +619,161 @@ func TestBuildCAMounts(test *testing.T) {
 	}
 }
 
+// TestBuildNvidiaGPUMounts verifies the nvidia toolkit binary mount logic.
+// When nvidia-ctk is not in PATH (typical CI / non-GPU hosts), no mounts are returned.
+// When nvidia-ctk IS in PATH, a mount for it is returned at /usr/local/bin/nvidia-ctk.
+// When nvidia-cdi-hook is also in PATH, an additional mount at its original host path
+// is returned so that CDI spec hook references resolve correctly in the kind node.
+func TestBuildNvidiaGPUMounts(test *testing.T) {
+	km := NewKindManager()
+
+	tests := []struct {
+		name     string
+		config   *config.ClusterConfig
+		wantZero bool
+	}{
+		{
+			name:     "no GPU config returns nil",
+			config:   &config.ClusterConfig{Name: "test"},
+			wantZero: true,
+		},
+		{
+			name: "nvidia disabled returns nil",
+			config: &config.ClusterConfig{
+				Name: "test",
+				GPU:  &config.GPUConfig{Nvidia: &config.GPUVendorConfig{Enabled: false, Count: 2}},
+			},
+			wantZero: true,
+		},
+		{
+			name: "nvidia enabled: mounts depend on what toolkit binaries are in PATH",
+			config: &config.ClusterConfig{
+				Name: "test",
+				GPU:  &config.GPUConfig{Nvidia: &config.GPUVendorConfig{Enabled: true, Count: 1}},
+			},
+			// Result depends on whether nvidia-ctk/nvidia-cdi-hook are installed on the test host.
+			// We verify mount paths are well-formed when present.
+			wantZero: false,
+		},
+	}
+
+	for _, tt := range tests {
+		test.Run(tt.name, func(test *testing.T) {
+			mounts := km.buildNvidiaGPUMounts(tt.config)
+			if tt.wantZero {
+				if len(mounts) != 0 {
+					test.Errorf("Expected 0 mounts, got %d", len(mounts))
+				}
+				return
+			}
+			// For enabled case: 0–2 mounts depending on what's in PATH.
+			// If nvidia-ctk is present it must be at /usr/local/bin/nvidia-ctk.
+			// If nvidia-cdi-hook is present its container path must equal its host path.
+			for _, m := range mounts {
+				if m.ContainerPath == "/usr/local/bin/nvidia-ctk" {
+					// nvidia-ctk mount — host path must be non-empty and readable
+					if m.HostPath == "" {
+						test.Errorf("nvidia-ctk mount: HostPath must not be empty")
+					}
+				} else {
+					// nvidia-cdi-hook mount — container path must match host path
+					if m.ContainerPath != m.HostPath {
+						test.Errorf("nvidia-cdi-hook mount: ContainerPath %q != HostPath %q", m.ContainerPath, m.HostPath)
+					}
+				}
+				if !m.Readonly {
+					test.Errorf("Mount %q: expected Readonly=true", m.ContainerPath)
+				}
+			}
+		})
+	}
+}
+
+func TestBuildAMDGPUMounts(test *testing.T) {
+	km := NewKindManager()
+
+	tests := []struct {
+		name     string
+		config   *config.ClusterConfig
+		validate func(*testing.T, []v1alpha4.Mount)
+	}{
+		{
+			name:   "no GPU config (nil)",
+			config: &config.ClusterConfig{Name: "test"},
+			validate: func(test *testing.T, mounts []v1alpha4.Mount) {
+				if len(mounts) != 0 {
+					test.Errorf("Expected 0 mounts for nil GPU config, got %d", len(mounts))
+				}
+			},
+		},
+		{
+			name: "amd disabled",
+			config: &config.ClusterConfig{
+				Name: "test",
+				GPU:  &config.GPUConfig{AMD: &config.GPUVendorConfig{Enabled: false, Count: 2}},
+			},
+			validate: func(test *testing.T, mounts []v1alpha4.Mount) {
+				if len(mounts) != 0 {
+					test.Errorf("Expected 0 mounts for disabled AMD GPU, got %d", len(mounts))
+				}
+			},
+		},
+		{
+			name: "single AMD GPU",
+			config: &config.ClusterConfig{
+				Name: "test",
+				GPU:  &config.GPUConfig{AMD: &config.GPUVendorConfig{Enabled: true, Count: 1}},
+			},
+			validate: func(test *testing.T, mounts []v1alpha4.Mount) {
+				// Expect /dev/kfd + renderD128
+				if len(mounts) != 2 {
+					test.Fatalf("Expected 2 mounts for 1 AMD GPU, got %d", len(mounts))
+				}
+				if mounts[0].HostPath != "/dev/kfd" || mounts[0].ContainerPath != "/dev/kfd" {
+					test.Errorf("Mount[0]: expected /dev/kfd, got HostPath=%q ContainerPath=%q",
+						mounts[0].HostPath, mounts[0].ContainerPath)
+				}
+				if mounts[1].HostPath != "/dev/dri/renderD128" || mounts[1].ContainerPath != "/dev/dri/renderD128" {
+					test.Errorf("Mount[1]: expected /dev/dri/renderD128, got HostPath=%q ContainerPath=%q",
+						mounts[1].HostPath, mounts[1].ContainerPath)
+				}
+			},
+		},
+		{
+			name: "multiple AMD GPUs indexed from 128",
+			config: &config.ClusterConfig{
+				Name: "test",
+				GPU:  &config.GPUConfig{AMD: &config.GPUVendorConfig{Enabled: true, Count: 3}},
+			},
+			validate: func(test *testing.T, mounts []v1alpha4.Mount) {
+				// Expect /dev/kfd + renderD128, renderD129, renderD130
+				if len(mounts) != 4 {
+					test.Fatalf("Expected 4 mounts for 3 AMD GPUs, got %d", len(mounts))
+				}
+				if mounts[0].HostPath != "/dev/kfd" {
+					test.Errorf("Mount[0]: expected /dev/kfd, got %q", mounts[0].HostPath)
+				}
+				for i := 0; i < 3; i++ {
+					expected := fmt.Sprintf("/dev/dri/renderD%d", 128+i)
+					if mounts[i+1].HostPath != expected {
+						test.Errorf("Mount[%d].HostPath: got %q, want %q", i+1, mounts[i+1].HostPath, expected)
+					}
+					if mounts[i+1].ContainerPath != expected {
+						test.Errorf("Mount[%d].ContainerPath: got %q, want %q", i+1, mounts[i+1].ContainerPath, expected)
+					}
+				}
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		test.Run(tt.name, func(test *testing.T) {
+			result := km.buildAMDGPUMounts(tt.config)
+			tt.validate(test, result)
+		})
+	}
+}
+
 func TestBuildContainerdConfigPatches(test *testing.T) {
 	km := NewKindManager()
 
@@ -780,6 +936,109 @@ func TestBuildKindConfigWithCorporateFeatures(test *testing.T) {
 	}
 }
 
+func TestBuildKindConfigWithGPU(test *testing.T) {
+	km := NewKindManager()
+
+	tests := []struct {
+		name     string
+		config   *config.ClusterConfig
+		validate func(*testing.T, *v1alpha4.Cluster)
+	}{
+		{
+			name: "NVIDIA GPU on default single node sets GPUs field",
+			config: &config.ClusterConfig{
+				Name: "test",
+				GPU:  &config.GPUConfig{Nvidia: &config.GPUVendorConfig{Enabled: true, Count: 2}},
+			},
+			validate: func(test *testing.T, cluster *v1alpha4.Cluster) {
+				if len(cluster.Nodes) != 1 {
+					test.Fatalf("Expected 1 node, got %d", len(cluster.Nodes))
+				}
+				node := cluster.Nodes[0]
+				if node.GPUs != "all" {
+					test.Errorf("node.GPUs: got %q, want \"all\"", node.GPUs)
+				}
+			},
+		},
+		{
+			name: "NVIDIA GPUs field only on worker nodes in multi-node config",
+			config: &config.ClusterConfig{
+				Name: "test",
+				GPU:  &config.GPUConfig{Nvidia: &config.GPUVendorConfig{Enabled: true, Count: 1}},
+				Config: []config.KindNode{
+					{Role: "control-plane"},
+					{Role: "worker"},
+				},
+			},
+			validate: func(test *testing.T, cluster *v1alpha4.Cluster) {
+				if len(cluster.Nodes) != 2 {
+					test.Fatalf("Expected 2 nodes, got %d", len(cluster.Nodes))
+				}
+				controlPlane := cluster.Nodes[0]
+				worker := cluster.Nodes[1]
+				if controlPlane.GPUs != "" {
+					test.Errorf("control-plane.GPUs: got %q, want \"\"", controlPlane.GPUs)
+				}
+				if worker.GPUs != "all" {
+					test.Errorf("worker.GPUs: got %q, want \"all\"", worker.GPUs)
+				}
+			},
+		},
+		{
+			name: "NVIDIA GPUs field on all workers with replicas",
+			config: &config.ClusterConfig{
+				Name: "test",
+				GPU:  &config.GPUConfig{Nvidia: &config.GPUVendorConfig{Enabled: true, Count: 2}},
+				Config: []config.KindNode{
+					{Role: "control-plane"},
+					{Role: "worker", Replicas: 3},
+				},
+			},
+			validate: func(test *testing.T, cluster *v1alpha4.Cluster) {
+				// 1 control-plane + 3 workers
+				if len(cluster.Nodes) != 4 {
+					test.Fatalf("Expected 4 nodes, got %d", len(cluster.Nodes))
+				}
+				if cluster.Nodes[0].GPUs != "" {
+					test.Errorf("control-plane.GPUs: got %q, want \"\"", cluster.Nodes[0].GPUs)
+				}
+				for i := 1; i <= 3; i++ {
+					if cluster.Nodes[i].GPUs != "all" {
+						test.Errorf("Node[%d].GPUs: got %q, want \"all\"", i, cluster.Nodes[i].GPUs)
+					}
+				}
+			},
+		},
+		{
+			name: "no GPU config leaves GPUs field empty",
+			config: &config.ClusterConfig{
+				Name: "test",
+				Config: []config.KindNode{
+					{Role: "control-plane"},
+					{Role: "worker"},
+				},
+			},
+			validate: func(test *testing.T, cluster *v1alpha4.Cluster) {
+				for i, node := range cluster.Nodes {
+					if node.GPUs != "" {
+						test.Errorf("Node[%d].GPUs: got %q, want \"\"", i, node.GPUs)
+					}
+				}
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		test.Run(tt.name, func(test *testing.T) {
+			result, err := km.buildKindConfig(tt.config)
+			if err != nil {
+				test.Fatalf("buildKindConfig failed: %v", err)
+			}
+			tt.validate(test, result)
+		})
+	}
+}
+
 // Helper functions
 
 func boolPtr(bl bool) *bool {
@@ -810,7 +1069,7 @@ func TestParseK8sVersion(test *testing.T) {
 		{
 			name:     "no version configured uses kind default",
 			cfg:      config.ClusterConfig{},
-			expected: "v1.35.0",
+			expected: "v1.35.1",
 		},
 		{
 			name:     "version field set",
@@ -830,7 +1089,7 @@ func TestParseK8sVersion(test *testing.T) {
 		{
 			name:     "default image constant parses correctly",
 			cfg:      config.ClusterConfig{NodeImage: defaults.Image},
-			expected: "v1.35.0",
+			expected: "v1.35.1",
 		},
 	}
 

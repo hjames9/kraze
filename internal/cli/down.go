@@ -196,11 +196,11 @@ func runDown(cmd *cobra.Command, args []string) error {
 	st, err := state.Load(ctx, clientset, cfg.Cluster.Name)
 	if err != nil {
 		Verbose("Warning: failed to load cluster state: %v", err)
-		st = state.New(cfg.Cluster.Name, cfg.Cluster.IsExternal())
+		st = state.New(cfg.Cluster.Name, cfg.Cluster.IsExternal(), false, 0, false, 0)
 	}
 	if st == nil {
 		// ConfigMap doesn't exist yet (Load returns nil, nil in this case)
-		st = state.New(cfg.Cluster.Name, cfg.Cluster.IsExternal())
+		st = state.New(cfg.Cluster.Name, cfg.Cluster.IsExternal(), false, 0, false, 0)
 	}
 
 	// Collect namespaces to clean up BEFORE uninstalling (since uninstall removes from state)

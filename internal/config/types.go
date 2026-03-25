@@ -26,6 +26,7 @@ type ClusterConfig struct {
 	CACertificates     []string               `yaml:"ca_certificates,omitempty"`     // Paths to CA certificate files to trust in cluster nodes
 	InsecureRegistries []string               `yaml:"insecure_registries,omitempty"` // Registries to skip TLS verification (e.g., ["registry.corp.com"])
 	Proxy              *ProxyConfig           `yaml:"proxy,omitempty"`               // HTTP/HTTPS proxy configuration
+	GPU                *GPUConfig             `yaml:"gpu,omitempty"`                 // GPU support for cluster nodes (nvidia and/or amd)
 }
 
 // KindNode represents a kind node configuration
@@ -65,6 +66,33 @@ type ProxyConfig struct {
 	HTTPProxy  string `yaml:"http_proxy,omitempty"`  // HTTP proxy URL (e.g., "http://proxy.corp.com:8080")
 	HTTPSProxy string `yaml:"https_proxy,omitempty"` // HTTPS proxy URL (e.g., "http://proxy.corp.com:8080")
 	NoProxy    string `yaml:"no_proxy,omitempty"`    // Comma-separated list of hosts to exclude from proxy
+}
+
+// GPUConfig holds per-vendor GPU configuration for kind cluster nodes.
+type GPUConfig struct {
+	Nvidia *GPUVendorConfig `yaml:"nvidia,omitempty"` // NVIDIA GPU support
+	AMD    *GPUVendorConfig `yaml:"amd,omitempty"`    // AMD GPU support
+}
+
+// GPUVendorConfig holds the enabled flag and GPU count for a single vendor.
+type GPUVendorConfig struct {
+	Enabled bool `yaml:"enabled"`
+	Count   int  `yaml:"count,omitempty"` // Required when enabled
+}
+
+// IsNvidiaEnabled returns true if NVIDIA GPU support is enabled.
+func (g *GPUConfig) IsNvidiaEnabled() bool {
+	return g != nil && g.Nvidia != nil && g.Nvidia.Enabled
+}
+
+// IsAMDEnabled returns true if AMD GPU support is enabled.
+func (g *GPUConfig) IsAMDEnabled() bool {
+	return g != nil && g.AMD != nil && g.AMD.Enabled
+}
+
+// IsAnyEnabled returns true if any GPU vendor is enabled.
+func (g *GPUConfig) IsAnyEnabled() bool {
+	return g.IsNvidiaEnabled() || g.IsAMDEnabled()
 }
 
 // ExternalClusterConfig represents configuration for using an existing cluster

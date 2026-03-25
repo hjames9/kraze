@@ -1,0 +1,57 @@
+# vLLM example — serves a model from a local HuggingFace cache directory
+#
+# No HuggingFace token or internet access needed — vLLM runs fully offline
+# using HF_HUB_OFFLINE=1 and reads directly from the mounted model cache.
+#
+# The model cache directory is mounted into the kind cluster node, making it
+# available to pods as a hostPath volume.
+#
+# Configuration:
+#   MODELS_DIR  — host path to HuggingFace cache root (default: /opt/models/huggingface)
+#                 expects the standard hub layout: $MODELS_DIR/hub/models--<org>--<name>/
+#   VLLM_MODEL  — edit the VLLM_MODEL env var value in vllm.yml to change the model
+#                 (default: Qwen/Qwen3.5-0.8B)
+#
+# Example:
+#   export MODELS_DIR=/path/to/huggingface/cache
+#   kraze up
+#   kraze port-forward vllm 8000:8000
+#   curl http://localhost:8000/v1/models
+
+cluster:
+  name: vllm-local
+
+  gpu:
+    nvidia:
+      enabled: true
+
+  config:
+    - role: control-plane
+      extraMounts:
+        - hostPath: ${MODELS_DIR:-/opt/models/huggingface}
+          containerPath: /opt/models/huggingface
+          readOnly: true
+
+services:
+  nvidia-device-plugin:
+    type: helm
+    repo: https://nvidia.github.io/k8s-device-plugin
+    chart: nvidia-device-plugin
+    namespace: nvidia
+    version: "0.19.0"
+    values_inline: |
+      # Remove NFD-based nodeAffinity so the plugin runs without Node Feature Discovery
+      affinity: null
+      # Mount the kind node's root filesystem so the plugin can find NVIDIA libraries
+      nvidiaDriverRoot: "/"
+      # Privileged is required to open /dev/nvidiactl for NVML initialization
+      securityContext:
+        privileged: true
+
+  vllm:
+    type: manifests
+    path: vllm.yml
+    namespace: vllm
+    wait: true
+    depends_on:
+      - nvidia-device-plugin

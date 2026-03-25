@@ -239,7 +239,43 @@ func runUp(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("failed to load cluster state: %w", err)
 	}
 	if st == nil {
-		st = state.New(cfg.Cluster.Name, cfg.Cluster.IsExternal())
+		nvidiaEnabled := cfg.Cluster.GPU.IsNvidiaEnabled()
+		nvidiaCount := 0
+		if nvidiaEnabled {
+			nvidiaCount = cfg.Cluster.GPU.Nvidia.Count
+		}
+		amdEnabled := cfg.Cluster.GPU.IsAMDEnabled()
+		amdCount := 0
+		if amdEnabled {
+			amdCount = cfg.Cluster.GPU.AMD.Count
+		}
+		st = state.New(cfg.Cluster.Name, cfg.Cluster.IsExternal(), nvidiaEnabled, nvidiaCount, amdEnabled, amdCount)
+	} else if !cfg.Cluster.IsExternal() {
+		// GPU config mismatch check (GPU requires cluster recreation)
+		nvidiaEnabled := cfg.Cluster.GPU.IsNvidiaEnabled()
+		nvidiaCount := 0
+		if nvidiaEnabled {
+			nvidiaCount = cfg.Cluster.GPU.Nvidia.Count
+		}
+		amdEnabled := cfg.Cluster.GPU.IsAMDEnabled()
+		amdCount := 0
+		if amdEnabled {
+			amdCount = cfg.Cluster.GPU.AMD.Count
+		}
+		if st.NvidiaGPUEnabled != nvidiaEnabled || (nvidiaEnabled && st.NvidiaGPUCount != nvidiaCount) ||
+			st.AMDGPUEnabled != amdEnabled || (amdEnabled && st.AMDGPUCount != amdCount) {
+			return fmt.Errorf(
+				"GPU configuration has changed since cluster '%s' was created.\n"+
+					"Was:  nvidia(enabled=%v count=%d) amd(enabled=%v count=%d)\n"+
+					"Now:  nvidia(enabled=%v count=%d) amd(enabled=%v count=%d)\n"+
+					"GPU support requires cluster recreation. Run: kraze destroy && kraze up",
+				cfg.Cluster.Name,
+				st.NvidiaGPUEnabled, st.NvidiaGPUCount,
+				st.AMDGPUEnabled, st.AMDGPUCount,
+				nvidiaEnabled, nvidiaCount,
+				amdEnabled, amdCount,
+			)
+		}
 	}
 
 	// Determine global wait behavior from CLI flags
@@ -446,10 +482,11 @@ func installService(
 
 		// Determine which images need to be loaded
 		imagesToLoad := make([]string, 0)
-		imagesToPull := make([]string, 0)
 		imagesToRemove := make([]string, 0) // Track images that need to be removed before reloading
 
-		// Separate local images (already in Docker) from remote images (need to pull)
+		// Only process local images (built locally, no registry source).
+		// Registry images (those with RepoDigests) are pulled directly by kind's containerd
+		// and do not need to be loaded via the host Docker daemon.
 		for _, img := range serviceImages {
 			currentHash := imageHashes[img]
 			imgInfo, _ := imgMgr.GetImageInfo(ctx, img)
@@ -492,22 +529,9 @@ func installService(
 					}
 				}
 			} else {
-				// Image is not local - need to pull it first
-				imagesToPull = append(imagesToPull, img)
-			}
-		}
-
-		// Pull remote images first
-		if len(imagesToPull) > 0 {
-			progress.UpdateService(serviceIndex, svc.Name, ui.StatusInstalling, fmt.Sprintf("Pulling %d image(s)", len(imagesToPull)))
-			for _, img := range imagesToPull {
-				progress.Verbose("Pulling image '%s'...", img)
-				if err := kindMgr.PullImage(ctx, img); err != nil {
-					progress.Verbose("Warning: failed to pull image '%s': %v", img, err)
-				} else {
-					progress.Verbose("%s Image '%s' pulled", color.Checkmark(), img)
-					imagesToLoad = append(imagesToLoad, img)
-				}
+				// Image is from a registry — kind pulls it directly into containerd.
+				// No host-side pull or kind load needed.
+				progress.Verbose("Image '%s' is a registry image, kind will pull it directly", img)
 			}
 		}
 

@@ -12,6 +12,11 @@ import (
 
 	"github.com/hjames9/kraze/internal/color"
 	"github.com/hjames9/kraze/internal/config"
+	k8serrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/clientcmd"
 	"sigs.k8s.io/kind/pkg/apis/config/defaults"
@@ -38,6 +43,18 @@ func (kind *KindManager) CreateCluster(ctx context.Context, cfg *config.ClusterC
 	// Store custom network name for kubeconfig patching
 	if cfg.Network != "" {
 		kind.customNetwork = cfg.Network
+	}
+
+	// Validate GPU prerequisites before doing anything else
+	if cfg.GPU.IsNvidiaEnabled() {
+		if err := kind.validateNvidiaGPUPrerequisites(); err != nil {
+			return fmt.Errorf("NVIDIA GPU prerequisite check failed: %w", err)
+		}
+	}
+	if cfg.GPU.IsAMDEnabled() {
+		if err := kind.validateAMDGPUPrerequisites(cfg.GPU.AMD.Count); err != nil {
+			return fmt.Errorf("AMD GPU prerequisite check failed: %w", err)
+		}
 	}
 
 	// Check if cluster already exists
@@ -128,6 +145,19 @@ func (kind *KindManager) CreateCluster(ctx context.Context, cfg *config.ClusterC
 		if err := kind.configureProxy(cfg.Name, httpProxy, httpsProxy, noProxy); err != nil {
 			fmt.Printf("Warning: Could not configure proxy: %v\n", err)
 		}
+	}
+
+	// Register NVIDIA RuntimeClass if NVIDIA GPU support is enabled
+	if cfg.GPU.IsNvidiaEnabled() {
+		fmt.Printf("Registering NVIDIA RuntimeClass...\n")
+		if err := kind.registerNvidiaRuntimeClass(ctx, cfg.Name); err != nil {
+			return fmt.Errorf("failed to register NVIDIA RuntimeClass: %w", err)
+		}
+	}
+	if cfg.GPU.IsAMDEnabled() {
+		// AMD does not require a RuntimeClass.
+		// The ROCm device plugin DaemonSet is installed as a kraze service.
+		fmt.Printf("%s AMD GPU mounts configured (no RuntimeClass needed for AMD)\n", color.Checkmark())
 	}
 
 	return nil
@@ -522,21 +552,37 @@ func (kind *KindManager) buildKindConfig(cfg *config.ClusterConfig) (*v1alpha4.C
 	if err != nil {
 		return nil, fmt.Errorf("failed to create GODEBUG configuration: %w", err)
 	}
+	gpuMounts := kind.buildGPUMounts(cfg)
 
-	// Combine CA mounts and GODEBUG mount
+	// Combine CA mounts and GODEBUG mount (applied to all nodes)
 	allMounts := append(caMounts, godebugMount)
 
 	// If no nodes specified in config, create a default control-plane node
+	// GPU mounts are applied to this node since it handles all workloads
 	if len(cfg.Config) == 0 {
 		node := v1alpha4.Node{
 			Role:        v1alpha4.ControlPlaneRole,
-			ExtraMounts: allMounts,
+			ExtraMounts: append(allMounts, gpuMounts...),
+		}
+		if cfg.GPU.IsNvidiaEnabled() {
+			node.GPUs = "all"
 		}
 		if nodeImage != "" {
 			node.Image = nodeImage
 		}
 		kindCfg.Nodes = append(kindCfg.Nodes, node)
 		return kindCfg, nil
+	}
+
+	// Determine whether to apply GPU mounts to worker nodes or fall back to control-plane
+	hasWorker := false
+	if cfg.GPU.IsAnyEnabled() {
+		for _, node := range cfg.Config {
+			if node.Role == "worker" {
+				hasWorker = true
+				break
+			}
+		}
 	}
 
 	// Convert kraze nodes to kind nodes
@@ -548,8 +594,17 @@ func (kind *KindManager) buildKindConfig(cfg *config.ClusterConfig) (*v1alpha4.C
 			kindNode.Image = nodeImage
 		}
 
-		// Add CA certificate and GODEBUG mounts to existing mounts
+		// Add CA certificate and GODEBUG mounts to all nodes
 		kindNode.ExtraMounts = append(kindNode.ExtraMounts, allMounts...)
+
+		// Add GPU mounts: to worker nodes when workers exist, otherwise to control-plane
+		applyGPU := kindNode.Role == v1alpha4.WorkerRole || (!hasWorker && kindNode.Role == v1alpha4.ControlPlaneRole)
+		if applyGPU {
+			kindNode.ExtraMounts = append(kindNode.ExtraMounts, gpuMounts...)
+			if cfg.GPU.IsNvidiaEnabled() {
+				kindNode.GPUs = "all"
+			}
+		}
 
 		// Handle replicas for worker nodes
 		if node.Replicas > 0 {
@@ -918,6 +973,65 @@ func (kind *KindManager) buildCAMounts(cfg *config.ClusterConfig) []v1alpha4.Mou
 	return mounts
 }
 
+// buildGPUMounts returns GPU-related extra mounts for a node.
+// For NVIDIA: mounts nvidia-container-runtime and nvidia-ctk into the kind node.
+// For AMD: mounts /dev/kfd and /dev/dri/renderD* device files.
+func (kind *KindManager) buildGPUMounts(cfg *config.ClusterConfig) []v1alpha4.Mount {
+	var mounts []v1alpha4.Mount
+	mounts = append(mounts, kind.buildNvidiaGPUMounts(cfg)...)
+	mounts = append(mounts, kind.buildAMDGPUMounts(cfg)...)
+	return mounts
+}
+
+// buildNvidiaGPUMounts mounts NVIDIA toolkit binaries into the kind node.
+//
+// nvidia-container-runtime is registered as containerd's nvidia OCI runtime handler.
+// nvidia-ctk is called by nvidia-container-runtime as an OCI hook to inject GPU
+// devices and libraries into containers. Both must be present inside the kind node
+// at the same paths they occupy on the host.
+func (kind *KindManager) buildNvidiaGPUMounts(cfg *config.ClusterConfig) []v1alpha4.Mount {
+	if !cfg.GPU.IsNvidiaEnabled() {
+		return nil
+	}
+	var mounts []v1alpha4.Mount
+	for _, bin := range []string{"nvidia-container-runtime", "nvidia-ctk"} {
+		binPath, err := osexec.LookPath(bin)
+		if err == nil && binPath != "" {
+			mounts = append(mounts, v1alpha4.Mount{
+				HostPath:      binPath,
+				ContainerPath: binPath,
+				Readonly:      true,
+			})
+		}
+	}
+	return mounts
+}
+
+// buildAMDGPUMounts produces bind-mounts for AMD GPU device files.
+//
+//   - /dev/kfd is the Kernel Fusion Driver shared by all AMD GPUs (required by ROCm).
+//   - /dev/dri/renderD<128+i> is the DRM render node for GPU i.
+//     renderD numbering always starts at 128 on Linux.
+func (kind *KindManager) buildAMDGPUMounts(cfg *config.ClusterConfig) []v1alpha4.Mount {
+	if !cfg.GPU.IsAMDEnabled() {
+		return nil
+	}
+	count := cfg.GPU.AMD.Count
+	mounts := make([]v1alpha4.Mount, 0, 1+count)
+	mounts = append(mounts, v1alpha4.Mount{
+		HostPath:      "/dev/kfd",
+		ContainerPath: "/dev/kfd",
+	})
+	for i := 0; i < count; i++ {
+		device := fmt.Sprintf("/dev/dri/renderD%d", 128+i)
+		mounts = append(mounts, v1alpha4.Mount{
+			HostPath:      device,
+			ContainerPath: device,
+		})
+	}
+	return mounts
+}
+
 // buildGODEBUGMount creates a systemd drop-in file for containerd with GODEBUG settings
 // This file is mounted into the container BEFORE containerd starts, eliminating the need for restarts
 // GODEBUG=x509negativeserial=1 allows Go to accept X.509 certificates with negative serial numbers
@@ -955,6 +1069,119 @@ Environment="GODEBUG=x509negativeserial=1"
 	}, nil
 }
 
+// validateNvidiaGPUPrerequisites checks that nvidia-container-toolkit is installed.
+// The default Docker runtime no longer needs to be changed — GPU passthrough uses
+// Docker's --gpus flag (DeviceRequests) which works with the standard runc runtime.
+func (kind *KindManager) validateNvidiaGPUPrerequisites() error {
+	// Both binaries must be present: nvidia-container-runtime is registered as
+	// containerd's nvidia OCI runtime handler; nvidia-ctk is called by it as an OCI
+	// hook to inject GPU devices and libraries into containers.
+	for _, bin := range []string{"nvidia-container-runtime", "nvidia-ctk"} {
+		if _, err := osexec.LookPath(bin); err != nil {
+			return fmt.Errorf(
+				"%s not found in PATH — is nvidia-container-toolkit installed?\n"+
+					"Install from: https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/install-guide.html",
+				bin,
+			)
+		}
+	}
+	return nil
+}
+
+// validateAMDGPUPrerequisites verifies the host has the AMD GPU device files
+// required for kind GPU passthrough:
+//   - /dev/kfd: Kernel Fusion Driver, shared interface for all AMD GPUs (required by ROCm)
+//   - /dev/dri/renderD<128+i>: DRM render node, one per GPU (starts at renderD128)
+func (kind *KindManager) validateAMDGPUPrerequisites(gpuCount int) error {
+	const prereqHelp = `
+Ensure the ROCm stack and AMDGPU kernel driver are installed on the host:
+  https://rocm.docs.amd.com/en/latest/deploy/linux/index.html
+
+After installation, verify:
+  ls -la /dev/kfd /dev/dri/renderD128`
+
+	if _, err := os.Stat("/dev/kfd"); err != nil {
+		if os.IsNotExist(err) {
+			return fmt.Errorf("/dev/kfd not found — is the ROCm/AMDGPU driver loaded?%s", prereqHelp)
+		}
+		return fmt.Errorf("failed to stat /dev/kfd: %w", err)
+	}
+
+	for i := 0; i < gpuCount; i++ {
+		device := fmt.Sprintf("/dev/dri/renderD%d", 128+i)
+		if _, err := os.Stat(device); err != nil {
+			if os.IsNotExist(err) {
+				return fmt.Errorf(
+					"%s not found — expected %d GPU(s) but device for GPU %d is missing%s",
+					device, gpuCount, i, prereqHelp,
+				)
+			}
+			return fmt.Errorf("failed to stat %s: %w", device, err)
+		}
+	}
+
+	return nil
+}
+
+// registerNvidiaRuntimeClass creates the nvidia RuntimeClass in the cluster.
+// This allows pods to request GPU access via runtimeClassName: nvidia.
+func (kind *KindManager) registerNvidiaRuntimeClass(ctx context.Context, clusterName string) error {
+	kubeconfig, err := kind.GetKubeConfigQuiet(clusterName, true, true)
+	if err != nil {
+		return fmt.Errorf("failed to get kubeconfig: %w", err)
+	}
+
+	restConfig, err := clientcmd.RESTConfigFromKubeConfig([]byte(kubeconfig))
+	if err != nil {
+		return fmt.Errorf("failed to build REST config: %w", err)
+	}
+	// Use insecure TLS since kubeconfig uses the container IP (same pattern as UpdateKubeconfigFile)
+	restConfig.TLSClientConfig.Insecure = true
+	restConfig.TLSClientConfig.CAData = nil
+
+	dynClient, err := dynamic.NewForConfig(restConfig)
+	if err != nil {
+		return fmt.Errorf("failed to create dynamic client: %w", err)
+	}
+
+	runtimeClassGVR := schema.GroupVersionResource{
+		Group:    "node.k8s.io",
+		Version:  "v1",
+		Resource: "runtimeclasses",
+	}
+
+	obj := &unstructured.Unstructured{
+		Object: map[string]interface{}{
+			"apiVersion": "node.k8s.io/v1",
+			"kind":       "RuntimeClass",
+			"metadata": map[string]interface{}{
+				"name": "nvidia",
+			},
+			"handler": "nvidia",
+		},
+	}
+
+	existing, err := dynClient.Resource(runtimeClassGVR).Get(ctx, "nvidia", metav1.GetOptions{})
+	if err != nil {
+		if !k8serrors.IsNotFound(err) {
+			return fmt.Errorf("failed to check for existing RuntimeClass: %w", err)
+		}
+		// Does not exist — create it
+		if _, err := dynClient.Resource(runtimeClassGVR).Create(ctx, obj, metav1.CreateOptions{}); err != nil {
+			return fmt.Errorf("failed to create NVIDIA RuntimeClass: %w", err)
+		}
+	} else {
+		// Already exists — update, preserving the resourceVersion
+		obj.SetResourceVersion(existing.GetResourceVersion())
+		if _, err := dynClient.Resource(runtimeClassGVR).Update(ctx, obj, metav1.UpdateOptions{}); err != nil {
+			return fmt.Errorf("failed to update NVIDIA RuntimeClass: %w", err)
+		}
+	}
+
+	fmt.Printf("%s NVIDIA RuntimeClass registered\n", color.Checkmark())
+	return nil
+}
+
 // buildContainerdConfigPatches creates containerd configuration patches
 func (kind *KindManager) buildContainerdConfigPatches(cfg *config.ClusterConfig) []string {
 	var patches []string
@@ -963,6 +1190,20 @@ func (kind *KindManager) buildContainerdConfigPatches(cfg *config.ClusterConfig)
 	// Setting config_path would tell containerd to ONLY use /etc/containerd/certs.d/
 	// which is empty during kubeadm init, breaking Docker Hub access.
 	// Insecure registries are configured AFTER cluster init via configureInsecureRegistries()
+
+	// Configure NVIDIA GPU support in containerd when NVIDIA GPUs are used.
+	// Registers the "nvidia" runtime handler using nvidia-container-runtime, which
+	// intercepts NVIDIA_VISIBLE_DEVICES and injects GPU devices and libraries.
+	// Applied before containerd starts, so no restart is needed.
+	if cfg.GPU.IsNvidiaEnabled() {
+		// nvidia-container-runtime is validated and mounted into the kind node by
+		// buildNvidiaGPUMounts(). Use LookPath result directly — no fallback needed.
+		nvidiaRuntimePath, _ := osexec.LookPath("nvidia-container-runtime")
+		patches = append(patches, fmt.Sprintf(`[plugins."io.containerd.grpc.v1.cri".containerd.runtimes.nvidia]
+  runtime_type = "io.containerd.runc.v2"
+  [plugins."io.containerd.grpc.v1.cri".containerd.runtimes.nvidia.options]
+    BinaryName = %q`, nvidiaRuntimePath))
+	}
 
 	return patches
 }

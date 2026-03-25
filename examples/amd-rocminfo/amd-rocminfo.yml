@@ -1,0 +1,14 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: amd-rocminfo
+  namespace: default
+spec:
+  restartPolicy: Never
+  containers:
+    - name: amd-rocminfo
+      image: rocm/rocm-terminal:latest
+      command: ["rocminfo"]
+      resources:
+        limits:
+          amd.com/gpu: 1

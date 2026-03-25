@@ -1,0 +1,61 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vllm
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: vllm
+  template:
+    metadata:
+      labels:
+        app: vllm
+    spec:
+      enableServiceLinks: false
+      containers:
+        - name: vllm
+          image: vllm/vllm-openai-rocm:v0.18.0
+          args:
+            - --model
+            - $(VLLM_MODEL)
+            - --port
+            - "8000"
+            # Uncomment to skip CUDA graph capture — reduces startup time,
+            # at the cost of slightly lower inference throughput. Useful for dev/iteration.
+            #- --enforce-eager
+          env:
+            - name: VLLM_MODEL
+              value: "Qwen/Qwen3.5-0.8B"
+            # For gated models (e.g. Meta Llama), set your HuggingFace token:
+            #   kubectl set env deployment/vllm -n vllm HUGGING_FACE_HUB_TOKEN=hf_...
+            - name: HUGGING_FACE_HUB_TOKEN
+              value: ""
+            # Uncomment if your GPU architecture is not yet fully supported by ROCm.
+            # This tells ROCm to use RDNA 3 (gfx1100) compatibility mode.
+            # Useful for newer GPUs like RDNA 4 (RX 9070) where ROCm support is still maturing.
+            #- name: HSA_OVERRIDE_GFX_VERSION
+            #  value: "11.0.0"
+          resources:
+            limits:
+              amd.com/gpu: 1
+          ports:
+            - containerPort: 8000
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            failureThreshold: 30
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: vllm
+spec:
+  selector:
+    app: vllm
+  ports:
+    - port: 8000
+      targetPort: 8000

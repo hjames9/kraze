@@ -790,7 +790,11 @@ func isDaemonSetReady(obj *unstructured.Unstructured, status map[string]interfac
 		return false, err
 	}
 
-	return numberReady >= desiredScheduled && desiredScheduled > 0, nil
+	// A DaemonSet with 0 desired pods (no matching nodes) is trivially ready
+	if desiredScheduled == 0 {
+		return true, nil
+	}
+	return numberReady >= desiredScheduled, nil
 }
 
 // isJobReady checks if a Job has completed
@@ -828,13 +832,17 @@ func isJobReady(obj *unstructured.Unstructured, status map[string]interface{}) (
 	return false, nil
 }
 
-// isPodReady checks if a Pod is ready
+// isPodReady checks if a Pod is ready.
+// Completed pods (Succeeded) are considered ready — they ran to completion successfully.
 func isPodReady(obj *unstructured.Unstructured, status map[string]interface{}) (bool, error) {
 	phase, found, err := unstructured.NestedString(status, "phase")
 	if err != nil || !found {
 		return false, err
 	}
 
+	if phase == "Succeeded" {
+		return true, nil
+	}
 	if phase != "Running" {
 		return false, nil
 	}
@@ -1164,7 +1172,7 @@ func displayPodDiagnostics(ctx context.Context, clientset *kubernetes.Clientset,
 		// Extract container name from failure message
 		containerName := extractContainerName(failureMsg)
 		if containerName != "" {
-			logs, err := getContainerLogs(ctx, clientset, namespace, podName, containerName, 20)
+			logs, err := getContainerLogs(ctx, clientset, namespace, podName, containerName, 50)
 			if err == nil && len(logs) > 0 {
 				fmt.Printf("  Last %d log lines from container '%s':\n", len(logs), containerName)
 				for _, log := range logs {

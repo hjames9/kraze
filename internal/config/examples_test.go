@@ -24,6 +24,15 @@ func TestAllExamples(test *testing.T) {
 		"charts",
 		"manifests",
 		"dependencies",
+		"nvidia-gpu",
+		"amd-gpu",
+		"amd-rocminfo",
+		"vllm-amd",
+		"cuda-vectoradd",
+		"vllm",
+		"vllm-local",
+		"vllm-openwebui",
+		"vllm-rag",
 	}
 
 	// Track validation results

@@ -1,0 +1,30 @@
+# AMD GPU cluster example
+#
+# Find your GPU count:
+#   ls /dev/dri/renderD*              # one renderD device per GPU (starting at renderD128)
+#   ls /dev/dri/renderD* | wc -l     # prints the count
+#
+# Prerequisites on the host:
+#   - AMD GPU drivers and ROCm runtime installed
+#   - /dev/kfd and /dev/dri/renderD* devices present
+#   - No Docker runtime changes needed (standard runc is sufficient)
+#
+# Verify setup:
+#   ls /dev/kfd             # should exist
+#   ls /dev/dri/renderD*    # should list one device per GPU
+
+cluster:
+  name: amd-gpu-cluster
+
+  gpu:
+    amd:
+      enabled: true
+      count: 1  # Number of GPUs to assign to worker nodes
+
+services:
+  amd-device-plugin:
+    type: helm
+    repo: https://rocm.github.io/k8s-device-plugin
+    chart: amd-gpu
+    namespace: amd
+    version: "0.21.0"

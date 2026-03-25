@@ -156,3 +156,5 @@ require (
 	sigs.k8s.io/structured-merge-diff/v6 v6.3.2 // indirect
 	sigs.k8s.io/yaml v1.6.0 // indirect
 )
+
+replace sigs.k8s.io/kind => github.com/hjames9/kind v0.0.0-20260324224006-6f8c1b26be5d

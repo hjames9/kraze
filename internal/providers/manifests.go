@@ -483,6 +483,12 @@ func (manifest *ManifestsProvider) applyResource(ctx context.Context, obj *unstr
 		return fmt.Errorf("failed to check if resource exists: %w", err)
 	}
 
+	// PVCs are immutable once bound — skip update to avoid "spec is immutable" errors.
+	// Storage resize is the only allowed mutation, but kraze does not manage that.
+	if obj.GetKind() == "PersistentVolumeClaim" {
+		return nil
+	}
+
 	// Resource exists, update it
 	// Preserve the resourceVersion for optimistic concurrency control
 	obj.SetResourceVersion(existing.GetResourceVersion())

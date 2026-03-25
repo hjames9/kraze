@@ -161,7 +161,6 @@ func (im *ImageManager) GetImageInfo(ctx context.Context, imageName string) (*Im
 	}
 
 	if len(inspectData) > 0 {
-		info.IsLocal = true
 		info.Size = inspectData[0].Size
 
 		// Extract SHA256 from ID (format: sha256:abc123...)
@@ -175,6 +174,11 @@ func (im *ImageManager) GetImageInfo(ctx context.Context, imageName string) (*Im
 			if len(digestParts) == 2 {
 				info.SHA256 = digestParts[1]
 			}
+			// Image has a registry source — kind can pull it directly, no need to load
+			info.IsLocal = false
+		} else {
+			// No repo digests means the image was built locally and never pushed to a registry
+			info.IsLocal = true
 		}
 	}
 
@@ -203,7 +207,7 @@ func (im *ImageManager) GetClusterImageHash(ctx context.Context, clusterName, im
 	containerName := clusterName + "-control-plane"
 
 	// Check if image exists in cluster using crictl
-	cmd := osexec.CommandContext(ctx, "docker", "exec", containerName, "crictl", "inspecti", clusterImageName)
+	cmd := osexec.CommandContext(ctx, "docker", "exec", containerName, "crictl", "inspect", clusterImageName)
 	output, err := cmd.Output()
 
 	if err != nil {
