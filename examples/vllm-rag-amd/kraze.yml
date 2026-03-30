@@ -1,0 +1,66 @@
+# vLLM + pgvector + Open WebUI RAG example (AMD GPU)
+#
+# A complete Retrieval Augmented Generation (RAG) stack for AMD GPUs:
+#   - vLLM:       LLM inference backend (OpenAI-compatible API) running on AMD ROCm
+#   - pgvector:   PostgreSQL with the pgvector extension for storing document embeddings
+#   - Open WebUI: Chat interface with built-in document ingestion and RAG pipeline
+#
+# How it works:
+#   1. Upload documents in Open WebUI (PDF, text, web pages, etc.)
+#   2. Open WebUI chunks and embeds the documents, storing vectors in pgvector
+#   3. On each query, relevant chunks are retrieved from pgvector and injected
+#      into the prompt sent to vLLM — grounding the model in your documents
+#
+# Prerequisites on the host:
+#   - AMD GPU drivers and ROCm runtime installed
+#   - /dev/kfd and /dev/dri/renderD* devices present
+#
+# Find your GPU count:
+#   ls /dev/dri/renderD* | wc -l
+#
+# Usage:
+#   kraze up
+#   kraze port-forward open-webui 8080:8080
+#   open http://localhost:8080
+#
+# In Open WebUI, enable RAG by clicking the paperclip icon in the chat input
+# to upload documents, or go to Workspace > Knowledge to manage document collections.
+
+cluster:
+  name: rag-stack-amd
+
+  gpu:
+    amd:
+      enabled: true
+      count: 1  # Number of GPUs to assign to worker nodes
+
+services:
+  amd-device-plugin:
+    type: helm
+    repo: https://rocm.github.io/k8s-device-plugin
+    chart: amd-gpu
+    namespace: amd
+    version: "0.21.0"
+
+  vllm:
+    type: manifests
+    path: vllm.yml
+    namespace: vllm
+    wait: true
+    depends_on:
+      - amd-device-plugin
+
+  pgvector:
+    type: manifests
+    path: pgvector.yml
+    namespace: pgvector
+    wait: true
+
+  open-webui:
+    type: manifests
+    path: open-webui.yml
+    namespace: open-webui
+    wait: true
+    depends_on:
+      - vllm
+      - pgvector

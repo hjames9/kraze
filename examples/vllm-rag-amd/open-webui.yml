@@ -1,0 +1,57 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: open-webui
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: open-webui
+  template:
+    metadata:
+      labels:
+        app: open-webui
+    spec:
+      enableServiceLinks: false
+      containers:
+        - name: open-webui
+          image: ghcr.io/open-webui/open-webui:main
+          env:
+            # LLM backend
+            - name: OPENAI_API_BASE_URL
+              value: "http://vllm.vllm.svc.cluster.local:8000/v1"
+            - name: OPENAI_API_KEY
+              value: "not-needed"
+            # Vector database for RAG
+            - name: VECTOR_DB
+              value: "pgvector"
+            - name: PGVECTOR_DB_URL
+              value: "postgresql://postgres:password@pgvector.pgvector.svc.cluster.local:5432/openwebui"
+          ports:
+            - containerPort: 8080
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 15
+            periodSeconds: 10
+            failureThreshold: 12
+          volumeMounts:
+            - name: data
+              mountPath: /app/backend/data
+      volumes:
+        - name: data
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: open-webui
+spec:
+  type: NodePort
+  selector:
+    app: open-webui
+  ports:
+    - port: 8080
+      targetPort: 8080
+      nodePort: 30808

@@ -4,6 +4,8 @@ metadata:
   name: vllm
 spec:
   replicas: 1
+  strategy:
+    type: Recreate  # Avoid rolling updates when using GPU - prevents multiple pods competing for same GPU
   selector:
     matchLabels:
       app: vllm
@@ -31,11 +33,6 @@ spec:
             #   kubectl set env deployment/vllm -n vllm HUGGING_FACE_HUB_TOKEN=hf_...
             - name: HUGGING_FACE_HUB_TOKEN
               value: ""
-            # Uncomment if your GPU architecture is not yet fully supported by ROCm.
-            # This tells ROCm to use RDNA 3 (gfx1100) compatibility mode.
-            # Useful for newer GPUs like RDNA 4 (RX 9070) where ROCm support is still maturing.
-            #- name: HSA_OVERRIDE_GFX_VERSION
-            #  value: "11.0.0"
           resources:
             limits:
               amd.com/gpu: 1
@@ -54,8 +51,10 @@ kind: Service
 metadata:
   name: vllm
 spec:
+  type: NodePort
   selector:
     app: vllm
   ports:
     - port: 8000
       targetPort: 8000
+      nodePort: 30800

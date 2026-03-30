@@ -814,6 +814,7 @@ See the [examples/](./examples) directory for complete working examples:
 - **[vllm-local/](./examples/vllm-local)** - vLLM serving an LLM from a local model cache (v0.7.0+)
 - **[vllm-openwebui/](./examples/vllm-openwebui)** - vLLM + Open WebUI complete local AI stack (v0.7.0+)
 - **[vllm-rag/](./examples/vllm-rag)** - vLLM + pgvector + Open WebUI RAG stack for document-grounded chat (v0.7.0+)
+- **[vllm-rag-amd/](./examples/vllm-rag-amd)** - vLLM + pgvector + Open WebUI RAG stack on AMD GPUs with ROCm (v0.7.0+)
 
 Validate all examples:
 ```bash
