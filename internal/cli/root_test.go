@@ -223,19 +223,19 @@ func TestResolveConfigFileExplicitFlag(t *testing.T) {
 	defer os.Remove(tmp.Name())
 	tmp.Close()
 
-	// Save and restore the global configFile variable
-	orig := configFile
-	defer func() { configFile = orig }()
+	// Save and restore the global configFiles variable
+	orig := configFiles
+	defer func() { configFiles = orig }()
 
-	configFile = tmp.Name()
-	got, err := resolveConfigFile(rootCmd)
+	configFiles = []string{tmp.Name()}
+	got, err := resolveConfigFiles(rootCmd)
 	if err != nil {
 		t.Fatalf("Expected no error, got: %v", err)
 	}
 
 	want, _ := filepath.Abs(tmp.Name())
-	if got != want {
-		t.Errorf("Expected %q, got %q", want, got)
+	if len(got) != 1 || got[0] != want {
+		t.Errorf("Expected [%q], got %v", want, got)
 	}
 }
 
@@ -264,18 +264,18 @@ func TestResolveConfigFileCwd(t *testing.T) {
 	}
 
 	// Ensure -f is not set
-	origConfigFile := configFile
-	defer func() { configFile = origConfigFile }()
-	configFile = ""
+	origConfigFiles := configFiles
+	defer func() { configFiles = origConfigFiles }()
+	configFiles = []string{}
 
-	got, err := resolveConfigFile(rootCmd)
+	got, err := resolveConfigFiles(rootCmd)
 	if err != nil {
 		t.Fatalf("Expected no error, got: %v", err)
 	}
 
 	want, _ := filepath.Abs("kraze.yml")
-	if got != want {
-		t.Errorf("Expected %q, got %q", want, got)
+	if len(got) != 1 || got[0] != want {
+		t.Errorf("Expected [%q], got %v", want, got)
 	}
 }
 

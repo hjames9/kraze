@@ -361,10 +361,10 @@ func (cs *ClusterState) HasImageHashChanged(serviceName, imageName, currentHash 
 	return storedHash != currentHash
 }
 
-// SetConfigPath stores the absolute path to the config file used with this cluster.
+// SetConfigPaths stores the absolute paths to the config files used with this cluster.
 // It replaces any previously stored paths.
-func (cs *ClusterState) SetConfigPath(absPath string) {
-	cs.ConfigPaths = []string{absPath}
+func (cs *ClusterState) SetConfigPaths(absPaths []string) {
+	cs.ConfigPaths = absPaths
 }
 
 // GetConfigPaths returns the stored config file paths for this cluster.

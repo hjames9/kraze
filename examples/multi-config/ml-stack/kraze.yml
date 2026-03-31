@@ -1,0 +1,40 @@
+# Multi-Config Example — ML Stack
+#
+# Secondary config file for ML/GPU services. Omits the cluster name so the
+# primary config (app/kraze.yml) owns cluster identity. GPU config here is
+# merged with the primary — enabling AMD GPU support for the whole cluster.
+#
+# This file is not meant to be used standalone; use it alongside the app config:
+#   kraze up -f app/kraze.yml -f ml-stack/kraze.yml
+
+cluster:
+  name: dev-cluster
+  gpu:
+    amd:
+      enabled: true
+      count: 1
+
+services:
+  pgvector:
+    type: helm
+    chart: postgresql
+    repo: oci://registry-1.docker.io/bitnamicharts
+    version: 16.2.1
+    namespace: ml
+    depends_on: [postgres]
+
+  vllm:
+    type: helm
+    chart: vllm
+    repo: oci://registry-1.docker.io/bitnamicharts
+    version: 0.1.0
+    namespace: ml
+    depends_on: [pgvector]
+
+  openwebui:
+    type: helm
+    chart: open-webui
+    repo: https://helm.openwebui.com
+    version: 3.4.1
+    namespace: ml
+    depends_on: [vllm]

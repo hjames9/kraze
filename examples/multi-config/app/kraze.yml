@@ -1,0 +1,30 @@
+# Multi-Config Example — App Stack
+#
+# This is the primary config file. It owns the cluster definition and
+# deploys the core application services.
+#
+# Usage (standalone):
+#   kraze up -f app/kraze.yml
+#
+# Usage (combined with ML stack):
+#   kraze up -f app/kraze.yml -f ml-stack/kraze.yml
+#   kraze status -f app/kraze.yml -f ml-stack/kraze.yml
+#   kraze down -f app/kraze.yml -f ml-stack/kraze.yml
+
+cluster:
+  name: dev-cluster
+
+services:
+  redis:
+    type: helm
+    chart: redis
+    repo: oci://registry-1.docker.io/bitnamicharts
+    version: 20.2.1
+    namespace: data
+
+  postgres:
+    type: helm
+    chart: postgresql
+    repo: oci://registry-1.docker.io/bitnamicharts
+    version: 16.2.1
+    namespace: data

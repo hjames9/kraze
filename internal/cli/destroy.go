@@ -3,6 +3,7 @@ package cli
 import (
 	"context"
 	"fmt"
+	"strings"
 
 	"github.com/hjames9/kraze/internal/cluster"
 	"github.com/hjames9/kraze/internal/color"
@@ -29,15 +30,15 @@ Services do not need to be uninstalled first - the entire cluster is removed.`,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		ctx := context.Background()
 
-		cfgPath, err := resolveConfigFile(cmd)
+		cfgPaths, err := resolveConfigFiles(cmd)
 		if err != nil {
 			return err
 		}
-		Verbose("Destroying cluster from config file: %s", cfgPath)
+		Verbose("Destroying cluster from config file(s): %s", strings.Join(cfgPaths, ", "))
 
 		// Parse config file to get cluster name
 		Verbose("Parsing configuration...")
-		cfg, err := config.Parse(cfgPath)
+		cfg, err := config.ParseMultiple(cfgPaths)
 		if err != nil {
 			return fmt.Errorf("failed to parse config: %w", err)
 		}

@@ -9,13 +9,13 @@ import (
 
 // getServiceNames returns a list of service names from the config file for shell completion
 func getServiceNames(cmd *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
-	cfgPath, err := resolveConfigFile(cmd)
+	cfgPaths, err := resolveConfigFiles(cmd)
 	if err != nil {
 		return nil, cobra.ShellCompDirectiveNoFileComp
 	}
 
 	// Parse config
-	cfg, err := config.Parse(cfgPath)
+	cfg, err := config.ParseMultiple(cfgPaths)
 	if err != nil {
 		return nil, cobra.ShellCompDirectiveNoFileComp
 	}

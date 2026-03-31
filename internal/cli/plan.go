@@ -52,14 +52,14 @@ type ServicePlanInfo struct {
 func runPlan(cmd *cobra.Command, args []string) error {
 	ctx := context.Background()
 
-	cfgPath, err := resolveConfigFile(cmd)
+	cfgPaths, err := resolveConfigFiles(cmd)
 	if err != nil {
 		return err
 	}
-	Verbose("Planning deployment from config file: %s", cfgPath)
+	Verbose("Planning deployment from config file(s): %s", strings.Join(cfgPaths, ", "))
 
 	// Parse configuration
-	cfg, err := config.Parse(cfgPath)
+	cfg, err := config.ParseMultiple(cfgPaths)
 	if err != nil {
 		return fmt.Errorf("failed to parse config: %w", err)
 	}

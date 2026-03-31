@@ -3,6 +3,7 @@ package cli
 import (
 	"context"
 	"fmt"
+	"strings"
 
 	"github.com/hjames9/kraze/internal/cluster"
 	"github.com/hjames9/kraze/internal/config"
@@ -30,14 +31,14 @@ You can filter services by name or by labels:
 func runStatus(cmd *cobra.Command, args []string) error {
 	ctx := context.Background()
 
-	cfgPath, err := resolveConfigFile(cmd)
+	cfgPaths, err := resolveConfigFiles(cmd)
 	if err != nil {
 		return err
 	}
-	Verbose("Checking status from config file: %s", cfgPath)
+	Verbose("Checking status from config file(s): %s", strings.Join(cfgPaths, ", "))
 
 	// Parse configuration
-	cfg, err := config.Parse(cfgPath)
+	cfg, err := config.ParseMultiple(cfgPaths)
 	if err != nil {
 		return fmt.Errorf("failed to parse config: %w", err)
 	}

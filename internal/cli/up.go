@@ -3,7 +3,7 @@ package cli
 import (
 	"context"
 	"fmt"
-	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -46,14 +46,14 @@ You can filter services by name or by labels:
 func runUp(cmd *cobra.Command, args []string) error {
 	ctx := context.Background()
 
-	cfgPath, err := resolveConfigFile(cmd)
+	cfgPaths, err := resolveConfigFiles(cmd)
 	if err != nil {
 		return err
 	}
-	Verbose("Starting services from config file: %s", cfgPath)
+	Verbose("Starting services from config file(s): %s", strings.Join(cfgPaths, ", "))
 
 	// Parse configuration
-	cfg, err := config.Parse(cfgPath)
+	cfg, err := config.ParseMultiple(cfgPaths)
 	if err != nil {
 		return fmt.Errorf("failed to parse config: %w", err)
 	}
@@ -283,13 +283,10 @@ func runUp(cmd *cobra.Command, args []string) error {
 		}
 	}
 
-	// Store the config path in cluster state so future commands can find it without -f
-	absPath, err := filepath.Abs(cfgPath)
-	if err == nil {
-		st.SetConfigPath(absPath)
-		if saveErr := st.Save(ctx, clientset); saveErr != nil {
-			Verbose("Warning: failed to store config path in cluster state: %v", saveErr)
-		}
+	// Store the config paths in cluster state so future commands can find them without -f
+	st.SetConfigPaths(cfgPaths)
+	if saveErr := st.Save(ctx, clientset); saveErr != nil {
+		Verbose("Warning: failed to store config paths in cluster state: %v", saveErr)
 	}
 
 	// Determine global wait behavior from CLI flags

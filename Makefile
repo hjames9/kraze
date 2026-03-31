@@ -186,6 +186,10 @@ validate-examples: build ## Validate all example configurations
 			./$(BUILD_DIR)/$(BINARY_NAME) validate --file "$$dir/kraze.yml" || exit 1; \
 		fi \
 	done
+	@echo "Validating examples/multi-config/"; \
+	./$(BUILD_DIR)/$(BINARY_NAME) validate \
+		--file examples/multi-config/app/kraze.yml \
+		--file examples/multi-config/ml-stack/kraze.yml || exit 1
 	@echo "All examples validated successfully"
 
 help: ## Show this help message

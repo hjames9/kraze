@@ -213,6 +213,58 @@ func TestManifestsExample(test *testing.T) {
 	}
 }
 
+// TestMultiConfigExample validates the multi-config example using ParseMultiple
+func TestMultiConfigExample(test *testing.T) {
+	appPath := filepath.Join("..", "..", "examples", "multi-config", "app", "kraze.yml")
+	mlPath := filepath.Join("..", "..", "examples", "multi-config", "ml-stack", "kraze.yml")
+
+	cfg, err := ParseMultiple([]string{appPath, mlPath})
+	if err != nil {
+		test.Fatalf("Failed to parse multi-config example: %v", err)
+	}
+
+	if cfg.Cluster.Name == "" {
+		test.Error("Expected cluster name to be set")
+	}
+
+	// Should contain services from both files
+	if len(cfg.Services) < 4 {
+		test.Errorf("Expected at least 4 services from merged configs, got %d", len(cfg.Services))
+	}
+
+	// App stack services
+	for _, name := range []string{"redis", "postgres"} {
+		if _, ok := cfg.Services[name]; !ok {
+			test.Errorf("Expected app service %q to be present", name)
+		}
+	}
+
+	// ML stack services
+	for _, name := range []string{"vllm", "openwebui"} {
+		if _, ok := cfg.Services[name]; !ok {
+			test.Errorf("Expected ml-stack service %q to be present", name)
+		}
+	}
+
+	// Cross-file dependency: pgvector depends_on postgres (defined in app config)
+	if pgvector, ok := cfg.Services["pgvector"]; ok {
+		found := false
+		for _, dep := range pgvector.DependsOn {
+			if dep == "postgres" {
+				found = true
+			}
+		}
+		if !found {
+			test.Error("Expected pgvector to depend on postgres (cross-file dependency)")
+		}
+	}
+
+	// GPU should be enabled from ml-stack config
+	if !cfg.Cluster.GPU.IsAMDEnabled() {
+		test.Error("Expected AMD GPU to be enabled after merging ml-stack config")
+	}
+}
+
 // TestDependenciesExample specifically tests the dependencies example
 func TestDependenciesExample(test *testing.T) {
 	examplePath := filepath.Join("..", "..", "examples", "dependencies", "kraze.yml")

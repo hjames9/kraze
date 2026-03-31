@@ -754,7 +754,7 @@ func TestConfigPathsRoundTrip(t *testing.T) {
 	clientset := fake.NewSimpleClientset()
 
 	cs := New("test-cluster", false, false, 0, false, 0)
-	cs.SetConfigPath("/home/user/myproject/kraze.yml")
+	cs.SetConfigPaths([]string{"/home/user/myproject/kraze.yml"})
 
 	if err := cs.Save(ctx, clientset); err != nil {
 		t.Fatalf("Failed to save state: %v", err)
@@ -786,17 +786,17 @@ func TestHasConfigPaths(t *testing.T) {
 		t.Error("Expected HasConfigPaths to be false for new state")
 	}
 
-	cs.SetConfigPath("/some/path/kraze.yml")
+	cs.SetConfigPaths([]string{"/some/path/kraze.yml"})
 
 	if !cs.HasConfigPaths() {
-		t.Error("Expected HasConfigPaths to be true after SetConfigPath")
+		t.Error("Expected HasConfigPaths to be true after SetConfigPaths")
 	}
 
-	// SetConfigPath replaces existing paths
-	cs.SetConfigPath("/other/path/kraze.yml")
+	// SetConfigPaths replaces existing paths
+	cs.SetConfigPaths([]string{"/other/path/kraze.yml"})
 	paths := cs.GetConfigPaths()
 	if len(paths) != 1 {
-		t.Errorf("Expected SetConfigPath to replace paths, got %d paths", len(paths))
+		t.Errorf("Expected SetConfigPaths to replace paths, got %d paths", len(paths))
 	}
 	if paths[0] != "/other/path/kraze.yml" {
 		t.Errorf("Expected '/other/path/kraze.yml', got '%s'", paths[0])

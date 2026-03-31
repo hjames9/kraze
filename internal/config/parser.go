@@ -11,19 +11,14 @@ import (
 
 // Parse reads and parses a kraze.yml configuration file
 func Parse(configPath string) (*Config, error) {
-	// Read the file
-	data, err := os.ReadFile(configPath)
+	data, err := readAndExpand(configPath)
 	if err != nil {
-		return nil, fmt.Errorf("failed to read config file: %w", err)
+		return nil, err
 	}
 
-	// Expand environment variables before parsing
-	data = ExpandEnvVarsInBytes(data)
-
-	// Parse YAML
 	var config Config
-	if err := yaml.Unmarshal(data, &config); err != nil {
-		return nil, fmt.Errorf("failed to parse YAML: %w", err)
+	if err := unmarshalConfig(data, &config); err != nil {
+		return nil, err
 	}
 
 	// Set service names from map keys
@@ -43,6 +38,23 @@ func Parse(configPath string) (*Config, error) {
 	}
 
 	return &config, nil
+}
+
+// readAndExpand reads a config file and expands environment variables.
+func readAndExpand(configPath string) ([]byte, error) {
+	data, err := os.ReadFile(configPath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read config file: %w", err)
+	}
+	return ExpandEnvVarsInBytes(data), nil
+}
+
+// unmarshalConfig parses YAML bytes into a Config struct.
+func unmarshalConfig(data []byte, config *Config) error {
+	if err := yaml.Unmarshal(data, config); err != nil {
+		return fmt.Errorf("failed to parse YAML: %w", err)
+	}
+	return nil
 }
 
 // Validate performs validation on the entire configuration
@@ -77,35 +89,7 @@ func (cfg *Config) Validate() error {
 		}
 	}
 
-	// Check for dependency cycles (will be implemented in graph package)
-	// For now, just check that dependencies exist
-	for _, svc := range cfg.Services {
-		for _, dep := range svc.DependsOn {
-			if _, exists := cfg.Services[dep]; !exists {
-				return &ValidationError{
-					Field:   fmt.Sprintf("service '%s' depends_on", svc.Name),
-					Message: fmt.Sprintf("dependency '%s' not found in services", dep),
-				}
-			}
-		}
-	}
-
-	// Validate that enabled services don't depend on disabled services
-	for _, svc := range cfg.Services {
-		if !svc.IsEnabled() {
-			continue
-		}
-		for _, depName := range svc.DependsOn {
-			if depSvc, exists := cfg.Services[depName]; exists && !depSvc.IsEnabled() {
-				return &ValidationError{
-					Field:   fmt.Sprintf("service '%s' depends_on", svc.Name),
-					Message: fmt.Sprintf("depends on disabled service '%s'", depName),
-				}
-			}
-		}
-	}
-
-	return nil
+	return cfg.validateCrossRefs()
 }
 
 // ResolvePaths resolves all relative paths in the configuration to absolute paths

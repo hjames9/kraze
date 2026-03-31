@@ -281,6 +281,9 @@ kraze up redis postgres
 # Use a different config file
 kraze up -f dev.yml
 
+# Merge multiple config files (services from all files combined into one cluster)
+kraze up -f app/kraze.yml -f ml-stack/kraze.yml
+
 # Wait for resources to be ready
 kraze up --wait --timeout 5m
 
@@ -790,7 +793,7 @@ kraze up --no-wait
 
 ### Global Flags
 
-- `-f, --file` - Path to configuration file (default: `kraze.yml`)
+- `-f, --file` - Path to configuration file; can be specified multiple times to merge configs (default: `kraze.yml`)
 - `-v, --verbose` - Enable verbose output
 - `--dry-run` - Show what would happen without executing
 
@@ -815,6 +818,7 @@ See the [examples/](./examples) directory for complete working examples:
 - **[vllm-openwebui/](./examples/vllm-openwebui)** - vLLM + Open WebUI complete local AI stack (v0.7.0+)
 - **[vllm-rag/](./examples/vllm-rag)** - vLLM + pgvector + Open WebUI RAG stack for document-grounded chat (v0.7.0+)
 - **[vllm-rag-amd/](./examples/vllm-rag-amd)** - vLLM + pgvector + Open WebUI RAG stack on AMD GPUs with ROCm (v0.7.0+)
+- **[multi-config/](./examples/multi-config)** - Multiple config files merged into one cluster (app stack + ML/GPU stack)
 
 Validate all examples:
 ```bash
