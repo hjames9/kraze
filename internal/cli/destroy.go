@@ -29,11 +29,15 @@ Services do not need to be uninstalled first - the entire cluster is removed.`,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		ctx := context.Background()
 
-		Verbose("Destroying cluster from config file: %s", configFile)
+		cfgPath, err := resolveConfigFile(cmd)
+		if err != nil {
+			return err
+		}
+		Verbose("Destroying cluster from config file: %s", cfgPath)
 
 		// Parse config file to get cluster name
 		Verbose("Parsing configuration...")
-		cfg, err := config.Parse(configFile)
+		cfg, err := config.Parse(cfgPath)
 		if err != nil {
 			return fmt.Errorf("failed to parse config: %w", err)
 		}

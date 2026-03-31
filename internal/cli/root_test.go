@@ -1,6 +1,8 @@
 package cli
 
 import (
+	"os"
+	"path/filepath"
 	"testing"
 )
 
@@ -209,6 +211,71 @@ func TestLoadImageCommand(test *testing.T) {
 	// Verify it requires at least one argument
 	if loadImageCmd.Args == nil {
 		test.Error("loadImageCmd.Args should be set to require arguments")
+	}
+}
+
+func TestResolveConfigFileExplicitFlag(t *testing.T) {
+	// Create a temp file to use as the config
+	tmp, err := os.CreateTemp("", "kraze-*.yml")
+	if err != nil {
+		t.Fatalf("Failed to create temp file: %v", err)
+	}
+	defer os.Remove(tmp.Name())
+	tmp.Close()
+
+	// Save and restore the global configFile variable
+	orig := configFile
+	defer func() { configFile = orig }()
+
+	configFile = tmp.Name()
+	got, err := resolveConfigFile(rootCmd)
+	if err != nil {
+		t.Fatalf("Expected no error, got: %v", err)
+	}
+
+	want, _ := filepath.Abs(tmp.Name())
+	if got != want {
+		t.Errorf("Expected %q, got %q", want, got)
+	}
+}
+
+func TestResolveConfigFileCwd(t *testing.T) {
+	// Create a temp directory with a kraze.yml file
+	dir, err := os.MkdirTemp("", "kraze-test-*")
+	if err != nil {
+		t.Fatalf("Failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(dir)
+
+	krazeYml := filepath.Join(dir, "kraze.yml")
+	if err := os.WriteFile(krazeYml, []byte("cluster:\n  name: test\n"), 0644); err != nil {
+		t.Fatalf("Failed to write kraze.yml: %v", err)
+	}
+
+	// Change to the temp directory
+	orig, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("Failed to get cwd: %v", err)
+	}
+	defer os.Chdir(orig) //nolint:errcheck
+
+	if err := os.Chdir(dir); err != nil {
+		t.Fatalf("Failed to chdir: %v", err)
+	}
+
+	// Ensure -f is not set
+	origConfigFile := configFile
+	defer func() { configFile = origConfigFile }()
+	configFile = ""
+
+	got, err := resolveConfigFile(rootCmd)
+	if err != nil {
+		t.Fatalf("Expected no error, got: %v", err)
+	}
+
+	want, _ := filepath.Abs("kraze.yml")
+	if got != want {
+		t.Errorf("Expected %q, got %q", want, got)
 	}
 }
 

@@ -702,6 +702,107 @@ func TestMigrationV0ToCurrentVersion(t *testing.T) {
 	}
 }
 
+func TestMigrationV2ToV3(t *testing.T) {
+	ctx := context.Background()
+	clientset := fake.NewSimpleClientset()
+
+	// v2 state has version=2 but no config_paths field
+	v2State := map[string]interface{}{
+		"version":      2,
+		"cluster_name": "test-cluster",
+		"is_external":  false,
+		"services":     map[string]interface{}{},
+		"last_updated": time.Now().Format(time.RFC3339),
+	}
+
+	v2JSON, err := json.Marshal(v2State)
+	if err != nil {
+		t.Fatalf("Failed to marshal v2 state: %v", err)
+	}
+
+	cm := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      ConfigMapName,
+			Namespace: ConfigMapNamespace,
+		},
+		Data: map[string]string{
+			ConfigMapDataKey: string(v2JSON),
+		},
+	}
+	_, err = clientset.CoreV1().ConfigMaps(ConfigMapNamespace).Create(ctx, cm, metav1.CreateOptions{})
+	if err != nil {
+		t.Fatalf("Failed to create ConfigMap: %v", err)
+	}
+
+	loaded, err := Load(ctx, clientset, "test-cluster")
+	if err != nil {
+		t.Fatalf("Failed to load v2 state: %v", err)
+	}
+
+	if loaded.Version != CurrentStateVersion {
+		t.Errorf("Expected version %d after migration, got %d", CurrentStateVersion, loaded.Version)
+	}
+
+	// ConfigPaths should be nil — fallback to -f or cwd behavior
+	if loaded.HasConfigPaths() {
+		t.Error("Expected ConfigPaths to be nil after migration from v2")
+	}
+}
+
+func TestConfigPathsRoundTrip(t *testing.T) {
+	ctx := context.Background()
+	clientset := fake.NewSimpleClientset()
+
+	cs := New("test-cluster", false, false, 0, false, 0)
+	cs.SetConfigPath("/home/user/myproject/kraze.yml")
+
+	if err := cs.Save(ctx, clientset); err != nil {
+		t.Fatalf("Failed to save state: %v", err)
+	}
+
+	loaded, err := Load(ctx, clientset, "test-cluster")
+	if err != nil {
+		t.Fatalf("Failed to load state: %v", err)
+	}
+
+	if !loaded.HasConfigPaths() {
+		t.Fatal("Expected HasConfigPaths to be true after save/load")
+	}
+
+	paths := loaded.GetConfigPaths()
+	if len(paths) != 1 {
+		t.Fatalf("Expected 1 config path, got %d", len(paths))
+	}
+
+	if paths[0] != "/home/user/myproject/kraze.yml" {
+		t.Errorf("Expected '/home/user/myproject/kraze.yml', got '%s'", paths[0])
+	}
+}
+
+func TestHasConfigPaths(t *testing.T) {
+	cs := New("test-cluster", false, false, 0, false, 0)
+
+	if cs.HasConfigPaths() {
+		t.Error("Expected HasConfigPaths to be false for new state")
+	}
+
+	cs.SetConfigPath("/some/path/kraze.yml")
+
+	if !cs.HasConfigPaths() {
+		t.Error("Expected HasConfigPaths to be true after SetConfigPath")
+	}
+
+	// SetConfigPath replaces existing paths
+	cs.SetConfigPath("/other/path/kraze.yml")
+	paths := cs.GetConfigPaths()
+	if len(paths) != 1 {
+		t.Errorf("Expected SetConfigPath to replace paths, got %d paths", len(paths))
+	}
+	if paths[0] != "/other/path/kraze.yml" {
+		t.Errorf("Expected '/other/path/kraze.yml', got '%s'", paths[0])
+	}
+}
+
 func TestMigrationV1ToV2(t *testing.T) {
 	ctx := context.Background()
 	clientset := fake.NewSimpleClientset()
@@ -739,8 +840,8 @@ func TestMigrationV1ToV2(t *testing.T) {
 		t.Fatalf("Failed to load v1 state: %v", err)
 	}
 
-	if loaded.Version != 2 {
-		t.Errorf("Expected version 2 after v1→v2 migration, got %d", loaded.Version)
+	if loaded.Version != CurrentStateVersion {
+		t.Errorf("Expected version %d after v1→current migration, got %d", CurrentStateVersion, loaded.Version)
 	}
 
 	// GPU fields should default to zero values (no GPU) — correct for pre-GPU clusters

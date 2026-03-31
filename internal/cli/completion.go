@@ -9,14 +9,13 @@ import (
 
 // getServiceNames returns a list of service names from the config file for shell completion
 func getServiceNames(cmd *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
-	// Get config file path from flag
-	configFile, _ := cmd.Flags().GetString("file")
-	if configFile == "" {
-		configFile = "kraze.yml"
+	cfgPath, err := resolveConfigFile(cmd)
+	if err != nil {
+		return nil, cobra.ShellCompDirectiveNoFileComp
 	}
 
 	// Parse config
-	cfg, err := config.Parse(configFile)
+	cfg, err := config.Parse(cfgPath)
 	if err != nil {
 		return nil, cobra.ShellCompDirectiveNoFileComp
 	}

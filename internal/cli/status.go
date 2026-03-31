@@ -30,10 +30,14 @@ You can filter services by name or by labels:
 func runStatus(cmd *cobra.Command, args []string) error {
 	ctx := context.Background()
 
-	Verbose("Checking status from config file: %s", configFile)
+	cfgPath, err := resolveConfigFile(cmd)
+	if err != nil {
+		return err
+	}
+	Verbose("Checking status from config file: %s", cfgPath)
 
 	// Parse configuration
-	cfg, err := config.Parse(configFile)
+	cfg, err := config.Parse(cfgPath)
 	if err != nil {
 		return fmt.Errorf("failed to parse config: %w", err)
 	}

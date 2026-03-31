@@ -3,6 +3,7 @@ package cli
 import (
 	"context"
 	"fmt"
+	"path/filepath"
 
 	"github.com/hjames9/kraze/internal/cluster"
 	"github.com/hjames9/kraze/internal/color"
@@ -28,11 +29,15 @@ For external clusters (cluster.external.enabled: true):
 	RunE: func(cmd *cobra.Command, args []string) error {
 		ctx := context.Background()
 
-		Verbose("Initializing cluster from config file: %s", configFile)
+		cfgPath, err := resolveConfigFile(cmd)
+		if err != nil {
+			return err
+		}
+		Verbose("Initializing cluster from config file: %s", cfgPath)
 
 		// Parse config file
 		Verbose("Parsing configuration...")
-		cfg, err := config.Parse(configFile)
+		cfg, err := config.Parse(cfgPath)
 		if err != nil {
 			return fmt.Errorf("failed to parse config: %w", err)
 		}
@@ -159,6 +164,9 @@ For external clusters (cluster.external.enabled: true):
 			amdCount = cfg.Cluster.GPU.AMD.Count
 		}
 		st := state.New(cfg.Cluster.Name, isExternal, nvidiaEnabled, nvidiaCount, amdEnabled, amdCount)
+		if absPath, absErr := filepath.Abs(cfgPath); absErr == nil {
+			st.SetConfigPath(absPath)
+		}
 		if err := st.Save(ctx, clientset); err != nil {
 			return fmt.Errorf("failed to save cluster state: %w", err)
 		}

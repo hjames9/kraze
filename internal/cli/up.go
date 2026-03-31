@@ -3,6 +3,7 @@ package cli
 import (
 	"context"
 	"fmt"
+	"path/filepath"
 	"sync"
 	"time"
 
@@ -45,10 +46,14 @@ You can filter services by name or by labels:
 func runUp(cmd *cobra.Command, args []string) error {
 	ctx := context.Background()
 
-	Verbose("Starting services from config file: %s", configFile)
+	cfgPath, err := resolveConfigFile(cmd)
+	if err != nil {
+		return err
+	}
+	Verbose("Starting services from config file: %s", cfgPath)
 
 	// Parse configuration
-	cfg, err := config.Parse(configFile)
+	cfg, err := config.Parse(cfgPath)
 	if err != nil {
 		return fmt.Errorf("failed to parse config: %w", err)
 	}
@@ -275,6 +280,15 @@ func runUp(cmd *cobra.Command, args []string) error {
 				nvidiaEnabled, nvidiaCount,
 				amdEnabled, amdCount,
 			)
+		}
+	}
+
+	// Store the config path in cluster state so future commands can find it without -f
+	absPath, err := filepath.Abs(cfgPath)
+	if err == nil {
+		st.SetConfigPath(absPath)
+		if saveErr := st.Save(ctx, clientset); saveErr != nil {
+			Verbose("Warning: failed to store config path in cluster state: %v", saveErr)
 		}
 	}
 

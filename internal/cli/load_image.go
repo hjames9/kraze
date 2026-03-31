@@ -43,7 +43,11 @@ func runLoadImage(cmd *cobra.Command, args []string) error {
 	}
 
 	// Parse configuration to get cluster name
-	cfg, err := config.Parse(configFile)
+	cfgPath, err := resolveConfigFile(cmd)
+	if err != nil {
+		return err
+	}
+	cfg, err := config.Parse(cfgPath)
 	if err != nil {
 		return fmt.Errorf("failed to parse config: %w", err)
 	}

@@ -23,7 +23,7 @@ const (
 	ConfigMapDataKey = "metadata"
 
 	// CurrentStateVersion is the current version of the state format
-	CurrentStateVersion = 2
+	CurrentStateVersion = 3
 )
 
 // ClusterState represents the state of deployed services stored in the cluster
@@ -35,6 +35,7 @@ type ClusterState struct {
 	NvidiaGPUCount   int                        `json:"nvidia_gpu_count,omitempty"`   // Number of NVIDIA GPUs configured at creation
 	AMDGPUEnabled    bool                       `json:"amd_gpu_enabled,omitempty"`    // Whether cluster was created with AMD GPU support
 	AMDGPUCount      int                        `json:"amd_gpu_count,omitempty"`      // Number of AMD GPUs configured at creation
+	ConfigPaths      []string                   `json:"config_paths,omitempty"`       // Absolute paths to config files used with this cluster
 	Services         map[string]ServiceMetadata `json:"services"`
 	LastUpdated      time.Time                  `json:"last_updated"`
 }
@@ -100,8 +101,6 @@ func Load(ctx context.Context, clientset kubernetes.Interface, clusterName strin
 
 // migrate handles migration from older state versions to the current version
 func (cs *ClusterState) migrate() error {
-	originalVersion := cs.Version
-
 	// Migrate from v0 (no version field) to v1
 	if cs.Version == 0 {
 		// v0 state had no version field
@@ -117,15 +116,17 @@ func (cs *ClusterState) migrate() error {
 		cs.Version = 2
 	}
 
+	// Migrate from v2 to v3
+	if cs.Version == 2 {
+		// v2 state had no config_paths field.
+		// ConfigPaths defaults to nil — commands fall back to requiring -f or cwd/kraze.yml.
+		cs.Version = 3
+	}
+
 	// Check if version is supported
 	if cs.Version > CurrentStateVersion {
 		return fmt.Errorf("cluster state version %d is newer than supported version %d - please upgrade kraze",
 			cs.Version, CurrentStateVersion)
-	}
-
-	// Log migration if it occurred
-	if originalVersion != cs.Version && originalVersion != 0 {
-		fmt.Printf("Migrated cluster state from version %d to %d\n", originalVersion, cs.Version)
 	}
 
 	return nil
@@ -358,6 +359,22 @@ func (cs *ClusterState) HasImageHashChanged(serviceName, imageName, currentHash 
 
 	// Compare hashes
 	return storedHash != currentHash
+}
+
+// SetConfigPath stores the absolute path to the config file used with this cluster.
+// It replaces any previously stored paths.
+func (cs *ClusterState) SetConfigPath(absPath string) {
+	cs.ConfigPaths = []string{absPath}
+}
+
+// GetConfigPaths returns the stored config file paths for this cluster.
+func (cs *ClusterState) GetConfigPaths() []string {
+	return cs.ConfigPaths
+}
+
+// HasConfigPaths returns true if at least one config path is stored.
+func (cs *ClusterState) HasConfigPaths() bool {
+	return len(cs.ConfigPaths) > 0
 }
 
 // GetChangedImages compares current image hashes with stored hashes
