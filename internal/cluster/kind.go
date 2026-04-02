@@ -2,6 +2,7 @@ package cluster
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	osexec "os/exec"
@@ -23,6 +24,7 @@ import (
 	"sigs.k8s.io/kind/pkg/apis/config/v1alpha4"
 	"sigs.k8s.io/kind/pkg/cluster"
 	"sigs.k8s.io/kind/pkg/cluster/nodeutils"
+	kindexec "sigs.k8s.io/kind/pkg/exec"
 )
 
 // KindManager manages kind cluster operations
@@ -99,7 +101,7 @@ func (kind *KindManager) CreateCluster(ctx context.Context, cfg *config.ClusterC
 
 	// Wait for cluster creation to complete
 	if err := <-createErr; err != nil {
-		return fmt.Errorf("failed to create cluster: %w", err)
+		return fmt.Errorf("failed to create cluster: %w", enrichClusterCreateError(err))
 	}
 
 	fmt.Printf("%s Cluster '%s' created successfully\n", color.Checkmark(), cfg.Name)
@@ -1072,6 +1074,53 @@ Environment="GODEBUG=x509negativeserial=1"
 // validateNvidiaGPUPrerequisites checks that nvidia-container-toolkit is installed.
 // The default Docker runtime no longer needs to be changed — GPU passthrough uses
 // Docker's --gpus flag (DeviceRequests) which works with the standard runc runtime.
+// enrichClusterCreateError inspects the raw error from kind's provider.Create and
+// returns a more actionable message for known failure modes. kind runs docker as a
+// subprocess and only surfaces the exit code in the error string; the actual Docker
+// error message is captured in RunError.Output and is otherwise silently discarded.
+//
+// This is especially important in Docker-outside-of-Docker environments (devcontainers)
+// where pre-flight port checks cannot see the host network namespace.
+func enrichClusterCreateError(err error) error {
+	var runErr *kindexec.RunError
+	if !errors.As(err, &runErr) || len(runErr.Output) == 0 {
+		return err
+	}
+
+	output := string(runErr.Output)
+
+	// Port already in use: "failed to bind host port for 0.0.0.0:8081:172.19.0.2:30801/tcp: address already in use"
+	portRe := regexp.MustCompile(`bind host port for [^:]+:(\d+):[^/]+/(\w+): address already in use`)
+	if m := portRe.FindStringSubmatch(output); m != nil {
+		port, proto := m[1], strings.ToUpper(m[2])
+		ssFlag := "-tlnup"
+		if strings.EqualFold(proto, "UDP") {
+			ssFlag = "-ulnup"
+		}
+		return fmt.Errorf(
+			"host port %s/%s is already in use\n"+
+				"  Another process (or VS Code port forwarding) is holding this port.\n"+
+				"  To find it: ss %s | grep %s\n"+
+				"  Docker output: %s",
+			port, proto, ssFlag, port, strings.TrimSpace(output),
+		)
+	}
+
+	// Device not found: "error gathering device information while adding custom device ... no such file"
+	deviceRe := regexp.MustCompile(`(?i)(no such file|cannot open|device not found)[^\n]*(/dev/\S+)`)
+	if m := deviceRe.FindStringSubmatch(output); m != nil {
+		return fmt.Errorf(
+			"required device %s not found on this host\n"+
+				"  Check that the GPU device exists before starting the cluster.\n"+
+				"  Docker output: %s",
+			m[2], strings.TrimSpace(output),
+		)
+	}
+
+	// Generic fallback: at least show what Docker said.
+	return fmt.Errorf("%w\n  Docker output: %s", err, strings.TrimSpace(output))
+}
+
 func (kind *KindManager) validateNvidiaGPUPrerequisites() error {
 	// Both binaries must be present: nvidia-container-runtime is registered as
 	// containerd's nvidia OCI runtime handler; nvidia-ctk is called by it as an OCI

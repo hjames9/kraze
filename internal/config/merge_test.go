@@ -363,6 +363,293 @@ func TestParseMultipleEmptyPathsError(t *testing.T) {
 	}
 }
 
+func TestParseMultipleKindNodePortMappingsUnion(t *testing.T) {
+	dir := t.TempDir()
+	a := writeTemp(t, dir, "a.yml", `
+cluster:
+  name: dev
+  config:
+    - role: control-plane
+      extraPortMappings:
+        - containerPort: 30080
+          hostPort: 8080
+services:
+  redis:
+    type: manifests
+    path: .
+`)
+	b := writeTemp(t, dir, "b.yml", `
+cluster:
+  name: dev
+  config:
+    - role: control-plane
+      extraPortMappings:
+        - containerPort: 30443
+          hostPort: 8443
+services:
+  postgres:
+    type: manifests
+    path: .
+`)
+	cfg, err := ParseMultiple([]string{a, b})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(cfg.Cluster.Config) != 1 {
+		t.Fatalf("expected 1 node, got %d", len(cfg.Cluster.Config))
+	}
+	if len(cfg.Cluster.Config[0].ExtraPortMappings) != 2 {
+		t.Errorf("expected 2 port mappings after union, got %d", len(cfg.Cluster.Config[0].ExtraPortMappings))
+	}
+}
+
+func TestParseMultipleKindNodePortMappingsDeduplicated(t *testing.T) {
+	dir := t.TempDir()
+	a := writeTemp(t, dir, "a.yml", `
+cluster:
+  name: dev
+  config:
+    - role: control-plane
+      extraPortMappings:
+        - containerPort: 30080
+          hostPort: 8080
+services:
+  redis:
+    type: manifests
+    path: .
+`)
+	b := writeTemp(t, dir, "b.yml", `
+cluster:
+  name: dev
+  config:
+    - role: control-plane
+      extraPortMappings:
+        - containerPort: 30080
+          hostPort: 8080
+services:
+  postgres:
+    type: manifests
+    path: .
+`)
+	cfg, err := ParseMultiple([]string{a, b})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(cfg.Cluster.Config[0].ExtraPortMappings) != 1 {
+		t.Errorf("expected identical port mapping to be deduplicated, got %d", len(cfg.Cluster.Config[0].ExtraPortMappings))
+	}
+}
+
+func TestParseMultipleKindNodePortMappingsConflictError(t *testing.T) {
+	dir := t.TempDir()
+	a := writeTemp(t, dir, "a.yml", `
+cluster:
+  name: dev
+  config:
+    - role: control-plane
+      extraPortMappings:
+        - containerPort: 30080
+          hostPort: 8080
+services:
+  redis:
+    type: manifests
+    path: .
+`)
+	b := writeTemp(t, dir, "b.yml", `
+cluster:
+  name: dev
+  config:
+    - role: control-plane
+      extraPortMappings:
+        - containerPort: 30080
+          hostPort: 9090
+services:
+  postgres:
+    type: manifests
+    path: .
+`)
+	_, err := ParseMultiple([]string{a, b})
+	if err == nil {
+		t.Error("expected error for conflicting hostPort on same containerPort, got nil")
+	}
+}
+
+func TestParseMultipleKindNodeMountsUnion(t *testing.T) {
+	dir := t.TempDir()
+	a := writeTemp(t, dir, "a.yml", `
+cluster:
+  name: dev
+  config:
+    - role: control-plane
+      extraMounts:
+        - hostPath: /host/data
+          containerPath: /data
+services:
+  redis:
+    type: manifests
+    path: .
+`)
+	b := writeTemp(t, dir, "b.yml", `
+cluster:
+  name: dev
+  config:
+    - role: control-plane
+      extraMounts:
+        - hostPath: /host/models
+          containerPath: /models
+services:
+  postgres:
+    type: manifests
+    path: .
+`)
+	cfg, err := ParseMultiple([]string{a, b})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(cfg.Cluster.Config[0].ExtraMounts) != 2 {
+		t.Errorf("expected 2 mounts after union, got %d", len(cfg.Cluster.Config[0].ExtraMounts))
+	}
+}
+
+func TestParseMultipleKindNodeMountsConflictError(t *testing.T) {
+	dir := t.TempDir()
+	a := writeTemp(t, dir, "a.yml", `
+cluster:
+  name: dev
+  config:
+    - role: control-plane
+      extraMounts:
+        - hostPath: /host/data
+          containerPath: /data
+services:
+  redis:
+    type: manifests
+    path: .
+`)
+	b := writeTemp(t, dir, "b.yml", `
+cluster:
+  name: dev
+  config:
+    - role: control-plane
+      extraMounts:
+        - hostPath: /host/other
+          containerPath: /data
+services:
+  postgres:
+    type: manifests
+    path: .
+`)
+	_, err := ParseMultiple([]string{a, b})
+	if err == nil {
+		t.Error("expected error for conflicting hostPath on same containerPath, got nil")
+	}
+}
+
+func TestParseMultipleKindNodeLabelsUnion(t *testing.T) {
+	dir := t.TempDir()
+	a := writeTemp(t, dir, "a.yml", `
+cluster:
+  name: dev
+  config:
+    - role: control-plane
+      labels:
+        app: foo
+services:
+  redis:
+    type: manifests
+    path: .
+`)
+	b := writeTemp(t, dir, "b.yml", `
+cluster:
+  name: dev
+  config:
+    - role: control-plane
+      labels:
+        env: dev
+services:
+  postgres:
+    type: manifests
+    path: .
+`)
+	cfg, err := ParseMultiple([]string{a, b})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	labels := cfg.Cluster.Config[0].Labels
+	if labels["app"] != "foo" || labels["env"] != "dev" {
+		t.Errorf("expected merged labels, got %v", labels)
+	}
+}
+
+func TestParseMultipleKindNodeLabelsConflictError(t *testing.T) {
+	dir := t.TempDir()
+	a := writeTemp(t, dir, "a.yml", `
+cluster:
+  name: dev
+  config:
+    - role: control-plane
+      labels:
+        app: foo
+services:
+  redis:
+    type: manifests
+    path: .
+`)
+	b := writeTemp(t, dir, "b.yml", `
+cluster:
+  name: dev
+  config:
+    - role: control-plane
+      labels:
+        app: bar
+services:
+  postgres:
+    type: manifests
+    path: .
+`)
+	_, err := ParseMultiple([]string{a, b})
+	if err == nil {
+		t.Error("expected error for conflicting label value, got nil")
+	}
+}
+
+func TestParseMultipleKindNodeDistinctRoles(t *testing.T) {
+	dir := t.TempDir()
+	a := writeTemp(t, dir, "a.yml", `
+cluster:
+  name: dev
+  config:
+    - role: control-plane
+      extraPortMappings:
+        - containerPort: 30080
+          hostPort: 8080
+services:
+  redis:
+    type: manifests
+    path: .
+`)
+	b := writeTemp(t, dir, "b.yml", `
+cluster:
+  name: dev
+  config:
+    - role: worker
+      extraMounts:
+        - hostPath: /host/data
+          containerPath: /data
+services:
+  postgres:
+    type: manifests
+    path: .
+`)
+	cfg, err := ParseMultiple([]string{a, b})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(cfg.Cluster.Config) != 2 {
+		t.Errorf("expected 2 nodes (control-plane + worker), got %d", len(cfg.Cluster.Config))
+	}
+}
+
 // splitNoProxy splits a comma-separated no_proxy string into trimmed entries.
 func splitNoProxy(s string) []string {
 	if s == "" {

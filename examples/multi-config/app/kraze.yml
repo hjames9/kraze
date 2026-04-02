@@ -3,6 +3,11 @@
 # This is the primary config file. It owns the cluster definition and
 # deploys the core application services.
 #
+# It also contributes cluster node config: port mappings for the app-layer
+# services and a shared node label. When combined with ml-stack/kraze.yml,
+# the port mappings and labels from both files are merged together —
+# no conflicts, no duplication.
+#
 # Usage (standalone):
 #   kraze up -f app/kraze.yml
 #
@@ -13,6 +18,23 @@
 
 cluster:
   name: dev-cluster
+
+  config:
+    - role: control-plane
+      # Port mappings for app-layer services (redis, postgres).
+      # The ml-stack config adds its own mappings to the same node;
+      # kraze merges them into one list.
+      extraPortMappings:
+        - containerPort: 30379
+          hostPort: 6379
+          protocol: TCP
+        - containerPort: 30432
+          hostPort: 5432
+          protocol: TCP
+      # Labels from both configs are merged. The ml-stack config adds
+      # stack=ml; the result has both labels on the node.
+      labels:
+        team: app
 
 services:
   redis:

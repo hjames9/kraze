@@ -264,6 +264,33 @@ func TestMultiConfigExample(test *testing.T) {
 	if !cfg.Cluster.GPU.IsAMDEnabled() {
 		test.Error("Expected AMD GPU to be enabled after merging ml-stack config")
 	}
+
+	// cluster.config: both files define a control-plane node — they should merge into one.
+	if len(cfg.Cluster.Config) != 1 {
+		test.Fatalf("Expected 1 merged kind node, got %d", len(cfg.Cluster.Config))
+	}
+	node := cfg.Cluster.Config[0]
+
+	// extraPortMappings: app contributes 2 (redis, postgres), ml-stack contributes 2 (vllm, openwebui).
+	if len(node.ExtraPortMappings) != 4 {
+		test.Errorf("Expected 4 merged port mappings, got %d", len(node.ExtraPortMappings))
+	}
+
+	// extraMounts: only ml-stack contributes a mount.
+	if len(node.ExtraMounts) != 1 {
+		test.Errorf("Expected 1 merged mount, got %d", len(node.ExtraMounts))
+	}
+	if len(node.ExtraMounts) > 0 && node.ExtraMounts[0].ContainerPath != "/var/lib/model-cache" {
+		test.Errorf("Expected mount at /var/lib/model-cache, got %q", node.ExtraMounts[0].ContainerPath)
+	}
+
+	// labels: app contributes team=app, ml-stack contributes stack=ml.
+	if node.Labels["team"] != "app" {
+		test.Errorf("Expected label team=app, got %q", node.Labels["team"])
+	}
+	if node.Labels["stack"] != "ml" {
+		test.Errorf("Expected label stack=ml, got %q", node.Labels["stack"])
+	}
 }
 
 // TestDependenciesExample specifically tests the dependencies example

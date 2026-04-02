@@ -158,14 +158,12 @@ func mergeClusterConfigs(configs []*Config) (ClusterConfig, error) {
 			}
 		}
 
-		// Kind node config: first-file wins; error on conflict.
-		if len(other.Config) > 0 {
-			if len(base.Config) == 0 {
-				base.Config = other.Config
-			} else {
-				return ClusterConfig{}, fmt.Errorf("cluster.config (kind nodes) is defined in multiple config files; define it only in the primary config")
-			}
+		// Kind node config: merge per-role (union port mappings, mounts, labels; error on scalar conflicts).
+		mergedNodes, err := mergeKindNodes(base.Config, other.Config, fileIdx)
+		if err != nil {
+			return ClusterConfig{}, err
 		}
+		base.Config = mergedNodes
 
 		// External cluster: must agree.
 		if other.External != nil {
@@ -290,6 +288,157 @@ func mergeStringField(dst *string, src, fieldName string, fileIdx int) error {
 		return fmt.Errorf("%s conflict between config file 1 (%s) and file %d (%s)", fieldName, *dst, fileIdx, src)
 	}
 	return nil
+}
+
+// mergeKindNodes merges two slices of KindNode, matching by role.
+// For each role present in both, per-field rules apply:
+//   - replicas: error on conflict if both non-zero and differ
+//   - extraPortMappings: union; error if same containerPort+protocol has conflicting hostPort/listenAddress
+//   - extraMounts: union; error if same containerPath has conflicting hostPath/readOnly
+//   - labels: union; error if same key has different value
+//
+// Nodes present in only one slice are included as-is.
+func mergeKindNodes(base, other []KindNode, fileIdx int) ([]KindNode, error) {
+	if len(other) == 0 {
+		return base, nil
+	}
+	if len(base) == 0 {
+		return other, nil
+	}
+
+	// Index base nodes by role for O(1) lookup.
+	byRole := make(map[string]int, len(base))
+	result := make([]KindNode, len(base))
+	copy(result, base)
+	for i, n := range result {
+		byRole[n.Role] = i
+	}
+
+	for _, o := range other {
+		idx, exists := byRole[o.Role]
+		if !exists {
+			// Role only in other — append as-is.
+			result = append(result, o)
+			continue
+		}
+		b := &result[idx]
+
+		// replicas: error on conflict.
+		if o.Replicas != 0 {
+			if b.Replicas == 0 {
+				b.Replicas = o.Replicas
+			} else if b.Replicas != o.Replicas {
+				return nil, fmt.Errorf("cluster.config role=%q replicas conflict between config file 1 (%d) and file %d (%d)", o.Role, b.Replicas, fileIdx, o.Replicas)
+			}
+		}
+
+		// extraPortMappings: union with conflict detection.
+		merged, err := mergePortMappings(b.ExtraPortMappings, o.ExtraPortMappings, o.Role, fileIdx)
+		if err != nil {
+			return nil, err
+		}
+		b.ExtraPortMappings = merged
+
+		// extraMounts: union with conflict detection.
+		mergedMounts, err := mergeMounts(b.ExtraMounts, o.ExtraMounts, o.Role, fileIdx)
+		if err != nil {
+			return nil, err
+		}
+		b.ExtraMounts = mergedMounts
+
+		// labels: union with conflict detection.
+		mergedLabels, err := mergeLabels(b.Labels, o.Labels, o.Role, fileIdx)
+		if err != nil {
+			return nil, err
+		}
+		b.Labels = mergedLabels
+	}
+
+	return result, nil
+}
+
+// mergePortMappings unions two PortMapping slices.
+// Conflict: same containerPort+protocol with different hostPort or listenAddress.
+func mergePortMappings(base, other []PortMapping, role string, fileIdx int) ([]PortMapping, error) {
+	if len(other) == 0 {
+		return base, nil
+	}
+
+	// Key: containerPort + "/" + protocol (empty protocol treated as TCP).
+	type key struct {
+		port  int32
+		proto string
+	}
+	index := make(map[key]PortMapping, len(base))
+	result := make([]PortMapping, len(base))
+	copy(result, base)
+	for _, pm := range base {
+		index[key{pm.ContainerPort, pm.Protocol}] = pm
+	}
+
+	for _, pm := range other {
+		k := key{pm.ContainerPort, pm.Protocol}
+		if existing, exists := index[k]; exists {
+			if existing.HostPort != pm.HostPort || existing.ListenAddress != pm.ListenAddress {
+				return nil, fmt.Errorf("cluster.config role=%q extraPortMappings containerPort=%d conflict between config file 1 and file %d", role, pm.ContainerPort, fileIdx)
+			}
+			// Identical — skip duplicate.
+			continue
+		}
+		index[k] = pm
+		result = append(result, pm)
+	}
+
+	return result, nil
+}
+
+// mergeMounts unions two Mount slices.
+// Conflict: same containerPath with different hostPath or readOnly.
+func mergeMounts(base, other []Mount, role string, fileIdx int) ([]Mount, error) {
+	if len(other) == 0 {
+		return base, nil
+	}
+
+	index := make(map[string]Mount, len(base))
+	result := make([]Mount, len(base))
+	copy(result, base)
+	for _, m := range base {
+		index[m.ContainerPath] = m
+	}
+
+	for _, m := range other {
+		if existing, exists := index[m.ContainerPath]; exists {
+			if existing.HostPath != m.HostPath || existing.ReadOnly != m.ReadOnly {
+				return nil, fmt.Errorf("cluster.config role=%q extraMounts containerPath=%q conflict between config file 1 and file %d", role, m.ContainerPath, fileIdx)
+			}
+			continue
+		}
+		index[m.ContainerPath] = m
+		result = append(result, m)
+	}
+
+	return result, nil
+}
+
+// mergeLabels unions two label maps.
+// Conflict: same key with different value.
+func mergeLabels(base, other map[string]string, role string, fileIdx int) (map[string]string, error) {
+	if len(other) == 0 {
+		return base, nil
+	}
+
+	result := make(map[string]string, len(base)+len(other))
+	for k, v := range base {
+		result[k] = v
+	}
+	for k, v := range other {
+		if existing, exists := result[k]; exists && existing != v {
+			return nil, fmt.Errorf("cluster.config role=%q labels key=%q conflict between config file 1 (%q) and file %d (%q)", role, k, existing, fileIdx, v)
+		}
+		result[k] = v
+	}
+
+	return result, nil
 }
 
 // unionStrings returns the union of two string slices with duplicates removed.

@@ -4,15 +4,46 @@
 # primary config (app/kraze.yml) owns cluster identity. GPU config here is
 # merged with the primary — enabling AMD GPU support for the whole cluster.
 #
+# This file also contributes to cluster.config:
+#   - extraPortMappings for vllm and open-webui are merged with the app
+#     stack's port mappings (no conflict, different containerPorts).
+#   - extraMounts exposes a host model cache directory into the node so
+#     vllm can access pre-downloaded weights without re-pulling.
+#   - labels merges stack=ml onto the node alongside team=app from the
+#     primary config.
+#
 # This file is not meant to be used standalone; use it alongside the app config:
 #   kraze up -f app/kraze.yml -f ml-stack/kraze.yml
 
 cluster:
   name: dev-cluster
+
   gpu:
     amd:
       enabled: true
       count: 1
+
+  config:
+    - role: control-plane
+      # Port mappings for ML services — merged with app/kraze.yml's mappings.
+      # After merge the node has all four port mappings (6379, 5432, 8000, 8080).
+      extraPortMappings:
+        - containerPort: 30800
+          hostPort: 8000
+          protocol: TCP
+        - containerPort: 30880
+          hostPort: 8080
+          protocol: TCP
+      # Mount a host directory with pre-downloaded model weights into the
+      # kind node so vllm doesn't need to re-pull on every cluster restart.
+      # Merged with any mounts defined in other config files.
+      extraMounts:
+        - hostPath: /tmp/model-cache
+          containerPath: /var/lib/model-cache
+          readOnly: false
+      # Merged with team=app from the primary config.
+      labels:
+        stack: ml
 
 services:
   pgvector:
