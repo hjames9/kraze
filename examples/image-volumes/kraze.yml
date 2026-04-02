@@ -1,0 +1,30 @@
+# Image Volumes Example
+#
+# Demonstrates Kubernetes image volumes — OCI images mounted directly as pod
+# volumes without copying their contents into the container image. kraze
+# automatically detects image references in volume specs and loads local images
+# into kind before deploying, the same way it handles container images.
+#
+# Common use cases:
+#   - Model weights for ML inference (version independently of the server)
+#   - Configuration or certificate artifacts distributed as OCI images
+#   - Read-only datasets shared across containers
+#
+# Requirements:
+#   Kubernetes 1.33+ (ImageVolume is beta and enabled by default).
+#   For Kubernetes 1.31-1.32, enable the feature gate manually via kubeadm.
+#
+# Usage:
+#   kraze up        # Deploy the server with the image volume attached
+#   kraze status    # Check deployment status
+#   kraze down      # Remove all resources
+
+cluster:
+  name: image-volumes-cluster
+
+services:
+  content-server:
+    type: manifests
+    path: ./k8s/server.yaml
+    namespace: default
+    wait: true

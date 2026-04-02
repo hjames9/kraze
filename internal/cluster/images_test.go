@@ -331,6 +331,53 @@ spec:
       containers:
       - name: migrate
         image: myapp/migrations:v2.0
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: model-server
+spec:
+  volumes:
+  - name: model-weights
+    image:
+      reference: myregistry.io/model:v1.0
+      pullPolicy: IfNotPresent
+  containers:
+  - name: server
+    image: myapp:server
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: inference
+spec:
+  template:
+    spec:
+      volumes:
+      - name: weights
+        image:
+          reference: myregistry.io/weights:latest
+      containers:
+      - name: runner
+        image: myapp:runner
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: scheduled-inference
+spec:
+  schedule: "0 * * * *"
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          volumes:
+          - name: model
+            image:
+              reference: myregistry.io/cronmodel:v2.0
+          containers:
+          - name: job
+            image: myapp:cronjob
 `
 
 	images := im.extractImagesFromManifest(manifest)
@@ -340,6 +387,12 @@ spec:
 		"nginx:alpine",
 		"busybox:latest",
 		"myapp/migrations:v2.0",
+		"myregistry.io/model:v1.0",
+		"myapp:server",
+		"myregistry.io/weights:latest",
+		"myapp:runner",
+		"myregistry.io/cronmodel:v2.0",
+		"myapp:cronjob",
 	}
 
 	if len(images) != len(expectedImages) {
@@ -611,6 +664,129 @@ database:
 		}
 		if !found {
 			test.Errorf("Expected image %q not found in: %v", expected, images)
+		}
+	}
+}
+
+func TestDeepMergeValues(test *testing.T) {
+	base := map[string]interface{}{
+		"worker": map[string]interface{}{
+			"image": map[string]interface{}{
+				"repository": "hjames/ruya_worker",
+				"tag":        "cuda",
+			},
+		},
+		"api": map[string]interface{}{
+			"replicaCount": 2,
+		},
+	}
+	override := map[string]interface{}{
+		"worker": map[string]interface{}{
+			"image": map[string]interface{}{
+				"tag":        "rocm7.2.1-torch2.9.1",
+				"pullPolicy": "IfNotPresent",
+			},
+		},
+	}
+
+	merged := deepMergeValues(base, override)
+
+	workerMap := merged["worker"].(map[string]interface{})
+	imageMap := workerMap["image"].(map[string]interface{})
+
+	if imageMap["repository"] != "hjames/ruya_worker" {
+		test.Errorf("repository: got %v, want hjames/ruya_worker", imageMap["repository"])
+	}
+	if imageMap["tag"] != "rocm7.2.1-torch2.9.1" {
+		test.Errorf("tag: got %v, want rocm7.2.1-torch2.9.1", imageMap["tag"])
+	}
+	if imageMap["pullPolicy"] != "IfNotPresent" {
+		test.Errorf("pullPolicy: got %v, want IfNotPresent", imageMap["pullPolicy"])
+	}
+	apiMap := merged["api"].(map[string]interface{})
+	if apiMap["replicaCount"] != 2 {
+		test.Errorf("replicaCount: got %v, want 2", apiMap["replicaCount"])
+	}
+	// Base must not be mutated
+	workerBase := base["worker"].(map[string]interface{})
+	imageBase := workerBase["image"].(map[string]interface{})
+	if imageBase["tag"] != "cuda" {
+		test.Errorf("base was mutated: tag got %v, want cuda", imageBase["tag"])
+	}
+}
+
+func TestExtractImagesFromLocalChart_ValuesMerge(test *testing.T) {
+	tmpDir := test.TempDir()
+	chartDir := filepath.Join(tmpDir, "mychart")
+	if err := os.MkdirAll(chartDir, 0755); err != nil {
+		test.Fatalf("Failed to create chart dir: %v", err)
+	}
+
+	// Chart defaults: repository defined with a default tag
+	defaultValues := `
+api:
+  image:
+    repository: hjames/ruya
+    tag: latest
+worker:
+  image:
+    repository: hjames/ruya_worker
+    tag: cuda
+`
+	if err := os.WriteFile(filepath.Join(chartDir, "values.yaml"), []byte(defaultValues), 0644); err != nil {
+		test.Fatalf("Failed to write default values: %v", err)
+	}
+
+	// Override: only tag is overridden — no repository key
+	overrideValues := `
+worker:
+  image:
+    tag: rocm7.2.1-torch2.9.1
+    pullPolicy: IfNotPresent
+`
+	overrideFile := filepath.Join(tmpDir, "local.yaml")
+	if err := os.WriteFile(overrideFile, []byte(overrideValues), 0644); err != nil {
+		test.Fatalf("Failed to write override values: %v", err)
+	}
+
+	valuesField := config.ValuesField{}
+	if err := yaml.Unmarshal([]byte(fmt.Sprintf("%q", overrideFile)), &valuesField); err != nil {
+		test.Fatalf("Failed to create ValuesField: %v", err)
+	}
+
+	svc := &config.ServiceConfig{
+		Name:      "ruya",
+		Type:      "helm",
+		Path:      chartDir,
+		Values:    valuesField,
+		Namespace: "kora",
+	}
+
+	im := NewImageManager(false)
+	images, err := im.extractImagesFromLocalChart(svc)
+	if err != nil {
+		test.Fatalf("extractImagesFromLocalChart() error: %v", err)
+	}
+
+	// Must find the merged worker image with the overridden tag
+	expectedImages := []string{"hjames/ruya:latest", "hjames/ruya_worker:rocm7.2.1-torch2.9.1"}
+	for _, expected := range expectedImages {
+		found := false
+		for _, img := range images {
+			if img == expected {
+				found = true
+				break
+			}
+		}
+		if !found {
+			test.Errorf("Expected image %q not found in: %v", expected, images)
+		}
+	}
+
+	// Must NOT contain the unoverridden default tag
+	for _, img := range images {
+		if img == "hjames/ruya_worker:cuda" {
+			test.Errorf("Found default image %q — tag override was not applied", img)
 		}
 	}
 }

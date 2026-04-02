@@ -1,0 +1,55 @@
+# Demonstrates a Kubernetes image volume: an OCI artifact image (web-content)
+# is mounted read-only at /usr/share/nginx/html so nginx serves its contents
+# without the files being bundled into the server image itself.
+#
+# This pattern lets you version the application server (nginx) and the data
+# (web-content) independently — update the content by pushing a new OCI image
+# and rolling the Deployment, without rebuilding the server image.
+#
+# If web-content:v1.0 is a locally-built image (no registry digest), kraze
+# will automatically load it into the kind cluster before applying this manifest.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: content-server
+  labels:
+    app: content-server
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: content-server
+  template:
+    metadata:
+      labels:
+        app: content-server
+    spec:
+      volumes:
+        - name: web-content
+          image:
+            reference: my-org/web-content:v1.0
+            pullPolicy: IfNotPresent
+      containers:
+        - name: server
+          image: nginx:1.25-alpine
+          volumeMounts:
+            - name: web-content
+              mountPath: /usr/share/nginx/html
+              readOnly: true
+          ports:
+            - containerPort: 80
+          resources:
+            requests:
+              memory: "32Mi"
+              cpu: "25m"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: content-server
+spec:
+  selector:
+    app: content-server
+  ports:
+    - port: 80
+      targetPort: 80

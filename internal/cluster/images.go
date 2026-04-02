@@ -1,17 +1,17 @@
 package cluster
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
+	"log/slog"
 	"os"
 	osexec "os/exec"
 	"path/filepath"
 	"regexp"
 	"strings"
-
-	"io"
-	"log/slog"
 
 	"github.com/hjames9/kraze/internal/config"
 	"gopkg.in/yaml.v3"
@@ -24,6 +24,8 @@ import (
 	"helm.sh/helm/v4/pkg/engine"
 	"helm.sh/helm/v4/pkg/registry"
 	ri "helm.sh/helm/v4/pkg/release"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	k8syaml "k8s.io/apimachinery/pkg/util/yaml"
 )
 
 // ImageReference represents a parsed Docker image reference
@@ -534,36 +536,78 @@ func (im *ImageManager) extractImagesFromRemoteChart(ctx context.Context, svc *c
 	return images, nil
 }
 
-func (im *ImageManager) extractImagesFromLocalChart(svc *config.ServiceConfig) ([]string, error) {
-	images := make([]string, 0)
-
-	// Try to extract from values files if specified
-	if !svc.Values.IsEmpty() {
-		for _, valuesFile := range svc.Values.Files() {
-			valuesImages, err := im.ExtractImagesFromValues(valuesFile)
-			if err != nil {
-				if im.verbose {
-					fmt.Printf("Warning: Failed to extract images from values file %s: %v\n", valuesFile, err)
-				}
-			} else {
-				images = append(images, valuesImages...)
+// deepMergeValues merges override into base, recursing into nested maps.
+// Override values take precedence; non-map values in override replace those in base.
+// This mirrors how Helm merges values files so that image tags defined only in an
+// override file are correctly combined with the repository defined in chart defaults.
+func deepMergeValues(base, override map[string]interface{}) map[string]interface{} {
+	result := make(map[string]interface{}, len(base))
+	for k, v := range base {
+		result[k] = v
+	}
+	for k, overrideVal := range override {
+		if baseVal, exists := result[k]; exists {
+			baseMap, baseIsMap := baseVal.(map[string]interface{})
+			overrideMap, overrideIsMap := overrideVal.(map[string]interface{})
+			if baseIsMap && overrideIsMap {
+				result[k] = deepMergeValues(baseMap, overrideMap)
+				continue
 			}
 		}
+		result[k] = overrideVal
 	}
+	return result
+}
 
-	// Try to extract from chart's default values.yaml
+func (im *ImageManager) extractImagesFromLocalChart(svc *config.ServiceConfig) ([]string, error) {
+	// Start with chart's default values.yaml as the base, then deep-merge each
+	// override file on top — exactly as Helm does. This ensures that a tag defined
+	// only in an override file is paired with the repository from the chart defaults.
+	merged := make(map[string]interface{})
+
 	defaultValuesPath := filepath.Join(svc.Path, "values.yaml")
 	if _, err := os.Stat(defaultValuesPath); err == nil {
-		valuesImages, err := im.ExtractImagesFromValues(defaultValuesPath)
+		data, err := os.ReadFile(defaultValuesPath)
 		if err != nil {
 			if im.verbose {
-				fmt.Printf("Warning: Failed to extract images from default values: %v\n", err)
+				fmt.Printf("Warning: Failed to read default values: %v\n", err)
 			}
 		} else {
-			images = append(images, valuesImages...)
+			var base map[string]interface{}
+			if err := yaml.Unmarshal(data, &base); err != nil {
+				if im.verbose {
+					fmt.Printf("Warning: Failed to parse default values: %v\n", err)
+				}
+			} else if base != nil {
+				merged = base
+			}
 		}
 	}
 
+	if !svc.Values.IsEmpty() {
+		for _, valuesFile := range svc.Values.Files() {
+			data, err := os.ReadFile(valuesFile)
+			if err != nil {
+				if im.verbose {
+					fmt.Printf("Warning: Failed to read values file %s: %v\n", valuesFile, err)
+				}
+				continue
+			}
+			var override map[string]interface{}
+			if err := yaml.Unmarshal(data, &override); err != nil {
+				if im.verbose {
+					fmt.Printf("Warning: Failed to parse values file %s: %v\n", valuesFile, err)
+				}
+				continue
+			}
+			if override != nil {
+				merged = deepMergeValues(merged, override)
+			}
+		}
+	}
+
+	images := make([]string, 0)
+	im.extractImagesRecursive(merged, &images)
 	return images, nil
 }
 
@@ -610,11 +654,43 @@ func (im *ImageManager) ExtractImagesFromManifests(manifestPaths []string) ([]st
 	return allImages, nil
 }
 
+// extractImageVolumeRefsRecursive walks an unstructured Kubernetes object looking
+// for image volume nodes: map entries where key == "image" and the value is a map
+// containing a "reference" key. This matches the Kubernetes image volume spec:
+//
+//	volumes:
+//	  - name: foo
+//	    image:
+//	      reference: "registry/image:tag"
+//
+// Container image fields (where "image" maps to a string) are intentionally
+// excluded — those are already handled by the regex pass.
+func extractImageVolumeRefsRecursive(node interface{}, images *[]string) {
+	switch v := node.(type) {
+	case map[string]interface{}:
+		for key, val := range v {
+			if key == "image" {
+				if imgMap, ok := val.(map[string]interface{}); ok {
+					if ref, ok := imgMap["reference"].(string); ok && ref != "" {
+						*images = append(*images, ref)
+						continue // don't recurse further into this image map
+					}
+				}
+			}
+			extractImageVolumeRefsRecursive(val, images)
+		}
+	case []interface{}:
+		for _, item := range v {
+			extractImageVolumeRefsRecursive(item, images)
+		}
+	}
+}
+
 // extractImagesFromManifest extracts image references from Kubernetes YAML manifest
 func (im *ImageManager) extractImagesFromManifest(manifest string) []string {
 	images := make([]string, 0)
 
-	// Use regex to find image fields in YAML
+	// First pass: regex to find container image fields in YAML.
 	// Matches patterns like:
 	//   image: nginx:latest
 	//   image: "nginx:latest"
@@ -631,7 +707,22 @@ func (im *ImageManager) extractImagesFromManifest(manifest string) []string {
 		}
 	}
 
-	return images
+	// Second pass: structured parsing for Kubernetes image volumes
+	// (spec.volumes[].image.reference and deeper equivalents for Deployments,
+	// StatefulSets, CronJobs, etc.). The recursive walker handles any nesting depth.
+	decoder := k8syaml.NewYAMLOrJSONDecoder(bytes.NewReader([]byte(manifest)), 4096)
+	for {
+		obj := &unstructured.Unstructured{}
+		if err := decoder.Decode(obj); err != nil {
+			break // EOF or malformed — regex results are still returned
+		}
+		if obj.Object == nil {
+			continue
+		}
+		extractImageVolumeRefsRecursive(obj.Object, &images)
+	}
+
+	return DeduplicateImages(images)
 }
 
 // FilterLocalImages returns only images that exist in the local Docker daemon
