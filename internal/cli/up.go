@@ -15,6 +15,7 @@ import (
 	"github.com/hjames9/kraze/internal/state"
 	"github.com/hjames9/kraze/internal/ui"
 	"github.com/spf13/cobra"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
 )
 
@@ -575,6 +576,10 @@ func installService(
 			}
 
 			progress.Verbose("%s Images loaded successfully", color.Checkmark())
+
+			// Delete any pods stuck in ImagePullBackOff for the images we just loaded
+			// so Kubernetes recreates them immediately instead of waiting out the backoff.
+			restartImagePullBackOffPods(ctx, clientset, svc.GetNamespace(), imagesToLoad, progress)
 		} else if len(localImages) > 0 {
 			progress.Verbose("All %d local image(s) already loaded (hashes match)", len(localImages))
 		}
@@ -649,6 +654,59 @@ func installService(
 	}
 
 	return nil
+}
+
+// restartImagePullBackOffPods deletes pods in the given namespace that are stuck
+// in ImagePullBackOff or ErrImagePull for one of the just-loaded images. Deleting
+// them causes the ReplicaSet controller to recreate them immediately, bypassing
+// the exponential backoff that would otherwise delay recovery for minutes.
+func restartImagePullBackOffPods(ctx context.Context, clientset kubernetes.Interface, namespace string, loadedImages []string, progress ui.ProgressManager) {
+	if len(loadedImages) == 0 {
+		return
+	}
+
+	// Build a normalized set of loaded image refs for fast lookup
+	type imageKey struct{ registry, repository, tag string }
+	loaded := make(map[imageKey]bool, len(loadedImages))
+	for _, img := range loadedImages {
+		ref := cluster.ParseImageReference(img)
+		loaded[imageKey{ref.Registry, ref.Repository, ref.Tag}] = true
+	}
+
+	pods, err := clientset.CoreV1().Pods(namespace).List(ctx, metav1.ListOptions{})
+	if err != nil {
+		progress.Verbose("Warning: failed to list pods in '%s': %v", namespace, err)
+		return
+	}
+
+	for i := range pods.Items {
+		pod := &pods.Items[i]
+
+		// Collect all container statuses (regular + init)
+		statuses := append(pod.Status.ContainerStatuses, pod.Status.InitContainerStatuses...)
+		for _, cs := range statuses {
+			reason := ""
+			if cs.State.Waiting != nil {
+				reason = cs.State.Waiting.Reason
+			}
+			if reason != "ImagePullBackOff" && reason != "ErrImagePull" {
+				continue
+			}
+
+			ref := cluster.ParseImageReference(cs.Image)
+			if !loaded[imageKey{ref.Registry, ref.Repository, ref.Tag}] {
+				continue
+			}
+
+			progress.Verbose("Deleting pod '%s' stuck in %s for image '%s'", pod.Name, reason, cs.Image)
+			if err := clientset.CoreV1().Pods(namespace).Delete(ctx, pod.Name, metav1.DeleteOptions{}); err != nil {
+				progress.Verbose("Warning: failed to delete pod '%s': %v", pod.Name, err)
+			} else {
+				progress.Verbose("%s Deleted stuck pod '%s' — ReplicaSet will recreate it", color.Checkmark(), pod.Name)
+			}
+			break // one delete per pod is enough
+		}
+	}
 }
 
 func init() {
