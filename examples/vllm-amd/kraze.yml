@@ -7,9 +7,6 @@
 #   - AMD GPU drivers and ROCm runtime installed
 #   - /dev/kfd and /dev/dri/renderD* devices present
 #
-# Find your GPU count:
-#   ls /dev/dri/renderD* | wc -l
-#
 # For gated models (e.g. Meta Llama), set your HuggingFace token after deploying:
 #   kubectl set env deployment/vllm -n vllm HUGGING_FACE_HUB_TOKEN=hf_...
 #
@@ -24,7 +21,6 @@ cluster:
   gpu:
     amd:
       enabled: true
-      count: 1
 
 services:
   amd-device-plugin:

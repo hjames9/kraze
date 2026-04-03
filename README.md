@@ -462,11 +462,9 @@ cluster:
   # Optional: GPU support (v0.7.0+, kind clusters only)
   # gpu:
   #   nvidia:
-  #     enabled: true
-  #     count: 1                      # nvidia-smi -L | wc -l
+  #     enabled: true                 # all GPUs exposed; use CUDA_VISIBLE_DEVICES in pods
   #   amd:
-  #     enabled: true
-  #     count: 1                      # ls /dev/dri/renderD* | wc -l
+  #     enabled: true                 # all GPUs auto-discovered; use ROCR_VISIBLE_DEVICES in pods
 
   # Optional: Use existing cluster (Docker Desktop, Minikube, remote)
   # external:
@@ -654,6 +652,8 @@ kraze can configure kind clusters to expose NVIDIA and/or AMD GPUs to pods. Both
 
 kraze uses Docker's `--gpus all` flag (via DeviceRequests) when creating kind node containers. This works with the standard Docker runtime — the default runtime does **not** need to be changed to `nvidia`.
 
+All GPUs on the host are exposed to the cluster. Use `CUDA_VISIBLE_DEVICES` in pod specs to restrict individual workloads to specific GPUs.
+
 **Host prerequisites:**
 
 - `nvidia-container-toolkit` installed: https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/install-guide.html
@@ -680,7 +680,9 @@ After cluster creation, kraze registers the `nvidia` RuntimeClass so pods can us
 
 #### AMD GPUs
 
-For AMD GPUs, kraze bind-mounts `/dev/kfd` (the ROCm Kernel Fusion Driver, shared across all GPUs) and `/dev/dri/renderD<128+i>` (one per GPU) into each kind node. No Docker runtime changes are needed — standard `runc` handles AMD device bind-mounts.
+For AMD GPUs, kraze bind-mounts `/dev/kfd` (the ROCm Kernel Fusion Driver, shared across all GPUs) and all discovered `/dev/dri/renderD*` nodes into each kind node. No Docker runtime changes are needed — standard `runc` handles AMD device bind-mounts.
+
+All GPUs on the host are exposed to the cluster. Use `ROCR_VISIBLE_DEVICES` or `HIP_VISIBLE_DEVICES` in pod specs to restrict individual workloads to specific GPUs.
 
 **Host prerequisites:**
 
@@ -693,11 +695,6 @@ ls /dev/kfd              # should exist
 ls /dev/dri/renderD*     # should list one device per GPU
 ```
 
-Find your GPU count:
-```bash
-ls /dev/dri/renderD* | wc -l
-```
-
 **Configuration:**
 
 ```yaml
@@ -707,7 +704,6 @@ cluster:
   gpu:
     amd:
       enabled: true
-      count: 1  # Number of GPUs to assign to worker nodes
 ```
 
 #### Multi-node clusters

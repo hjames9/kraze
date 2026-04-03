@@ -194,7 +194,6 @@ cluster:
   gpu:
     amd:
       enabled: true
-      count: 2
 services:
   redis:
     type: manifests
@@ -214,44 +213,6 @@ services:
 	}
 	if !cfg.Cluster.GPU.IsAMDEnabled() {
 		t.Error("expected AMD GPU to be enabled after merge")
-	}
-	if cfg.Cluster.GPU.AMD.Count != 2 {
-		t.Errorf("expected AMD count 2, got %d", cfg.Cluster.GPU.AMD.Count)
-	}
-}
-
-func TestParseMultipleGPUMaxCount(t *testing.T) {
-	dir := t.TempDir()
-	a := writeTemp(t, dir, "a.yml", `
-cluster:
-  name: dev
-  gpu:
-    amd:
-      enabled: true
-      count: 2
-services:
-  redis:
-    type: manifests
-    path: .
-`)
-	b := writeTemp(t, dir, "b.yml", `
-cluster:
-  name: dev
-  gpu:
-    amd:
-      enabled: true
-      count: 4
-services:
-  postgres:
-    type: manifests
-    path: .
-`)
-	cfg, err := ParseMultiple([]string{a, b})
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if cfg.Cluster.GPU.AMD.Count != 4 {
-		t.Errorf("expected max AMD count 4, got %d", cfg.Cluster.GPU.AMD.Count)
 	}
 }
 

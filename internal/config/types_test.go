@@ -162,8 +162,8 @@ func TestGPUConfigIsNvidiaEnabled(test *testing.T) {
 	}{
 		{name: "nil GPU config", gpu: nil, expected: false},
 		{name: "no nvidia section", gpu: &GPUConfig{}, expected: false},
-		{name: "nvidia disabled", gpu: &GPUConfig{Nvidia: &GPUVendorConfig{Enabled: false, Count: 2}}, expected: false},
-		{name: "nvidia enabled", gpu: &GPUConfig{Nvidia: &GPUVendorConfig{Enabled: true, Count: 2}}, expected: true},
+		{name: "nvidia disabled", gpu: &GPUConfig{Nvidia: &GPUVendorConfig{Enabled: false}}, expected: false},
+		{name: "nvidia enabled", gpu: &GPUConfig{Nvidia: &GPUVendorConfig{Enabled: true}}, expected: true},
 	}
 	for _, tt := range tests {
 		test.Run(tt.name, func(test *testing.T) {
@@ -182,8 +182,8 @@ func TestGPUConfigIsAMDEnabled(test *testing.T) {
 	}{
 		{name: "nil GPU config", gpu: nil, expected: false},
 		{name: "no amd section", gpu: &GPUConfig{}, expected: false},
-		{name: "amd disabled", gpu: &GPUConfig{AMD: &GPUVendorConfig{Enabled: false, Count: 2}}, expected: false},
-		{name: "amd enabled", gpu: &GPUConfig{AMD: &GPUVendorConfig{Enabled: true, Count: 2}}, expected: true},
+		{name: "amd disabled", gpu: &GPUConfig{AMD: &GPUVendorConfig{Enabled: false}}, expected: false},
+		{name: "amd enabled", gpu: &GPUConfig{AMD: &GPUVendorConfig{Enabled: true}}, expected: true},
 	}
 	for _, tt := range tests {
 		test.Run(tt.name, func(test *testing.T) {
@@ -202,13 +202,13 @@ func TestGPUConfigIsAnyEnabled(test *testing.T) {
 	}{
 		{name: "nil GPU config", gpu: nil, expected: false},
 		{name: "neither enabled", gpu: &GPUConfig{}, expected: false},
-		{name: "nvidia only", gpu: &GPUConfig{Nvidia: &GPUVendorConfig{Enabled: true, Count: 1}}, expected: true},
-		{name: "amd only", gpu: &GPUConfig{AMD: &GPUVendorConfig{Enabled: true, Count: 1}}, expected: true},
+		{name: "nvidia only", gpu: &GPUConfig{Nvidia: &GPUVendorConfig{Enabled: true}}, expected: true},
+		{name: "amd only", gpu: &GPUConfig{AMD: &GPUVendorConfig{Enabled: true}}, expected: true},
 		{
 			name: "both enabled",
 			gpu: &GPUConfig{
-				Nvidia: &GPUVendorConfig{Enabled: true, Count: 2},
-				AMD:    &GPUVendorConfig{Enabled: true, Count: 1},
+				Nvidia: &GPUVendorConfig{Enabled: true},
+				AMD:    &GPUVendorConfig{Enabled: true},
 			},
 			expected: true,
 		},
@@ -286,29 +286,7 @@ func TestConfigValidate(test *testing.T) {
 			wantErr: true,
 		},
 		{
-			name: "nvidia gpu enabled with valid count",
-			cfg: &Config{
-				Cluster: ClusterConfig{
-					Name: "test",
-					GPU:  &GPUConfig{Nvidia: &GPUVendorConfig{Enabled: true, Count: 2}},
-				},
-				Services: map[string]ServiceConfig{},
-			},
-			wantErr: false,
-		},
-		{
-			name: "nvidia gpu enabled with zero count is valid (count optional for NVIDIA)",
-			cfg: &Config{
-				Cluster: ClusterConfig{
-					Name: "test",
-					GPU:  &GPUConfig{Nvidia: &GPUVendorConfig{Enabled: true, Count: 0}},
-				},
-				Services: map[string]ServiceConfig{},
-			},
-			wantErr: false,
-		},
-		{
-			name: "nvidia gpu enabled without count is valid (gpus: all exposes all GPUs)",
+			name: "nvidia gpu enabled",
 			cfg: &Config{
 				Cluster: ClusterConfig{
 					Name: "test",
@@ -319,26 +297,15 @@ func TestConfigValidate(test *testing.T) {
 			wantErr: false,
 		},
 		{
-			name: "amd gpu enabled with valid count",
+			name: "amd gpu enabled",
 			cfg: &Config{
 				Cluster: ClusterConfig{
 					Name: "test",
-					GPU:  &GPUConfig{AMD: &GPUVendorConfig{Enabled: true, Count: 1}},
+					GPU:  &GPUConfig{AMD: &GPUVendorConfig{Enabled: true}},
 				},
 				Services: map[string]ServiceConfig{},
 			},
 			wantErr: false,
-		},
-		{
-			name: "amd gpu enabled with zero count",
-			cfg: &Config{
-				Cluster: ClusterConfig{
-					Name: "test",
-					GPU:  &GPUConfig{AMD: &GPUVendorConfig{Enabled: true, Count: 0}},
-				},
-				Services: map[string]ServiceConfig{},
-			},
-			wantErr: true,
 		},
 		{
 			name: "both nvidia and amd enabled",
@@ -346,8 +313,8 @@ func TestConfigValidate(test *testing.T) {
 				Cluster: ClusterConfig{
 					Name: "test",
 					GPU: &GPUConfig{
-						Nvidia: &GPUVendorConfig{Enabled: true, Count: 2},
-						AMD:    &GPUVendorConfig{Enabled: true, Count: 1},
+						Nvidia: &GPUVendorConfig{Enabled: true},
+						AMD:    &GPUVendorConfig{Enabled: true},
 					},
 				},
 				Services: map[string]ServiceConfig{},
@@ -355,11 +322,11 @@ func TestConfigValidate(test *testing.T) {
 			wantErr: false,
 		},
 		{
-			name: "nvidia disabled, count irrelevant",
+			name: "nvidia disabled",
 			cfg: &Config{
 				Cluster: ClusterConfig{
 					Name: "test",
-					GPU:  &GPUConfig{Nvidia: &GPUVendorConfig{Enabled: false, Count: 0}},
+					GPU:  &GPUConfig{Nvidia: &GPUVendorConfig{Enabled: false}},
 				},
 				Services: map[string]ServiceConfig{},
 			},
@@ -370,7 +337,7 @@ func TestConfigValidate(test *testing.T) {
 			cfg: &Config{
 				Cluster: ClusterConfig{
 					Name:     "test",
-					GPU:      &GPUConfig{Nvidia: &GPUVendorConfig{Enabled: true, Count: 1}},
+					GPU:      &GPUConfig{Nvidia: &GPUVendorConfig{Enabled: true}},
 					External: &ExternalClusterConfig{Enabled: true},
 				},
 				Services: map[string]ServiceConfig{},
@@ -382,7 +349,7 @@ func TestConfigValidate(test *testing.T) {
 			cfg: &Config{
 				Cluster: ClusterConfig{
 					Name:     "test",
-					GPU:      &GPUConfig{AMD: &GPUVendorConfig{Enabled: true, Count: 1}},
+					GPU:      &GPUConfig{AMD: &GPUVendorConfig{Enabled: true}},
 					External: &ExternalClusterConfig{Enabled: true},
 				},
 				Services: map[string]ServiceConfig{},

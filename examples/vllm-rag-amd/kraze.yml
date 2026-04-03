@@ -15,9 +15,6 @@
 #   - AMD GPU drivers and ROCm runtime installed
 #   - /dev/kfd and /dev/dri/renderD* devices present
 #
-# Find your GPU count:
-#   ls /dev/dri/renderD* | wc -l
-#
 # Usage:
 #   kraze up
 #   kraze port-forward open-webui 8080:8080
@@ -32,7 +29,6 @@ cluster:
   gpu:
     amd:
       enabled: true
-      count: 1  # Number of GPUs to assign to worker nodes
 
 services:
   amd-device-plugin:

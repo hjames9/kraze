@@ -246,40 +246,21 @@ func runUp(cmd *cobra.Command, args []string) error {
 	}
 	if st == nil {
 		nvidiaEnabled := cfg.Cluster.GPU.IsNvidiaEnabled()
-		nvidiaCount := 0
-		if nvidiaEnabled {
-			nvidiaCount = cfg.Cluster.GPU.Nvidia.Count
-		}
 		amdEnabled := cfg.Cluster.GPU.IsAMDEnabled()
-		amdCount := 0
-		if amdEnabled {
-			amdCount = cfg.Cluster.GPU.AMD.Count
-		}
-		st = state.New(cfg.Cluster.Name, cfg.Cluster.IsExternal(), nvidiaEnabled, nvidiaCount, amdEnabled, amdCount)
+		st = state.New(cfg.Cluster.Name, cfg.Cluster.IsExternal(), nvidiaEnabled, 0, amdEnabled, 0)
 	} else if !cfg.Cluster.IsExternal() {
 		// GPU config mismatch check (GPU requires cluster recreation)
 		nvidiaEnabled := cfg.Cluster.GPU.IsNvidiaEnabled()
-		nvidiaCount := 0
-		if nvidiaEnabled {
-			nvidiaCount = cfg.Cluster.GPU.Nvidia.Count
-		}
 		amdEnabled := cfg.Cluster.GPU.IsAMDEnabled()
-		amdCount := 0
-		if amdEnabled {
-			amdCount = cfg.Cluster.GPU.AMD.Count
-		}
-		if st.NvidiaGPUEnabled != nvidiaEnabled || (nvidiaEnabled && st.NvidiaGPUCount != nvidiaCount) ||
-			st.AMDGPUEnabled != amdEnabled || (amdEnabled && st.AMDGPUCount != amdCount) {
+		if st.NvidiaGPUEnabled != nvidiaEnabled || st.AMDGPUEnabled != amdEnabled {
 			return fmt.Errorf(
 				"GPU configuration has changed since cluster '%s' was created.\n"+
-					"Was:  nvidia(enabled=%v count=%d) amd(enabled=%v count=%d)\n"+
-					"Now:  nvidia(enabled=%v count=%d) amd(enabled=%v count=%d)\n"+
+					"Was:  nvidia(enabled=%v) amd(enabled=%v)\n"+
+					"Now:  nvidia(enabled=%v) amd(enabled=%v)\n"+
 					"GPU support requires cluster recreation. Run: kraze destroy && kraze up",
 				cfg.Cluster.Name,
-				st.NvidiaGPUEnabled, st.NvidiaGPUCount,
-				st.AMDGPUEnabled, st.AMDGPUCount,
-				nvidiaEnabled, nvidiaCount,
-				amdEnabled, amdCount,
+				st.NvidiaGPUEnabled, st.AMDGPUEnabled,
+				nvidiaEnabled, amdEnabled,
 			)
 		}
 	}

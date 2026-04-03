@@ -641,7 +641,7 @@ func TestBuildNvidiaGPUMounts(test *testing.T) {
 			name: "nvidia disabled returns nil",
 			config: &config.ClusterConfig{
 				Name: "test",
-				GPU:  &config.GPUConfig{Nvidia: &config.GPUVendorConfig{Enabled: false, Count: 2}},
+				GPU:  &config.GPUConfig{Nvidia: &config.GPUVendorConfig{Enabled: false}},
 			},
 			wantZero: true,
 		},
@@ -649,7 +649,7 @@ func TestBuildNvidiaGPUMounts(test *testing.T) {
 			name: "nvidia enabled: mounts depend on what toolkit binaries are in PATH",
 			config: &config.ClusterConfig{
 				Name: "test",
-				GPU:  &config.GPUConfig{Nvidia: &config.GPUVendorConfig{Enabled: true, Count: 1}},
+				GPU:  &config.GPUConfig{Nvidia: &config.GPUVendorConfig{Enabled: true}},
 			},
 			// Result depends on whether nvidia-ctk/nvidia-cdi-hook are installed on the test host.
 			// We verify mount paths are well-formed when present.
@@ -710,7 +710,7 @@ func TestBuildAMDGPUMounts(test *testing.T) {
 			name: "amd disabled",
 			config: &config.ClusterConfig{
 				Name: "test",
-				GPU:  &config.GPUConfig{AMD: &config.GPUVendorConfig{Enabled: false, Count: 2}},
+				GPU:  &config.GPUConfig{AMD: &config.GPUVendorConfig{Enabled: false}},
 			},
 			validate: func(test *testing.T, mounts []v1alpha4.Mount) {
 				if len(mounts) != 0 {
@@ -719,47 +719,26 @@ func TestBuildAMDGPUMounts(test *testing.T) {
 			},
 		},
 		{
-			name: "single AMD GPU",
+			name: "amd enabled: always includes /dev/kfd, auto-discovers renderD devices",
 			config: &config.ClusterConfig{
 				Name: "test",
-				GPU:  &config.GPUConfig{AMD: &config.GPUVendorConfig{Enabled: true, Count: 1}},
+				GPU:  &config.GPUConfig{AMD: &config.GPUVendorConfig{Enabled: true}},
 			},
 			validate: func(test *testing.T, mounts []v1alpha4.Mount) {
-				// Expect /dev/kfd + renderD128
-				if len(mounts) != 2 {
-					test.Fatalf("Expected 2 mounts for 1 AMD GPU, got %d", len(mounts))
+				// Must always include /dev/kfd as the first mount.
+				if len(mounts) == 0 {
+					test.Fatal("Expected at least 1 mount (/dev/kfd) for enabled AMD GPU, got 0")
 				}
 				if mounts[0].HostPath != "/dev/kfd" || mounts[0].ContainerPath != "/dev/kfd" {
 					test.Errorf("Mount[0]: expected /dev/kfd, got HostPath=%q ContainerPath=%q",
 						mounts[0].HostPath, mounts[0].ContainerPath)
 				}
-				if mounts[1].HostPath != "/dev/dri/renderD128" || mounts[1].ContainerPath != "/dev/dri/renderD128" {
-					test.Errorf("Mount[1]: expected /dev/dri/renderD128, got HostPath=%q ContainerPath=%q",
-						mounts[1].HostPath, mounts[1].ContainerPath)
-				}
-			},
-		},
-		{
-			name: "multiple AMD GPUs indexed from 128",
-			config: &config.ClusterConfig{
-				Name: "test",
-				GPU:  &config.GPUConfig{AMD: &config.GPUVendorConfig{Enabled: true, Count: 3}},
-			},
-			validate: func(test *testing.T, mounts []v1alpha4.Mount) {
-				// Expect /dev/kfd + renderD128, renderD129, renderD130
-				if len(mounts) != 4 {
-					test.Fatalf("Expected 4 mounts for 3 AMD GPUs, got %d", len(mounts))
-				}
-				if mounts[0].HostPath != "/dev/kfd" {
-					test.Errorf("Mount[0]: expected /dev/kfd, got %q", mounts[0].HostPath)
-				}
-				for i := 0; i < 3; i++ {
+				// Additional mounts must follow the renderD128+i naming convention.
+				for i, m := range mounts[1:] {
 					expected := fmt.Sprintf("/dev/dri/renderD%d", 128+i)
-					if mounts[i+1].HostPath != expected {
-						test.Errorf("Mount[%d].HostPath: got %q, want %q", i+1, mounts[i+1].HostPath, expected)
-					}
-					if mounts[i+1].ContainerPath != expected {
-						test.Errorf("Mount[%d].ContainerPath: got %q, want %q", i+1, mounts[i+1].ContainerPath, expected)
+					if m.HostPath != expected || m.ContainerPath != expected {
+						test.Errorf("Mount[%d]: expected %q, got HostPath=%q ContainerPath=%q",
+							i+1, expected, m.HostPath, m.ContainerPath)
 					}
 				}
 			},
@@ -948,7 +927,7 @@ func TestBuildKindConfigWithGPU(test *testing.T) {
 			name: "NVIDIA GPU on default single node sets GPUs field",
 			config: &config.ClusterConfig{
 				Name: "test",
-				GPU:  &config.GPUConfig{Nvidia: &config.GPUVendorConfig{Enabled: true, Count: 2}},
+				GPU:  &config.GPUConfig{Nvidia: &config.GPUVendorConfig{Enabled: true}},
 			},
 			validate: func(test *testing.T, cluster *v1alpha4.Cluster) {
 				if len(cluster.Nodes) != 1 {
@@ -964,7 +943,7 @@ func TestBuildKindConfigWithGPU(test *testing.T) {
 			name: "NVIDIA GPUs field only on worker nodes in multi-node config",
 			config: &config.ClusterConfig{
 				Name: "test",
-				GPU:  &config.GPUConfig{Nvidia: &config.GPUVendorConfig{Enabled: true, Count: 1}},
+				GPU:  &config.GPUConfig{Nvidia: &config.GPUVendorConfig{Enabled: true}},
 				Config: []config.KindNode{
 					{Role: "control-plane"},
 					{Role: "worker"},
@@ -988,7 +967,7 @@ func TestBuildKindConfigWithGPU(test *testing.T) {
 			name: "NVIDIA GPUs field on all workers with replicas",
 			config: &config.ClusterConfig{
 				Name: "test",
-				GPU:  &config.GPUConfig{Nvidia: &config.GPUVendorConfig{Enabled: true, Count: 2}},
+				GPU:  &config.GPUConfig{Nvidia: &config.GPUVendorConfig{Enabled: true}},
 				Config: []config.KindNode{
 					{Role: "control-plane"},
 					{Role: "worker", Replicas: 3},

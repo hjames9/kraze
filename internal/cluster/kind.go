@@ -54,7 +54,7 @@ func (kind *KindManager) CreateCluster(ctx context.Context, cfg *config.ClusterC
 		}
 	}
 	if cfg.GPU.IsAMDEnabled() {
-		if err := kind.validateAMDGPUPrerequisites(cfg.GPU.AMD.Count); err != nil {
+		if err := kind.validateAMDGPUPrerequisites(); err != nil {
 			return fmt.Errorf("AMD GPU prerequisite check failed: %w", err)
 		}
 	}
@@ -1011,21 +1011,27 @@ func (kind *KindManager) buildNvidiaGPUMounts(cfg *config.ClusterConfig) []v1alp
 
 // buildAMDGPUMounts produces bind-mounts for AMD GPU device files.
 //
+// All available GPU devices are mounted so the cluster has full access to host
+// hardware. Applications should use ROCR_VISIBLE_DEVICES or HIP_VISIBLE_DEVICES
+// to restrict which GPUs a workload uses.
+//
 //   - /dev/kfd is the Kernel Fusion Driver shared by all AMD GPUs (required by ROCm).
+//     It exposes all GPUs regardless, so restricting by device count provides no isolation.
 //   - /dev/dri/renderD<128+i> is the DRM render node for GPU i.
 //     renderD numbering always starts at 128 on Linux.
 func (kind *KindManager) buildAMDGPUMounts(cfg *config.ClusterConfig) []v1alpha4.Mount {
 	if !cfg.GPU.IsAMDEnabled() {
 		return nil
 	}
-	count := cfg.GPU.AMD.Count
-	mounts := make([]v1alpha4.Mount, 0, 1+count)
-	mounts = append(mounts, v1alpha4.Mount{
+	mounts := []v1alpha4.Mount{{
 		HostPath:      "/dev/kfd",
 		ContainerPath: "/dev/kfd",
-	})
-	for i := 0; i < count; i++ {
+	}}
+	for i := 0; ; i++ {
 		device := fmt.Sprintf("/dev/dri/renderD%d", 128+i)
+		if _, err := os.Stat(device); err != nil {
+			break
+		}
 		mounts = append(mounts, v1alpha4.Mount{
 			HostPath:      device,
 			ContainerPath: device,
@@ -1140,8 +1146,8 @@ func (kind *KindManager) validateNvidiaGPUPrerequisites() error {
 // validateAMDGPUPrerequisites verifies the host has the AMD GPU device files
 // required for kind GPU passthrough:
 //   - /dev/kfd: Kernel Fusion Driver, shared interface for all AMD GPUs (required by ROCm)
-//   - /dev/dri/renderD<128+i>: DRM render node, one per GPU (starts at renderD128)
-func (kind *KindManager) validateAMDGPUPrerequisites(gpuCount int) error {
+//   - /dev/dri/renderD128: at least one DRM render node must be present
+func (kind *KindManager) validateAMDGPUPrerequisites() error {
 	const prereqHelp = `
 Ensure the ROCm stack and AMDGPU kernel driver are installed on the host:
   https://rocm.docs.amd.com/en/latest/deploy/linux/index.html
@@ -1156,17 +1162,11 @@ After installation, verify:
 		return fmt.Errorf("failed to stat /dev/kfd: %w", err)
 	}
 
-	for i := 0; i < gpuCount; i++ {
-		device := fmt.Sprintf("/dev/dri/renderD%d", 128+i)
-		if _, err := os.Stat(device); err != nil {
-			if os.IsNotExist(err) {
-				return fmt.Errorf(
-					"%s not found — expected %d GPU(s) but device for GPU %d is missing%s",
-					device, gpuCount, i, prereqHelp,
-				)
-			}
-			return fmt.Errorf("failed to stat %s: %w", device, err)
+	if _, err := os.Stat("/dev/dri/renderD128"); err != nil {
+		if os.IsNotExist(err) {
+			return fmt.Errorf("/dev/dri/renderD128 not found — no AMD GPUs detected%s", prereqHelp)
 		}
+		return fmt.Errorf("failed to stat /dev/dri/renderD128: %w", err)
 	}
 
 	return nil

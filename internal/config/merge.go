@@ -84,12 +84,6 @@ func parseWithoutCrossRefValidation(configPath string) (*Config, error) {
 			Message: "GPU support is only available for kind clusters, not external clusters",
 		}
 	}
-	if cfg.Cluster.GPU.IsAMDEnabled() && cfg.Cluster.GPU.AMD.Count <= 0 {
-		return nil, &ValidationError{
-			Field:   "cluster.gpu.amd.count",
-			Message: "count must be a positive integer when amd.enabled is true",
-		}
-	}
 
 	// Validate individual service configs (type, required fields) but not cross-refs.
 	for _, svc := range cfg.Services {
@@ -139,7 +133,7 @@ func mergeClusterConfigs(configs []*Config) (ClusterConfig, error) {
 		base.InsecureRegistries = unionStrings(base.InsecureRegistries, other.InsecureRegistries)
 		base.PreloadImages = unionStrings(base.PreloadImages, other.PreloadImages)
 
-		// GPU: OR per-vendor, max count.
+		// GPU: OR per-vendor enabled flags.
 		base.GPU = mergeGPUConfigs(base.GPU, other.GPU)
 
 		// Proxy: conflict detection for enabled flag and URLs.
@@ -191,7 +185,7 @@ func mergeClusterConfigs(configs []*Config) (ClusterConfig, error) {
 	return base, nil
 }
 
-// mergeGPUConfigs merges two GPU configs using OR logic per vendor and max count.
+// mergeGPUConfigs merges two GPU configs using OR logic per vendor.
 func mergeGPUConfigs(a, b *GPUConfig) *GPUConfig {
 	if a == nil && b == nil {
 		return nil
@@ -208,24 +202,14 @@ func mergeGPUConfigs(a, b *GPUConfig) *GPUConfig {
 		if result.Nvidia == nil {
 			result.Nvidia = b.Nvidia
 		} else {
-			enabled := result.Nvidia.Enabled || b.Nvidia.Enabled
-			count := result.Nvidia.Count
-			if b.Nvidia.Count > count {
-				count = b.Nvidia.Count
-			}
-			result.Nvidia = &GPUVendorConfig{Enabled: enabled, Count: count}
+			result.Nvidia = &GPUVendorConfig{Enabled: result.Nvidia.Enabled || b.Nvidia.Enabled}
 		}
 	}
 	if b.AMD != nil {
 		if result.AMD == nil {
 			result.AMD = b.AMD
 		} else {
-			enabled := result.AMD.Enabled || b.AMD.Enabled
-			count := result.AMD.Count
-			if b.AMD.Count > count {
-				count = b.AMD.Count
-			}
-			result.AMD = &GPUVendorConfig{Enabled: enabled, Count: count}
+			result.AMD = &GPUVendorConfig{Enabled: result.AMD.Enabled || b.AMD.Enabled}
 		}
 	}
 	return result

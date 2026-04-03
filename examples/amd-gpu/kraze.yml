@@ -1,8 +1,8 @@
 # AMD GPU cluster example
 #
-# Find your GPU count:
-#   ls /dev/dri/renderD*              # one renderD device per GPU (starting at renderD128)
-#   ls /dev/dri/renderD* | wc -l     # prints the count
+# kraze auto-discovers all AMD GPUs on the host and mounts them into the cluster.
+# Use ROCR_VISIBLE_DEVICES or HIP_VISIBLE_DEVICES in your workloads to restrict
+# which GPUs a specific pod uses.
 #
 # Prerequisites on the host:
 #   - AMD GPU drivers and ROCm runtime installed
@@ -19,7 +19,6 @@ cluster:
   gpu:
     amd:
       enabled: true
-      count: 1  # Number of GPUs to assign to worker nodes
 
 services:
   amd-device-plugin:

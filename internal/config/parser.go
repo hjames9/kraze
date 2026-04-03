@@ -72,14 +72,6 @@ func (cfg *Config) Validate() error {
 				Message: "GPU support is only available for kind clusters, not external clusters",
 			}
 		}
-		// count is not validated for NVIDIA — gpus: "all" exposes all host GPUs regardless.
-		// count is retained in config for potential future use (e.g. specifying a subset).
-		if cfg.Cluster.GPU.IsAMDEnabled() && cfg.Cluster.GPU.AMD.Count <= 0 {
-			return &ValidationError{
-				Field:   "cluster.gpu.amd.count",
-				Message: "count must be a positive integer when amd.enabled is true",
-			}
-		}
 	}
 
 	// Validate each service

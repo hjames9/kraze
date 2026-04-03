@@ -21,7 +21,6 @@ cluster:
   gpu:
     amd:
       enabled: true
-      count: 1
 
   config:
     - role: control-plane

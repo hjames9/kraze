@@ -7,9 +7,6 @@
 #   - AMD GPU drivers and ROCm runtime installed
 #   - /dev/kfd and /dev/dri/renderD* devices present
 #
-# Find your GPU count:
-#   ls /dev/dri/renderD* | wc -l
-#
 # Usage:
 #   kraze up
 #   kubectl logs amd-rocminfo    # should list your GPU(s) under "ROCk - Kernel Fusion Driver"
@@ -21,7 +18,6 @@ cluster:
   gpu:
     amd:
       enabled: true
-      count: 1
 
 services:
   amd-device-plugin:

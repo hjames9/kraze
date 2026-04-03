@@ -74,10 +74,9 @@ type GPUConfig struct {
 	AMD    *GPUVendorConfig `yaml:"amd,omitempty"`    // AMD GPU support
 }
 
-// GPUVendorConfig holds the enabled flag and GPU count for a single vendor.
+// GPUVendorConfig holds the enabled flag for a single GPU vendor.
 type GPUVendorConfig struct {
 	Enabled bool `yaml:"enabled"`
-	Count   int  `yaml:"count,omitempty"` // Required when enabled
 }
 
 // IsNvidiaEnabled returns true if NVIDIA GPU support is enabled.
