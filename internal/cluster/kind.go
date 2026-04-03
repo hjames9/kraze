@@ -23,7 +23,7 @@ import (
 	"sigs.k8s.io/kind/pkg/apis/config/defaults"
 	"sigs.k8s.io/kind/pkg/apis/config/v1alpha4"
 	"sigs.k8s.io/kind/pkg/cluster"
-	"sigs.k8s.io/kind/pkg/cluster/nodeutils"
+	"sigs.k8s.io/kind/pkg/cluster/images"
 	kindexec "sigs.k8s.io/kind/pkg/exec"
 )
 
@@ -685,21 +685,15 @@ func (kind *KindManager) LoadImage(ctx context.Context, clusterName, imageName s
 		return fmt.Errorf("failed to save image '%s': %w (make sure the image exists locally)", imageName, err)
 	}
 
-	// Load the image onto all nodes
-	for _, node := range nodes {
-		// Open the tar file for reading
-		imageFile, err := os.Open(imageTar)
-		if err != nil {
-			return fmt.Errorf("failed to open image tar: %w", err)
+	// Load the image onto all nodes using layer-aware transfer
+	results, err := images.LoadImageLayerAware(imageTar, nodes, nil)
+	if err != nil {
+		return fmt.Errorf("failed to load image '%s': %w", imageName, err)
+	}
+	for _, result := range results {
+		if result.Error != nil {
+			return fmt.Errorf("failed to load image onto node %s: %w", result.Node.String(), result.Error)
 		}
-		defer imageFile.Close()
-
-		if err := nodeutils.LoadImageArchive(node, imageFile); err != nil {
-			return fmt.Errorf("failed to load image onto node %s: %w", node.String(), err)
-		}
-
-		// Close and reopen for next node
-		imageFile.Close()
 	}
 
 	return nil
