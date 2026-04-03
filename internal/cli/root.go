@@ -62,6 +62,7 @@ func init() {
 	rootCmd.AddCommand(validateCmd)
 	rootCmd.AddCommand(planCmd)
 	rootCmd.AddCommand(loadImageCmd)
+	rootCmd.AddCommand(listImagesCmd)
 	rootCmd.AddCommand(portForwardCmd)
 	rootCmd.AddCommand(completionCmd)
 }

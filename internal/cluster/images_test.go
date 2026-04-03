@@ -668,6 +668,107 @@ database:
 	}
 }
 
+func TestParseClusterImages(test *testing.T) {
+	tests := []struct {
+		name     string
+		input    string
+		expected []ClusterImage
+		wantErr  bool
+	}{
+		{
+			name: "multiple images with repo tags",
+			input: `{
+				"images": [
+					{
+						"id": "sha256:abc123def456",
+						"repoTags": ["docker.io/hjames/ruya_worker:rocm7.2.1-torch2.9.1"],
+						"size": "8800000000"
+					},
+					{
+						"id": "sha256:deadbeef1234",
+						"repoTags": ["docker.io/hjames/ruya_models:yolo11s.pt-whisper-large-v3-pyannote"],
+						"size": "13200000000"
+					}
+				]
+			}`,
+			expected: []ClusterImage{
+				{ID: "sha256:abc123def456", RepoTags: []string{"docker.io/hjames/ruya_worker:rocm7.2.1-torch2.9.1"}, Size: "8800000000"},
+				{ID: "sha256:deadbeef1234", RepoTags: []string{"docker.io/hjames/ruya_models:yolo11s.pt-whisper-large-v3-pyannote"}, Size: "13200000000"},
+			},
+		},
+		{
+			name: "image with multiple repo tags",
+			input: `{
+				"images": [
+					{
+						"id": "sha256:abc123",
+						"repoTags": ["docker.io/myapp:latest", "docker.io/myapp:v1.0"],
+						"size": "100000000"
+					}
+				]
+			}`,
+			expected: []ClusterImage{
+				{ID: "sha256:abc123", RepoTags: []string{"docker.io/myapp:latest", "docker.io/myapp:v1.0"}, Size: "100000000"},
+			},
+		},
+		{
+			name: "image with no repo tags",
+			input: `{
+				"images": [
+					{
+						"id": "sha256:orphan1234",
+						"repoTags": [],
+						"size": "50000000"
+					}
+				]
+			}`,
+			expected: []ClusterImage{
+				{ID: "sha256:orphan1234", RepoTags: []string{}, Size: "50000000"},
+			},
+		},
+		{
+			name:     "empty image list",
+			input:    `{"images": []}`,
+			expected: []ClusterImage{},
+		},
+		{
+			name:    "invalid JSON",
+			input:   `not json`,
+			wantErr: true,
+		},
+	}
+
+	for _, tt := range tests {
+		test.Run(tt.name, func(test *testing.T) {
+			result, err := parseClusterImages([]byte(tt.input))
+
+			if tt.wantErr {
+				if err == nil {
+					test.Error("expected error, got nil")
+				}
+				return
+			}
+			if err != nil {
+				test.Fatalf("unexpected error: %v", err)
+			}
+			if len(result) != len(tt.expected) {
+				test.Fatalf("got %d images, want %d", len(result), len(tt.expected))
+			}
+			for i, img := range result {
+				if img.ID != tt.expected[i].ID {
+					test.Errorf("[%d] ID: got %q, want %q", i, img.ID, tt.expected[i].ID)
+				}
+				if img.Size != tt.expected[i].Size {
+					test.Errorf("[%d] Size: got %q, want %q", i, img.Size, tt.expected[i].Size)
+				}
+				if len(img.RepoTags) != len(tt.expected[i].RepoTags) {
+					test.Errorf("[%d] RepoTags len: got %d, want %d", i, len(img.RepoTags), len(tt.expected[i].RepoTags))
+				}
+			}
+		})
+	}
+}
+
 func TestDeepMergeValues(test *testing.T) {
 	base := map[string]interface{}{
 		"worker": map[string]interface{}{
@@ -826,6 +927,45 @@ func TestExtractImagesRecursive(test *testing.T) {
 		test.Errorf("Expected %d images, got %d: %v", len(expectedImages), len(images), images)
 	}
 
+	for _, expected := range expectedImages {
+		found := false
+		for _, img := range images {
+			if img == expected {
+				found = true
+				break
+			}
+		}
+		if !found {
+			test.Errorf("Expected image %q not found in: %v", expected, images)
+		}
+	}
+}
+
+func TestExtractImagesRecursive_FlatStringImage(test *testing.T) {
+	im := NewImageManager(false)
+
+	// Flat string image reference — used for image volumes and other patterns
+	// where the full image ref is a single string rather than repository+tag fields.
+	// e.g. worker.models.image: "hjames/ruya_models:yolo11s.pt-whisper-large-v3"
+	data := map[string]interface{}{
+		"worker": map[string]interface{}{
+			"image": map[string]interface{}{
+				"repository": "hjames/ruya_worker",
+				"tag":        "rocm7.2.1",
+			},
+			"models": map[string]interface{}{
+				"image": "hjames/ruya_models:yolo11s.pt-whisper-large-v3-pyannote",
+			},
+		},
+	}
+
+	images := make([]string, 0)
+	im.extractImagesRecursive(data, &images)
+
+	expectedImages := []string{
+		"hjames/ruya_worker:rocm7.2.1",
+		"hjames/ruya_models:yolo11s.pt-whisper-large-v3-pyannote",
+	}
 	for _, expected := range expectedImages {
 		found := false
 		for _, img := range images {

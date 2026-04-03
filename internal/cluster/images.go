@@ -208,8 +208,8 @@ func (im *ImageManager) GetClusterImageHash(ctx context.Context, clusterName, im
 	// Get the control plane container name
 	containerName := clusterName + "-control-plane"
 
-	// Check if image exists in cluster using crictl
-	cmd := osexec.CommandContext(ctx, "docker", "exec", containerName, "crictl", "inspect", clusterImageName)
+	// Check if image exists in cluster using crictl inspecti (inspect image, not container)
+	cmd := osexec.CommandContext(ctx, "docker", "exec", containerName, "crictl", "inspecti", clusterImageName)
 	output, err := cmd.Output()
 
 	if err != nil {
@@ -217,7 +217,7 @@ func (im *ImageManager) GetClusterImageHash(ctx context.Context, clusterName, im
 		return "", nil
 	}
 
-	// Parse crictl inspect output to get image ID
+	// Parse crictl inspecti output to get image ID
 	var inspectData struct {
 		Status struct {
 			ID string `json:"id"`
@@ -225,10 +225,55 @@ func (im *ImageManager) GetClusterImageHash(ctx context.Context, clusterName, im
 	}
 
 	if err := json.Unmarshal(output, &inspectData); err != nil {
-		return "", fmt.Errorf("failed to parse crictl inspect output: %w", err)
+		return "", fmt.Errorf("failed to parse crictl inspecti output: %w", err)
 	}
 
 	return inspectData.Status.ID, nil
+}
+
+// ClusterImage represents an image loaded in a kind cluster node
+type ClusterImage struct {
+	ID       string
+	RepoTags []string
+	Size     string
+}
+
+// ListClusterImages returns all images currently loaded in the kind cluster
+func (im *ImageManager) ListClusterImages(ctx context.Context, clusterName string) ([]ClusterImage, error) {
+	containerName := clusterName + "-control-plane"
+
+	cmd := osexec.CommandContext(ctx, "docker", "exec", containerName, "crictl", "images", "-o", "json")
+	output, err := cmd.Output()
+	if err != nil {
+		return nil, fmt.Errorf("failed to list cluster images: %w", err)
+	}
+
+	return parseClusterImages(output)
+}
+
+// parseClusterImages parses the JSON output of `crictl images -o json`
+func parseClusterImages(output []byte) ([]ClusterImage, error) {
+	var result struct {
+		Images []struct {
+			ID       string   `json:"id"`
+			RepoTags []string `json:"repoTags"`
+			Size     string   `json:"size"`
+		} `json:"images"`
+	}
+
+	if err := json.Unmarshal(output, &result); err != nil {
+		return nil, fmt.Errorf("failed to parse crictl images output: %w", err)
+	}
+
+	images := make([]ClusterImage, 0, len(result.Images))
+	for _, img := range result.Images {
+		images = append(images, ClusterImage{
+			ID:       img.ID,
+			RepoTags: img.RepoTags,
+			Size:     img.Size,
+		})
+	}
+	return images, nil
 }
 
 // ExtractImagesFromValues extracts image references from a Helm values file
@@ -280,6 +325,13 @@ func (im *ImageManager) ExtractImagesFromValues(valuesPath string) ([]string, er
 func (im *ImageManager) extractImagesRecursive(data interface{}, images *[]string) {
 	switch v := data.(type) {
 	case map[string]interface{}:
+		// Flat string image reference: image: "registry/repo:tag"
+		// Used for image volumes and other non-standard patterns where the full
+		// image reference is a single string rather than repository+tag fields.
+		if imgStr, ok := v["image"].(string); ok && imgStr != "" {
+			*images = append(*images, imgStr)
+		}
+
 		// Check if this looks like an image definition
 		if repo, hasRepo := v["repository"].(string); hasRepo && repo != "" {
 			var tag string
