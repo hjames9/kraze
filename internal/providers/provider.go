@@ -27,6 +27,12 @@ import (
 	"k8s.io/client-go/tools/clientcmd"
 )
 
+// imagePullGracePeriod is how long to tolerate ImagePullBackOff / ErrImagePull on a pod
+// before treating it as a hard failure. This covers the window between kraze loading an
+// image into kind and containerd finishing its indexing — during which a newly-created pod
+// can transiently hit a pull error even though the image is already present locally.
+const imagePullGracePeriod = 30 * time.Second
+
 // Provider is the interface that all service providers must implement
 type Provider interface {
 	// Install installs a service
@@ -614,6 +620,9 @@ func waitForResourceReady(ctx context.Context, dynamicClient dynamic.Interface, 
 	// Track whether we've seen the resource at least once
 	resourceSeen := false
 
+	// Per-pod grace period tracking for image-pull failures (see checkControlledPodsForFailures)
+	imagePullFailFirstSeen := make(map[string]time.Time)
+
 	// Poll until ready
 	ticker := time.NewTicker(2 * time.Second)
 	defer ticker.Stop()
@@ -675,7 +684,7 @@ func waitForResourceReady(ctx context.Context, dynamicClient dynamic.Interface, 
 				}
 			} else if kind == "Deployment" || kind == "StatefulSet" || kind == "DaemonSet" || kind == "Job" {
 				// Check Pods controlled by this resource
-				if err := checkControlledPodsForFailures(ctx, clientset, current, kind); err != nil {
+				if err := checkControlledPodsForFailures(ctx, clientset, current, kind, imagePullFailFirstSeen); err != nil {
 					return err
 				}
 			}
@@ -869,8 +878,27 @@ func isPodReady(obj *unstructured.Unstructured, status map[string]interface{}) (
 	return false, nil
 }
 
-// checkControlledPodsForFailures checks Pods controlled by a Deployment/StatefulSet/etc for failures
-func checkControlledPodsForFailures(ctx context.Context, clientset *kubernetes.Clientset, obj *unstructured.Unstructured, kind string) error {
+// isImagePullFailure returns true when the failure message comes from an image-pull error.
+// These can be transient immediately after kraze loads a local image into kind.
+func isImagePullFailure(msg string) bool {
+	return strings.Contains(msg, "ImagePullBackOff") || strings.Contains(msg, "ErrImagePull")
+}
+
+// withinImagePullGracePeriod records the first time a pod is seen in an image-pull failure
+// and returns true while the pod is still within imagePullGracePeriod. It returns false once
+// the grace period has elapsed, at which point the caller should surface the failure.
+// podKey should be "namespace/name". firstSeen is mutated in place.
+func withinImagePullGracePeriod(podKey string, firstSeen map[string]time.Time) bool {
+	if _, seen := firstSeen[podKey]; !seen {
+		firstSeen[podKey] = time.Now()
+	}
+	return time.Since(firstSeen[podKey]) < imagePullGracePeriod
+}
+
+// checkControlledPodsForFailures checks Pods controlled by a Deployment/StatefulSet/etc for failures.
+// imagePullFailFirstSeen tracks the first time each pod (namespace/name) was seen in an image-pull
+// failure state so that transient pull errors are tolerated for imagePullGracePeriod before failing.
+func checkControlledPodsForFailures(ctx context.Context, clientset *kubernetes.Clientset, obj *unstructured.Unstructured, kind string, imagePullFailFirstSeen map[string]time.Time) error {
 	namespace := obj.GetNamespace()
 
 	// Get the selector for finding Pods
@@ -912,8 +940,26 @@ func checkControlledPodsForFailures(ctx context.Context, clientset *kubernetes.C
 			continue
 		}
 
+		podKey := pod.Namespace + "/" + pod.Name
+
 		// Check for failure using typed Pod object
 		if failed, failureMsg := checkTypedPodFailureState(&pod); failed {
+			if isImagePullFailure(failureMsg) {
+				// On the first time we see this pod in an image-pull failure, delete it
+				// immediately. This resets Kubernetes' exponential backoff timer so the
+				// replacement pod gets a fresh pull attempt right away, rather than
+				// waiting minutes for the backoff to expire. It also ensures the pod we
+				// eventually diagnose (if the failure persists) was created during this
+				// run and has fresh, relevant events.
+				if _, seen := imagePullFailFirstSeen[podKey]; !seen {
+					_ = clientset.CoreV1().Pods(pod.Namespace).Delete(ctx, pod.Name, metav1.DeleteOptions{})
+				}
+				// Wait out the grace period before treating this as a hard failure.
+				if withinImagePullGracePeriod(podKey, imagePullFailFirstSeen) {
+					continue
+				}
+			}
+
 			// Create minimal unstructured for displayPodDiagnostics
 			podUnstructured := &unstructured.Unstructured{}
 			podUnstructured.SetNamespace(pod.Namespace)
@@ -921,6 +967,10 @@ func checkControlledPodsForFailures(ctx context.Context, clientset *kubernetes.C
 
 			displayPodDiagnostics(ctx, clientset, podUnstructured, failureMsg)
 			return fmt.Errorf("%s has failing pod %s: %s", kind, pod.Name, failureMsg)
+		} else {
+			// Pod recovered — clear any grace period state so a future failure on
+			// this pod name starts a fresh timer.
+			delete(imagePullFailFirstSeen, podKey)
 		}
 	}
 
@@ -1102,6 +1152,18 @@ func checkPodFailureState(obj *unstructured.Unstructured) (bool, string) {
 }
 
 // getPodEvents fetches recent events for a Pod
+// isEventRecent returns true if the event falls within the given cutoff window.
+// It prefers LastTimestamp (set for most events) and falls back to EventTime
+// (the newer microsecond-precision field). Events with no timestamp pass through
+// so they are never silently dropped.
+func isEventRecent(event corev1.Event, cutoff time.Time) bool {
+	ts := event.LastTimestamp.Time
+	if ts.IsZero() {
+		ts = event.EventTime.Time
+	}
+	return ts.IsZero() || !ts.Before(cutoff)
+}
+
 func getPodEvents(ctx context.Context, clientset *kubernetes.Clientset, namespace, podName string, limit int) ([]string, error) {
 	events, err := clientset.CoreV1().Events(namespace).List(ctx, metav1.ListOptions{
 		FieldSelector: fmt.Sprintf("involvedObject.name=%s,involvedObject.kind=Pod", podName),
@@ -1110,11 +1172,17 @@ func getPodEvents(ctx context.Context, clientset *kubernetes.Clientset, namespac
 		return nil, err
 	}
 
-	// Sort events by timestamp (most recent first) and limit
+	// Collect the most recent events, skipping anything older than 5 minutes.
+	// This avoids surfacing accumulated backoff events from previous runs or
+	// earlier retry cycles that are no longer relevant to the current failure.
+	cutoff := time.Now().Add(-5 * time.Minute)
 	var eventMsgs []string
 	count := 0
 	for i := len(events.Items) - 1; i >= 0 && count < limit; i-- {
 		event := events.Items[i]
+		if !isEventRecent(event, cutoff) {
+			continue
+		}
 		eventMsgs = append(eventMsgs, fmt.Sprintf("  - %s: %s", event.Reason, event.Message))
 		count++
 	}

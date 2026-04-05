@@ -557,15 +557,16 @@ func installService(
 			}
 
 			progress.Verbose("%s Images loaded successfully", color.Checkmark())
-
-			// Delete any pods stuck in ImagePullBackOff for the images we just loaded
-			// so Kubernetes recreates them immediately instead of waiting out the backoff.
-			restartImagePullBackOffPods(ctx, clientset, svc.GetNamespace(), imagesToLoad, progress)
 		} else if len(localImages) > 0 {
 			progress.Verbose("All %d local image(s) already loaded (hashes match)", len(localImages))
 		}
 
 		dockerMutex.Unlock()
+
+		// Restart any pods stuck in ImagePullBackOff for this service's images.
+		// Using serviceImages (not just imagesToLoad) covers images that were already
+		// in the cluster — stale stuck pods from previous runs won't be caught otherwise.
+		restartImagePullBackOffPods(ctx, clientset, svc.GetNamespace(), serviceImages, progress)
 
 		// Store image hashes in state for future comparisons
 		if len(imageHashes) > 0 {
