@@ -39,10 +39,11 @@ type ImageReference struct {
 
 // ImageInfo contains metadata about a Docker image
 type ImageInfo struct {
-	Reference ImageReference
-	SHA256    string // Image digest/hash from Docker
-	IsLocal   bool   // Whether image exists in local Docker daemon
-	Size      int64  // Image size in bytes
+	Reference     ImageReference
+	SHA256        string // Image digest/hash from Docker
+	IsLocal       bool   // True if image was built locally (no RepoDigests — never pushed to a registry)
+	InLocalDaemon bool   // True if image physically exists in the local Docker daemon (built or pulled)
+	Size          int64  // Image size in bytes
 }
 
 // ImageManager handles image detection, loading, and management
@@ -146,10 +147,12 @@ func (im *ImageManager) GetImageInfo(ctx context.Context, imageName string) (*Im
 	output, err := cmd.Output()
 
 	if err != nil {
-		// Image doesn't exist locally
-		info.IsLocal = false
+		// Image doesn't exist in the local Docker daemon
 		return info, nil
 	}
+
+	// Image exists in the local Docker daemon regardless of its origin.
+	info.InLocalDaemon = true
 
 	// Parse docker inspect output to get image details
 	var inspectData []struct {
@@ -176,10 +179,11 @@ func (im *ImageManager) GetImageInfo(ctx context.Context, imageName string) (*Im
 			if len(digestParts) == 2 {
 				info.SHA256 = digestParts[1]
 			}
-			// Image has a registry source — kind can pull it directly, no need to load
-			info.IsLocal = false
+			// Image was pulled from a registry (has RepoDigests).
+			// IsLocal stays false — it describes origin, not daemon presence.
+			// InLocalDaemon is already true (set above).
 		} else {
-			// No repo digests means the image was built locally and never pushed to a registry
+			// No repo digests — image was built locally and never pushed to a registry.
 			info.IsLocal = true
 		}
 	}
@@ -617,21 +621,36 @@ func (im *ImageManager) extractImagesFromLocalChart(svc *config.ServiceConfig) (
 	// only in an override file is paired with the repository from the chart defaults.
 	merged := make(map[string]interface{})
 
-	defaultValuesPath := filepath.Join(svc.Path, "values.yaml")
-	if _, err := os.Stat(defaultValuesPath); err == nil {
-		data, err := os.ReadFile(defaultValuesPath)
+	isArchive := strings.HasSuffix(svc.Path, ".tgz") || strings.HasSuffix(svc.Path, ".tar.gz")
+
+	if isArchive {
+		// Packed chart archive (.tgz/.tar.gz) — use Helm's v2 loader to get default values
+		archChart, err := v2loader.Load(svc.Path)
 		if err != nil {
 			if im.verbose {
-				fmt.Printf("Warning: Failed to read default values: %v\n", err)
+				fmt.Printf("Warning: Failed to load chart archive %s: %v\n", svc.Path, err)
 			}
-		} else {
-			var base map[string]interface{}
-			if err := yaml.Unmarshal(data, &base); err != nil {
+		} else if archChart.Values != nil {
+			merged = archChart.Values
+		}
+	} else {
+		// Directory-based chart — read values.yaml directly
+		defaultValuesPath := filepath.Join(svc.Path, "values.yaml")
+		if _, err := os.Stat(defaultValuesPath); err == nil {
+			data, err := os.ReadFile(defaultValuesPath)
+			if err != nil {
 				if im.verbose {
-					fmt.Printf("Warning: Failed to parse default values: %v\n", err)
+					fmt.Printf("Warning: Failed to read default values: %v\n", err)
 				}
-			} else if base != nil {
-				merged = base
+			} else {
+				var base map[string]interface{}
+				if err := yaml.Unmarshal(data, &base); err != nil {
+					if im.verbose {
+						fmt.Printf("Warning: Failed to parse default values: %v\n", err)
+					}
+				} else if base != nil {
+					merged = base
+				}
 			}
 		}
 	}

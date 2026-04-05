@@ -576,6 +576,78 @@ func (helm *HelmProvider) addHTTPRepository(repoURL string) (string, error) {
 	return repoName, nil
 }
 
+// NewHelmProviderForPacking creates a minimal HelmProvider that can pull charts
+// without a live Kubernetes cluster. Suitable for use by the pack command.
+func NewHelmProviderForPacking(verbose bool) *HelmProvider {
+	return &HelmProvider{
+		settings: cli.New(),
+		opts: &ProviderOptions{
+			Verbose: verbose,
+		},
+	}
+}
+
+// PullChartToDir downloads a remote Helm chart (OCI or HTTPS) as a .tgz file
+// to destDir. Returns the absolute path to the downloaded .tgz.
+// Does not require a live Kubernetes cluster.
+func (helm *HelmProvider) PullChartToDir(service *config.ServiceConfig, destDir string) (string, error) {
+	if !service.IsRemoteChart() {
+		return "", fmt.Errorf("service %q is not a remote Helm chart", service.Name)
+	}
+
+	// Build a minimal action config: registry client only, no kubeconfig.
+	actionConfig := action.NewConfiguration()
+	registryClient, err := registry.NewClient(
+		registry.ClientOptDebug(helm.opts.Verbose),
+		registry.ClientOptCredentialsFile(helm.settings.RegistryConfig),
+	)
+	if err != nil {
+		return "", fmt.Errorf("failed to create registry client: %w", err)
+	}
+	actionConfig.RegistryClient = registryClient
+
+	pull := action.NewPull(action.WithConfig(actionConfig))
+	pull.Settings = helm.settings
+	pull.DestDir = destDir
+	pull.Untar = false
+	if service.Version != "" {
+		pull.Version = service.Version
+	}
+
+	var chartRef string
+	if config.IsOCIURL(service.Repo) {
+		chartRef = fmt.Sprintf("%s/%s", service.Repo, service.Chart)
+	} else if config.IsHTTPURL(service.Repo) {
+		repoName, err := helm.addHTTPRepository(service.Repo)
+		if err != nil {
+			return "", fmt.Errorf("failed to add repository %s: %w", service.Repo, err)
+		}
+		chartRef = fmt.Sprintf("%s/%s", repoName, service.Chart)
+	} else {
+		return "", fmt.Errorf("unsupported repo URL: %s", service.Repo)
+	}
+
+	if helm.opts.Verbose {
+		fmt.Printf("Pulling chart %q to %s\n", chartRef, destDir)
+	}
+
+	if _, err = pull.Run(chartRef); err != nil {
+		return "", fmt.Errorf("failed to pull chart %q: %w", chartRef, err)
+	}
+
+	// Find the downloaded .tgz file in destDir.
+	entries, err := os.ReadDir(destDir)
+	if err != nil {
+		return "", fmt.Errorf("failed to read %s: %w", destDir, err)
+	}
+	for _, e := range entries {
+		if !e.IsDir() && strings.HasSuffix(e.Name(), ".tgz") {
+			return filepath.Join(destDir, e.Name()), nil
+		}
+	}
+	return "", fmt.Errorf("no .tgz found in %s after pulling %q", destDir, chartRef)
+}
+
 // generateRepoName generates a unique repository name from URL
 func generateRepoName(repoURL string) string {
 	// Remove protocol

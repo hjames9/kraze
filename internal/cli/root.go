@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"github.com/hjames9/kraze/internal/cluster"
+	"github.com/hjames9/kraze/internal/pack"
 	"github.com/hjames9/kraze/internal/providers"
 	"github.com/hjames9/kraze/internal/state"
 	"github.com/spf13/cobra"
@@ -65,6 +66,7 @@ func init() {
 	rootCmd.AddCommand(listImagesCmd)
 	rootCmd.AddCommand(portForwardCmd)
 	rootCmd.AddCommand(completionCmd)
+	rootCmd.AddCommand(packCmd)
 }
 
 // resolveConfigFiles returns the absolute paths to the config files to use.
@@ -145,7 +147,7 @@ func resolveConfigFiles(cmd *cobra.Command) ([]string, error) {
 	switch len(viableClusters) {
 	case 0:
 		if krazeClusterFound {
-			return nil, fmt.Errorf("kraze cluster found but no config path stored — run 'kraze up -f <config>' to register it, or use -f to specify the config file")
+			return nil, fmt.Errorf("no valid config path found for the kraze cluster — use -f to specify the config file (e.g. kraze status -f kraze.yml or kraze status -f package.tgz)")
 		}
 		return []string{"kraze.yml"}, nil
 	case 1:
@@ -159,6 +161,22 @@ func resolveConfigFiles(cmd *cobra.Command) ([]string, error) {
 		}
 		return nil, fmt.Errorf("%s", msg)
 	}
+}
+
+// resolveAndExtractConfigFiles resolves config files and transparently extracts
+// any pack archive (.tar.gz/.tgz) to a temp directory. The caller must defer
+// the returned cleanup function to remove the temp directory.
+// For non-archive configs the cleanup is a no-op and paths are unchanged.
+func resolveAndExtractConfigFiles(cmd *cobra.Command) ([]string, func(), error) {
+	paths, err := resolveConfigFiles(cmd)
+	if err != nil {
+		return nil, func() {}, err
+	}
+	extracted, cleanup, err := pack.MaybeExtract(paths)
+	if err != nil {
+		return nil, func() {}, err
+	}
+	return extracted, cleanup, nil
 }
 
 // SetVersionInfo sets the version information for the CLI

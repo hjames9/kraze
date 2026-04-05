@@ -489,11 +489,29 @@ func (manifest *ManifestsProvider) applyResource(ctx context.Context, obj *unstr
 		return nil
 	}
 
-	// Resource exists, update it
-	// Preserve the resourceVersion for optimistic concurrency control
-	obj.SetResourceVersion(existing.GetResourceVersion())
-	_, err = client.Update(ctx, obj, metav1.UpdateOptions{})
-	return err
+	// Resource exists — update it. Kubernetes controllers continuously update resource
+	// status, so the resourceVersion can change between our Get and Update. Retry on
+	// 409 Conflict by re-fetching the latest version each time.
+	const maxUpdateRetries = 5
+	latest := existing
+	for attempt := range maxUpdateRetries {
+		obj.SetResourceVersion(latest.GetResourceVersion())
+		_, err = client.Update(ctx, obj, metav1.UpdateOptions{})
+		if err == nil {
+			return nil
+		}
+		if !errors.IsConflict(err) {
+			return err
+		}
+		// Conflict: re-fetch and retry
+		if attempt < maxUpdateRetries-1 {
+			latest, err = client.Get(ctx, name, metav1.GetOptions{})
+			if err != nil {
+				return fmt.Errorf("failed to re-fetch resource after conflict: %w", err)
+			}
+		}
+	}
+	return fmt.Errorf("failed to update resource after %d attempts due to conflicts: %w", maxUpdateRetries, err)
 }
 
 // deleteResource deletes a resource using the dynamic client

@@ -1,6 +1,8 @@
 package cluster
 
 import (
+	"archive/tar"
+	"compress/gzip"
 	"context"
 	"fmt"
 	"os"
@@ -889,6 +891,146 @@ worker:
 		if img == "hjames/ruya_worker:cuda" {
 			test.Errorf("Found default image %q — tag override was not applied", img)
 		}
+	}
+}
+
+// makeChartTGZ creates a minimal valid Helm chart .tgz archive in dir and
+// returns the path to the file. chartName is used as both the chart name and
+// the top-level directory inside the archive.
+func makeChartTGZ(t *testing.T, dir, chartName string, valuesYAML string) string {
+	t.Helper()
+
+	chartYAML := fmt.Sprintf("apiVersion: v2\nname: %s\nversion: 0.1.0\n", chartName)
+
+	tgzPath := filepath.Join(dir, chartName+"-0.1.0.tgz")
+	f, err := os.Create(tgzPath)
+	if err != nil {
+		t.Fatalf("create tgz: %v", err)
+	}
+	defer f.Close()
+
+	gw, _ := gzip.NewWriterLevel(f, gzip.BestSpeed)
+	tw := tar.NewWriter(gw)
+
+	writeFile := func(name, body string) {
+		hdr := &tar.Header{
+			Name: chartName + "/" + name,
+			Mode: 0644,
+			Size: int64(len(body)),
+		}
+		if err := tw.WriteHeader(hdr); err != nil {
+			t.Fatalf("tar header %s: %v", name, err)
+		}
+		if _, err := tw.Write([]byte(body)); err != nil {
+			t.Fatalf("tar write %s: %v", name, err)
+		}
+	}
+
+	writeFile("Chart.yaml", chartYAML)
+	writeFile("values.yaml", valuesYAML)
+
+	if err := tw.Close(); err != nil {
+		t.Fatalf("tar close: %v", err)
+	}
+	if err := gw.Close(); err != nil {
+		t.Fatalf("gzip close: %v", err)
+	}
+	return tgzPath
+}
+
+func TestExtractImagesFromLocalChart_TGZArchive(test *testing.T) {
+	tmpDir := test.TempDir()
+
+	valuesYAML := `
+image:
+  repository: myrepo/myservice
+  tag: "2.5.0"
+sidecar:
+  image:
+    repository: myrepo/sidecar
+    tag: latest
+`
+	tgzPath := makeChartTGZ(test, tmpDir, "myservice", valuesYAML)
+
+	svc := &config.ServiceConfig{
+		Name:      "myservice",
+		Type:      "helm",
+		Path:      tgzPath,
+		Namespace: "default",
+	}
+
+	im := NewImageManager(false)
+	images, err := im.extractImagesFromLocalChart(svc)
+	if err != nil {
+		test.Fatalf("extractImagesFromLocalChart() error: %v", err)
+	}
+
+	expected := []string{"myrepo/myservice:2.5.0", "myrepo/sidecar:latest"}
+	for _, want := range expected {
+		found := false
+		for _, got := range images {
+			if got == want {
+				found = true
+				break
+			}
+		}
+		if !found {
+			test.Errorf("expected image %q not found in: %v", want, images)
+		}
+	}
+}
+
+func TestExtractImagesFromLocalChart_TGZArchive_WithValuesOverride(test *testing.T) {
+	tmpDir := test.TempDir()
+
+	defaultValues := `
+image:
+  repository: myrepo/myservice
+  tag: "1.0.0"
+`
+	tgzPath := makeChartTGZ(test, tmpDir, "myservice", defaultValues)
+
+	overrideValues := `
+image:
+  tag: "2.0.0"
+`
+	overrideFile := filepath.Join(tmpDir, "override.yaml")
+	if err := os.WriteFile(overrideFile, []byte(overrideValues), 0644); err != nil {
+		test.Fatalf("write override: %v", err)
+	}
+
+	valuesField := config.ValuesField{}
+	if err := yaml.Unmarshal([]byte(fmt.Sprintf("%q", overrideFile)), &valuesField); err != nil {
+		test.Fatalf("ValuesField: %v", err)
+	}
+
+	svc := &config.ServiceConfig{
+		Name:      "myservice",
+		Type:      "helm",
+		Path:      tgzPath,
+		Values:    valuesField,
+		Namespace: "default",
+	}
+
+	im := NewImageManager(false)
+	images, err := im.extractImagesFromLocalChart(svc)
+	if err != nil {
+		test.Fatalf("extractImagesFromLocalChart() error: %v", err)
+	}
+
+	for _, img := range images {
+		if img == "myrepo/myservice:1.0.0" {
+			test.Errorf("default tag was not overridden; got %v", images)
+		}
+	}
+	found := false
+	for _, img := range images {
+		if img == "myrepo/myservice:2.0.0" {
+			found = true
+		}
+	}
+	if !found {
+		test.Errorf("overridden image myrepo/myservice:2.0.0 not found in: %v", images)
 	}
 }
 

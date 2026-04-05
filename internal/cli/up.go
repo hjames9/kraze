@@ -11,6 +11,7 @@ import (
 	"github.com/hjames9/kraze/internal/color"
 	"github.com/hjames9/kraze/internal/config"
 	"github.com/hjames9/kraze/internal/graph"
+	"github.com/hjames9/kraze/internal/pack"
 	"github.com/hjames9/kraze/internal/providers"
 	"github.com/hjames9/kraze/internal/state"
 	"github.com/hjames9/kraze/internal/ui"
@@ -51,6 +52,17 @@ func runUp(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return err
 	}
+
+	// Keep the original paths (archive or yml) to persist in cluster state so
+	// future commands can re-resolve the config without -f.
+	originalCfgPaths := cfgPaths
+
+	cfgPaths, cleanupPack, err := pack.MaybeExtract(cfgPaths)
+	if err != nil {
+		return err
+	}
+	defer cleanupPack()
+
 	Verbose("Starting services from config file(s): %s", strings.Join(cfgPaths, ", "))
 
 	// Parse configuration
@@ -265,8 +277,9 @@ func runUp(cmd *cobra.Command, args []string) error {
 		}
 	}
 
-	// Store the config paths in cluster state so future commands can find them without -f
-	st.SetConfigPaths(cfgPaths)
+	// Store the original config paths (before pack extraction) so future commands
+	// can locate the config or archive without -f.
+	st.SetConfigPaths(originalCfgPaths)
 	if saveErr := st.Save(ctx, clientset); saveErr != nil {
 		Verbose("Warning: failed to store config paths in cluster state: %v", saveErr)
 	}
@@ -307,10 +320,7 @@ func runUp(cmd *cobra.Command, args []string) error {
 			successCount++
 			serviceIndex++
 		} else {
-			// Multiple services - install in parallel with cancellation
-			levelCtx, cancel := context.WithCancel(ctx)
-			defer cancel()
-
+			// Multiple services - install in parallel
 			// Service error tracking
 			type serviceError struct {
 				serviceName string
@@ -320,7 +330,6 @@ func runUp(cmd *cobra.Command, args []string) error {
 			var wg sync.WaitGroup
 			errChan := make(chan serviceError, len(level))
 			successChan := make(chan bool, len(level))
-			var firstError sync.Once
 
 			for _, svc := range level {
 				wg.Add(1)
@@ -330,12 +339,8 @@ func runUp(cmd *cobra.Command, args []string) error {
 				go func(service *config.ServiceConfig, idx int) {
 					defer wg.Done()
 
-					if err := installService(levelCtx, service, idx, cfg, kubeconfig, st, clientset, kindMgr, imgMgr, progress, globalWait, globalTimeout, verbose); err != nil {
-						// Cancel context on first error to stop other installations
-						firstError.Do(func() {
-							progress.Verbose("Service '%s' failed, cancelling other installations in level %d", service.Name, levelNum)
-							cancel()
-						})
+					if err := installService(ctx, service, idx, cfg, kubeconfig, st, clientset, kindMgr, imgMgr, progress, globalWait, globalTimeout, verbose); err != nil {
+						progress.Verbose("Service '%s' failed in level %d: %v", service.Name, levelNum, err)
 						errChan <- serviceError{serviceName: service.Name, err: err}
 					} else {
 						successChan <- true
@@ -467,8 +472,8 @@ func installService(
 				imageHashes[img] = imgInfo.SHA256
 			}
 
-			// Collect local images
-			if imgInfo.IsLocal {
+			// Collect images present in local daemon (built or pre-pulled)
+			if imgInfo.InLocalDaemon {
 				localImages = append(localImages, img)
 			}
 		}
@@ -484,8 +489,11 @@ func installService(
 			currentHash := imageHashes[img]
 			imgInfo, _ := imgMgr.GetImageInfo(ctx, img)
 
-			if imgInfo != nil && imgInfo.IsLocal {
-				// Image is local - check if it needs to be loaded into cluster
+			if imgInfo != nil && imgInfo.InLocalDaemon {
+				// Image is present in the local Docker daemon (built locally or pre-pulled).
+				// Load it into the kind cluster rather than relying on kind's containerd
+				// to pull from the registry — the registry may be unreachable from inside
+				// the kind node network.
 				needsLoad := false
 				needsRemove := false
 				if cfg.Cluster.IsExternal() {
@@ -522,9 +530,8 @@ func installService(
 					}
 				}
 			} else {
-				// Image is from a registry — kind pulls it directly into containerd.
-				// No host-side pull or kind load needed.
-				progress.Verbose("Image '%s' is a registry image, kind will pull it directly", img)
+				// Image is not in the local Docker daemon — kind will pull it from the registry.
+				progress.Verbose("Image '%s' not found in local daemon, kind will pull from registry", img)
 			}
 		}
 

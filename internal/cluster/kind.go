@@ -1391,6 +1391,10 @@ func (kind *KindManager) connectToHostNetwork(clusterName string, networkName st
 	} else {
 		// Auto-detect networks
 		networksToTry = kind.detectNetworks()
+		if len(networksToTry) == 0 {
+			// Not running in a container — no additional network connection needed.
+			return nil
+		}
 	}
 
 	for _, network := range networksToTry {
@@ -1420,6 +1424,14 @@ func (kind *KindManager) connectToHostNetwork(clusterName string, networkName st
 		} else {
 			fmt.Printf("%s Connected cluster to '%s' network for better connectivity\n", color.Checkmark(), network)
 		}
+
+		// Fix the default route inside every kind node so internet traffic flows
+		// through this network's NAT rules. Without this, nodes with two network
+		// interfaces (kind + bridge) keep routing internet traffic through the kind
+		// interface, which may lack working iptables masquerade rules.
+		if err := kind.fixDefaultRouteForCluster(clusterName, network); err != nil {
+			fmt.Printf("Warning: Could not update default route via '%s': %v\n", network, err)
+		}
 		return nil
 	}
 
@@ -1428,6 +1440,43 @@ func (kind *KindManager) connectToHostNetwork(clusterName string, networkName st
 }
 
 // ensureNetworkExists checks if a Docker network exists and creates it if needed
+// fixDefaultRouteForCluster updates the default route inside every kind node of
+// the cluster to use the gateway of the given Docker network. This ensures
+// outbound internet traffic is NATted through that network's iptables rules
+// rather than through the kind-internal network, which may have no NAT.
+func (kind *KindManager) fixDefaultRouteForCluster(clusterName, networkName string) error {
+	// Get the gateway IP for this network
+	out, err := osexec.Command("docker", "network", "inspect", networkName,
+		"--format", "{{range .IPAM.Config}}{{.Gateway}}{{end}}").Output()
+	if err != nil {
+		return fmt.Errorf("inspect network %s: %w", networkName, err)
+	}
+	gateway := strings.TrimSpace(string(out))
+	if gateway == "" {
+		return fmt.Errorf("no gateway found for network %s", networkName)
+	}
+
+	// Get all nodes in this cluster
+	nodesOut, err := osexec.Command("kind", "get", "nodes", "--name", clusterName).Output()
+	if err != nil {
+		// Fall back to just the control-plane
+		nodesOut = []byte(clusterName + "-control-plane")
+	}
+	nodes := strings.Fields(string(nodesOut))
+
+	for _, node := range nodes {
+		routeOut, err := osexec.Command("docker", "exec", node,
+			"ip", "route", "replace", "default", "via", gateway).CombinedOutput()
+		if err != nil {
+			fmt.Printf("Warning: Could not update default route in node '%s': %v: %s\n", node, err, routeOut)
+		} else {
+			fmt.Printf("%s Default route in '%s' updated to use '%s' gateway (%s)\n",
+				color.Checkmark(), node, networkName, gateway)
+		}
+	}
+	return nil
+}
+
 func (kind *KindManager) ensureNetworkExists(networkName string, subnet string) error {
 	// Check if network already exists
 	checkCmd := osexec.Command("docker", "network", "inspect", networkName)
@@ -1458,22 +1507,22 @@ func (kind *KindManager) ensureNetworkExists(networkName string, subnet string) 
 	return nil
 }
 
-// detectNetworks detects which Docker networks to use based on the current environment
+// detectNetworks detects which Docker networks to use based on the current environment.
+// On bare metal hosts, connects to the Docker bridge network which ensures kind nodes
+// have outbound internet access via the host's NAT rules.
+// Inside a container (dev container / CI), connects to the container's own networks
+// so the kind cluster is reachable on the same Docker network as the host container.
 func (kind *KindManager) detectNetworks() []string {
-	// Try to detect if we're running inside a Docker container
-	if !kind.isRunningInContainer() {
-		// Not in a container, use default bridge network
-		return []string{"bridge"}
+	if kind.isRunningInContainer() {
+		// We're in a container - try to get its networks
+		currentNetworks := kind.getCurrentContainerNetworks()
+		if len(currentNetworks) > 0 {
+			// Found networks from current container - use those plus bridge as fallback
+			return append(currentNetworks, "bridge")
+		}
 	}
 
-	// We're in a container - try to get its networks
-	currentNetworks := kind.getCurrentContainerNetworks()
-	if len(currentNetworks) > 0 {
-		// Found networks from current container - use those plus bridge as fallback
-		return append(currentNetworks, "bridge")
-	}
-
-	// Couldn't detect networks, fall back to bridge
+	// Bare metal host or fallback: use bridge for internet connectivity
 	return []string{"bridge"}
 }
 

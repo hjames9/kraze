@@ -23,6 +23,7 @@
     - [`kraze init`](#kraze-init)
     - [`kraze destroy`](#kraze-destroy)
     - [`kraze validate`](#kraze-validate)
+    - [`kraze pack`](#kraze-pack)
     - [`kraze load-image <image...>`](#kraze-load-image-image)
     - [`kraze version`](#kraze-version)
     - [`kraze completion [bash|zsh|fish|powershell]`](#kraze-completion-bashzshfishpowershell)
@@ -51,6 +52,7 @@ kraze is a Kubernetes development environment manager that brings the familiar d
 - **docker-compose UX** - Familiar commands: `up`, `down`, `status`
 - **Corporate Network Support** - Works behind proxies with TLS inspection and custom CAs
 - **GPU Support** - Run NVIDIA and AMD GPU workloads in kind clusters (v0.7.0+)
+- **Portable Packages** - Bundle your deployment into a `.tar.gz` to share with teammates or distribute to servers
 
 ## Breaking Changes (v0.6.0)
 
@@ -387,6 +389,28 @@ kraze validate
 
 # Validate specific file
 kraze validate -f dev.yml
+```
+
+#### `kraze pack`
+Bundle a kraze deployment into a portable `.tar.gz` archive for sharing.
+
+At pack time, all local assets (charts, manifests, values files, CA certs) are included directly. Remote Helm charts (OCI/HTTPS) are pulled and bundled as `.tgz` files, and remote HTTP manifests are downloaded and bundled — so the recipient needs no access to Helm repos or manifest URLs. Container images are the only thing fetched at runtime (from Docker registries).
+
+The commands `up`, `validate`, and `plan` all accept `.tar.gz` packages transparently via the `-f` flag.
+
+```bash
+# Pack the deployment in the current directory
+kraze pack
+
+# Pack with a specific config file and output path
+kraze pack -f kraze.yml -o myapp.tar.gz
+
+# The recipient can then run it directly — no internet access to Helm repos needed
+kraze up -f myapp.tar.gz
+
+# Or validate and plan before deploying
+kraze validate -f myapp.tar.gz
+kraze plan -f myapp.tar.gz
 ```
 
 #### `kraze load-image <image...>`

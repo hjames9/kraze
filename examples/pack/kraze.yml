@@ -1,0 +1,44 @@
+# Pack Example
+#
+# Demonstrates kraze pack: bundle a deployment for sharing.
+#
+# This config includes both a local Helm chart and a remote OCI chart.
+# Running 'kraze pack' bundles everything into a single .tar.gz:
+#   - Local chart (./myapp) is copied as-is
+#   - Remote chart (redis OCI) is pulled and bundled as .tgz
+#   - Values file is included
+#
+# Usage:
+#   kraze pack -o myapp.tar.gz         # Create the package (requires internet)
+#   kraze validate -f myapp.tar.gz     # Recipient validates without internet
+#   kraze up -f myapp.tar.gz           # Recipient deploys
+
+cluster:
+  name: pack-example
+
+services:
+  # Local Helm chart — bundled as-is from ./myapp directory
+  myapp:
+    type: helm
+    path: ./myapp
+    namespace: apps
+    create_namespace: true
+    values:
+      - ./values-override.yaml
+
+  # Remote Helm chart (OCI) — pulled from registry and bundled as .tgz at pack time
+  redis:
+    type: helm
+    repo: oci://registry-1.docker.io/bitnamicharts
+    chart: redis
+    version: 20.2.1
+    namespace: data
+    create_namespace: true
+    values_inline: |
+      master:
+        resources:
+          requests:
+            memory: "128Mi"
+            cpu: "100m"
+      replica:
+        replicaCount: 1

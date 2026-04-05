@@ -101,10 +101,11 @@ func runPortForward(cmd *cobra.Command, args []string) error {
 	}
 
 	// Parse configuration
-	cfgPaths, err := resolveConfigFiles(cmd)
+	cfgPaths, cleanupPack, err := resolveAndExtractConfigFiles(cmd)
 	if err != nil {
 		return err
 	}
+	defer cleanupPack()
 	cfg, err := config.ParseMultiple(cfgPaths)
 	if err != nil {
 		return fmt.Errorf("failed to parse config: %w", err)

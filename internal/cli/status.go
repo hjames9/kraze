@@ -31,10 +31,11 @@ You can filter services by name or by labels:
 func runStatus(cmd *cobra.Command, args []string) error {
 	ctx := context.Background()
 
-	cfgPaths, err := resolveConfigFiles(cmd)
+	cfgPaths, cleanupPack, err := resolveAndExtractConfigFiles(cmd)
 	if err != nil {
 		return err
 	}
+	defer cleanupPack()
 	Verbose("Checking status from config file(s): %s", strings.Join(cfgPaths, ", "))
 
 	// Parse configuration

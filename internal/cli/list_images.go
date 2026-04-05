@@ -25,10 +25,11 @@ Examples:
 func runListImages(cmd *cobra.Command, args []string) error {
 	ctx := context.Background()
 
-	cfgPaths, err := resolveConfigFiles(cmd)
+	cfgPaths, cleanupPack, err := resolveAndExtractConfigFiles(cmd)
 	if err != nil {
 		return err
 	}
+	defer cleanupPack()
 
 	cfg, err := config.ParseMultiple(cfgPaths)
 	if err != nil {

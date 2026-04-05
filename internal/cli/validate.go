@@ -14,10 +14,12 @@ var validateCmd = &cobra.Command{
 	Short: "Validate kraze.yml configuration",
 	Long:  `Validate the syntax and structure of your kraze.yml configuration file.`,
 	RunE: func(cmd *cobra.Command, args []string) error {
-		cfgPaths, err := resolveConfigFiles(cmd)
+		cfgPaths, cleanupPack, err := resolveAndExtractConfigFiles(cmd)
 		if err != nil {
 			return err
 		}
+		defer cleanupPack()
+
 		Verbose("Validating configuration file(s): %s", strings.Join(cfgPaths, ", "))
 
 		// Parse configuration file

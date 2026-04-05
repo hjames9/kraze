@@ -34,6 +34,7 @@ func TestAllExamples(test *testing.T) {
 		"vllm-openwebui",
 		"vllm-rag",
 		"image-volumes",
+		"pack",
 	}
 
 	// Track validation results

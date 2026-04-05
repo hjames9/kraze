@@ -29,10 +29,11 @@ For external clusters (cluster.external.enabled: true):
 	RunE: func(cmd *cobra.Command, args []string) error {
 		ctx := context.Background()
 
-		cfgPaths, err := resolveConfigFiles(cmd)
+		cfgPaths, cleanupPack, err := resolveAndExtractConfigFiles(cmd)
 		if err != nil {
 			return err
 		}
+		defer cleanupPack()
 		Verbose("Initializing cluster from config file(s): %s", strings.Join(cfgPaths, ", "))
 
 		// Parse config file

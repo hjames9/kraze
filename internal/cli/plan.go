@@ -52,10 +52,12 @@ type ServicePlanInfo struct {
 func runPlan(cmd *cobra.Command, args []string) error {
 	ctx := context.Background()
 
-	cfgPaths, err := resolveConfigFiles(cmd)
+	cfgPaths, cleanupPack, err := resolveAndExtractConfigFiles(cmd)
 	if err != nil {
 		return err
 	}
+	defer cleanupPack()
+
 	Verbose("Planning deployment from config file(s): %s", strings.Join(cfgPaths, ", "))
 
 	// Parse configuration
