@@ -239,7 +239,7 @@ func runDown(cmd *cobra.Command, args []string) error {
 	}
 
 	// Create progress manager
-	progress := ui.NewProgressManager(verbose, plain)
+	progress := ui.NewProgressManager(verbose, plain, len(orderedServices))
 
 	// Start progress display
 	progress.Start(len(orderedServices), "Uninstalling")

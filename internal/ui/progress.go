@@ -8,6 +8,7 @@ import (
 
 	"github.com/hjames9/kraze/internal/color"
 	"github.com/mattn/go-isatty"
+	"golang.org/x/term"
 )
 
 // ServiceStatus represents the current status of a service
@@ -52,14 +53,29 @@ type ProgressManager interface {
 	Verbose(format string, args ...interface{})
 }
 
-// NewProgressManager creates the appropriate progress manager based on terminal detection
-func NewProgressManager(verbose bool, plain bool) ProgressManager {
+// NewProgressManager creates the appropriate progress manager based on terminal detection.
+// total is the number of services that will be displayed; it is used to decide whether
+// the interactive (in-place) display fits within the current terminal height.
+func NewProgressManager(verbose bool, plain bool, total int) ProgressManager {
 	// Use scrolling mode if:
 	// - plain flag is set (user wants scrolling mode)
 	// - verbose flag is set (verbose implies scrolling)
 	// - stdout is not a terminal (piped/redirected)
 	if plain || verbose || !isatty.IsTerminal(os.Stdout.Fd()) {
 		return &ScrollingProgress{verbose: verbose}
+	}
+
+	// Fall back to scrolling if the service list is taller than the terminal.
+	// In-place redraws rely on cursor-up escape codes; if the display exceeds the
+	// visible area, the terminal scrolls and those codes no longer reach the top of
+	// the display, causing repeated lines in the scrollback buffer.
+	// Overhead: 3 header lines (\n, "Installing N services...", \n) + 2 footer lines.
+	const terminalOverhead = 5
+	if total > 0 {
+		_, height, err := term.GetSize(int(os.Stdout.Fd()))
+		if err == nil && height > 0 && total+terminalOverhead > height {
+			return &ScrollingProgress{verbose: verbose}
+		}
 	}
 
 	return &InteractiveProgress{}
@@ -97,6 +113,16 @@ func (ip *InteractiveProgress) Start(total int, operation string) {
 
 	fmt.Printf("\n%s %d service(s)...\n\n", operation, total)
 
+	// Pre-allocate the display area so subsequent redraws always overwrite in-place
+	// rather than growing the display one line at a time.  If the display grew
+	// incrementally (one UpdateService call per service during initialization), the
+	// terminal could scroll before all lines were printed, pushing early lines into
+	// the scrollback buffer and breaking the cursor-up arithmetic.
+	for i := 0; i < total; i++ {
+		fmt.Printf("[%d/%d]\n", i+1, total)
+	}
+	ip.linesWritten = total
+
 	// Start spinner animation in background
 	go ip.animateSpinner()
 }
@@ -130,6 +156,11 @@ func (ip *InteractiveProgress) redraw() {
 	for i := 0; i < ip.total; i++ {
 		svc := ip.services[i]
 		if svc == nil {
+			// Print a blank placeholder so the display height stays constant at
+			// ip.total lines from the very first redraw.  Skipping nil entries
+			// would shrink lines vs linesWritten and break the cursor-up math.
+			fmt.Printf("\r\033[K[%d/%d]\n", i+1, ip.total)
+			lines++
 			continue
 		}
 

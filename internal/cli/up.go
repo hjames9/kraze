@@ -190,7 +190,7 @@ func runUp(cmd *cobra.Command, args []string) error {
 	}
 
 	// Create progress manager
-	progress := ui.NewProgressManager(verbose, plain)
+	progress := ui.NewProgressManager(verbose, plain, len(orderedServices))
 
 	// Create or verify cluster
 	kindMgr := cluster.NewKindManager()
