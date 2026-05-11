@@ -35,6 +35,7 @@ func TestAllExamples(test *testing.T) {
 		"vllm-rag",
 		"image-volumes",
 		"pack",
+		"explicit-images",
 	}
 
 	// Track validation results

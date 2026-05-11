@@ -537,6 +537,17 @@ services:
     namespace: app
     depends_on:
       - service-name
+
+  # Explicit image list (supplements auto-detection)
+  # Use when images are in non-standard locations that auto-detection cannot reach
+  # (e.g., extraInitContainers YAML strings, operator-managed pods, ConfigMap-sourced images)
+  service-with-extra-images:
+    type: helm
+    repo: oci://registry-1.docker.io/bitnamicharts
+    chart: keycloak
+    namespace: auth
+    images:
+      - myorg/custom-theme:latest   # loaded before helm install, merged with auto-detected images
 ```
 
 #### Disabling Services
@@ -839,6 +850,7 @@ See the [examples/](./examples) directory for complete working examples:
 - **[vllm-rag/](./examples/vllm-rag)** - vLLM + pgvector + Open WebUI RAG stack for document-grounded chat (v0.7.0+)
 - **[vllm-rag-amd/](./examples/vllm-rag-amd)** - vLLM + pgvector + Open WebUI RAG stack on AMD GPUs with ROCm (v0.7.0+)
 - **[multi-config/](./examples/multi-config)** - Multiple config files merged into one cluster (app stack + ML/GPU stack)
+- **[explicit-images/](./examples/explicit-images)** - Supplement auto-detected images with an explicit list for edge cases like `extraInitContainers`
 
 Validate all examples:
 ```bash

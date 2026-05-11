@@ -1,0 +1,51 @@
+# Explicit Images Example
+#
+# Demonstrates the `images` field, which lets you list local Docker images
+# that kraze should load into the kind cluster for a service.
+#
+# By default kraze auto-detects images from values files and manifests.
+# The `images` field supplements that detection — useful when images are
+# referenced in places auto-detection cannot reach, such as:
+#
+#   - extraInitContainers / extraSidecars YAML strings in Helm values
+#   - Operator-managed pods that the chart itself doesn't template
+#   - Images referenced only at runtime (e.g. sourced from ConfigMaps)
+#
+# The explicit list is merged with auto-detected images and deduplicated,
+# so listing an image that auto-detection already finds is harmless.
+#
+# Usage:
+#   kraze up     # Install all services
+#   kraze down   # Uninstall all
+
+cluster:
+  name: explicit-images-cluster
+
+services:
+  # Keycloak deployed via Helm. The chart's default values reference the
+  # official keycloak image — auto-detection finds that automatically.
+  #
+  # However, a custom theme image is injected via extraInitContainers, which
+  # is a raw YAML string in the values file that auto-detection cannot parse.
+  # Listing it explicitly ensures it is loaded into the cluster before the
+  # Helm install runs.
+  keycloak:
+    type: helm
+    chart: keycloak
+    repo: oci://registry-1.docker.io/bitnamicharts
+    namespace: auth
+    create_namespace: true
+    values: ./keycloak-values.yaml
+    images:
+      - hjames/kora-keycloak-theme:latest   # init container in extraInitContainers
+
+  # A manifest-based service where all images are in standard container
+  # spec fields — auto-detection handles them without any explicit list.
+  # Shown here to demonstrate that `images` is purely additive.
+  redis:
+    type: manifests
+    path: ./redis.yaml
+    namespace: data
+    create_namespace: true
+    # No `images` field needed — auto-detection finds redis:7-alpine
+    # from the Deployment manifest automatically.

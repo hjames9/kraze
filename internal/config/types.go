@@ -180,6 +180,13 @@ type ServiceConfig struct {
 	// Path field used by both Helm (local chart) and Manifests (single file/dir)
 	Path  string   `yaml:"path,omitempty"`  // Local chart path (Helm) or manifest file/directory (Manifests)
 	Paths []string `yaml:"paths,omitempty"` // Multiple manifest files
+
+	// Images is an explicit list of local Docker images to load into the kind
+	// cluster for this service. These supplement the images that kraze detects
+	// automatically from values files and manifests. Useful for images that are
+	// referenced in non-standard places (e.g., extraInitContainers YAML strings,
+	// operator-managed pods, or any location the auto-detector cannot reach).
+	Images []string `yaml:"images,omitempty"`
 }
 
 // IsHelm returns true if this service is a Helm chart

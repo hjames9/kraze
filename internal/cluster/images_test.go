@@ -1121,3 +1121,159 @@ func TestExtractImagesRecursive_FlatStringImage(test *testing.T) {
 		}
 	}
 }
+
+// TestGetImagesForService_ExplicitImages verifies that images listed under the
+// service's `images:` field are included in the result even when auto-detection
+// would not find them (e.g., images referenced inside extraInitContainers YAML
+// strings or other non-standard locations).
+func TestGetImagesForService_ExplicitImages(t *testing.T) {
+	im := NewImageManager(false)
+	ctx := context.Background()
+
+	svc := &config.ServiceConfig{
+		Name: "keycloak",
+		Type: "manifests",
+		Path: "", // no manifests — auto-detection finds nothing
+		Images: []string{
+			"hjames/kora-keycloak-theme:latest",
+		},
+	}
+
+	images, err := im.GetImagesForService(ctx, svc, "")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if len(images) != 1 || images[0] != "hjames/kora-keycloak-theme:latest" {
+		t.Errorf("expected [hjames/kora-keycloak-theme:latest], got %v", images)
+	}
+}
+
+// TestGetImagesForService_ExplicitImagesMergedWithAutoDetected verifies that
+// explicitly listed images are merged with (not replacing) auto-detected ones.
+func TestGetImagesForService_ExplicitImagesMergedWithAutoDetected(t *testing.T) {
+	im := NewImageManager(false)
+	ctx := context.Background()
+
+	// Write a temporary values file that auto-detection will find an image in.
+	tmp := t.TempDir()
+	valuesFile := filepath.Join(tmp, "values.yaml")
+	if err := os.WriteFile(valuesFile, []byte(`
+image:
+  repository: myrepo/myapp
+  tag: "1.0"
+`), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	svc := &config.ServiceConfig{
+		Name:   "myservice",
+		Type:   "helm",
+		Chart:  "mychart",
+		Values: config.ValuesField{},
+		Images: []string{
+			"hjames/kora-keycloak-theme:latest",
+			"myrepo/myapp:1.0", // duplicate — should be deduplicated
+		},
+	}
+	if err := svc.Values.UnmarshalYAML(func(v interface{}) error {
+		*(v.(*string)) = valuesFile
+		return nil
+	}); err != nil {
+		// Directly set the values file path via the Files method workaround.
+	}
+	// Build via YAML round-trip so ValuesField is populated correctly.
+	raw := fmt.Sprintf(`
+name: myservice
+type: helm
+chart: mychart
+values: %s
+images:
+  - hjames/kora-keycloak-theme:latest
+  - myrepo/myapp:1.0
+`, valuesFile)
+	var parsed config.ServiceConfig
+	if err := parseServiceYAML(raw, &parsed); err != nil {
+		t.Fatalf("yaml parse: %v", err)
+	}
+
+	images, err := im.GetImagesForService(ctx, &parsed, "")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	want := map[string]bool{
+		"myrepo/myapp:1.0":                  true,
+		"hjames/kora-keycloak-theme:latest": true,
+	}
+	for _, img := range images {
+		delete(want, img)
+	}
+	if len(want) > 0 {
+		t.Errorf("missing images: %v (got %v)", want, images)
+	}
+
+	// Verify deduplication: myrepo/myapp:1.0 should appear exactly once.
+	count := 0
+	for _, img := range images {
+		if img == "myrepo/myapp:1.0" {
+			count++
+		}
+	}
+	if count != 1 {
+		t.Errorf("myrepo/myapp:1.0 appears %d times, want 1", count)
+	}
+}
+
+// TestGetImagesForService_ExplicitImagesDeduplicatedAgainstAutoDetected verifies
+// that an image appearing in both the explicit list and auto-detection is only
+// returned once.
+func TestGetImagesForService_ExplicitImagesDeduplicatedAgainstAutoDetected(t *testing.T) {
+	im := NewImageManager(false)
+	ctx := context.Background()
+
+	tmp := t.TempDir()
+	manifest := filepath.Join(tmp, "deploy.yaml")
+	if err := os.WriteFile(manifest, []byte(`
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: app
+spec:
+  template:
+    spec:
+      containers:
+        - name: app
+          image: myrepo/myapp:1.0
+`), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	svc := &config.ServiceConfig{
+		Name:   "app",
+		Type:   "manifests",
+		Path:   manifest,
+		Images: []string{"myrepo/myapp:1.0"}, // same image auto-detection finds
+	}
+
+	images, err := im.GetImagesForService(ctx, svc, "")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	count := 0
+	for _, img := range images {
+		if img == "myrepo/myapp:1.0" {
+			count++
+		}
+	}
+	if count != 1 {
+		t.Errorf("myrepo/myapp:1.0 appears %d times after dedup, want 1", count)
+	}
+}
+
+// parseServiceYAML is a test helper that round-trips a YAML snippet through
+// Go's yaml decoder into a ServiceConfig.
+func parseServiceYAML(raw string, out *config.ServiceConfig) error {
+	return yaml.Unmarshal([]byte(raw), out)
+}

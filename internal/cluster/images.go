@@ -904,6 +904,12 @@ func (im *ImageManager) GetImagesForService(ctx context.Context, svc *config.Ser
 		images = append(images, manifestImages...)
 	}
 
+	// Merge any images explicitly listed in the service config. These supplement
+	// the auto-detected set and handle cases where images are referenced in
+	// non-standard locations (e.g., extraInitContainers YAML strings) that the
+	// automatic extraction cannot reach.
+	images = append(images, svc.Images...)
+
 	// Deduplicate
 	images = DeduplicateImages(images)
 
