@@ -18,6 +18,7 @@ func (n *noopProgress) Start(total int, operation string) {}
 func (n *noopProgress) UpdateService(index int, name string, status ui.ServiceStatus, message string) {
 }
 func (n *noopProgress) Finish(successCount int)                    {}
+func (n *noopProgress) Stop()                                      {}
 func (n *noopProgress) Verbose(format string, args ...interface{}) {}
 
 func makePod(name, namespace string, containerStatuses []corev1.ContainerStatus, initStatuses []corev1.ContainerStatus) corev1.Pod {

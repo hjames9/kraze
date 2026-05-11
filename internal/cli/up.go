@@ -294,6 +294,8 @@ func runUp(cmd *cobra.Command, args []string) error {
 	// Create image manager for automatic image loading
 	imgMgr := cluster.NewImageManager(verbose)
 
+	defer progress.Stop()
+
 	// Start progress display
 	progress.Start(len(orderedServices), "Installing")
 
