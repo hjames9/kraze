@@ -2,6 +2,7 @@ package ui
 
 import (
 	"bytes"
+	"io"
 	"strings"
 	"testing"
 )
@@ -16,7 +17,7 @@ func driveInteractive(total int, updates []struct {
 	status  ServiceStatus
 	message string
 }) *InteractiveProgress {
-	ip := &InteractiveProgress{}
+	ip := &InteractiveProgress{out: io.Discard}
 
 	// Manually call Start internals without the spinner goroutine.
 	ip.operation = "Installing"
@@ -45,7 +46,7 @@ func driveInteractive(total int, updates []struct {
 func TestInteractiveProgressLinesWrittenStable(t *testing.T) {
 	total := 5
 
-	ip := &InteractiveProgress{}
+	ip := &InteractiveProgress{out: io.Discard}
 	ip.operation = "Installing"
 	ip.total = total
 	ip.services = make(map[int]*serviceInfo)
@@ -74,7 +75,7 @@ func TestInteractiveProgressLinesWrittenStable(t *testing.T) {
 // undershoot on the next redraw.
 func TestInteractiveProgressNilServicesDrawn(t *testing.T) {
 	var buf bytes.Buffer
-	ip := &InteractiveProgress{}
+	ip := &InteractiveProgress{out: io.Discard}
 	ip.total = 3
 	ip.services = make(map[int]*serviceInfo)
 	ip.linesWritten = 0
@@ -115,6 +116,7 @@ func TestScrollingProgressUpdates(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.description, func(t *testing.T) {
 			sp := &ScrollingProgress{
+				out:          io.Discard,
 				operation:    "Installing",
 				total:        1,
 				shownHeaders: make(map[int]bool),
@@ -136,7 +138,7 @@ func TestScrollingProgressUpdates(t *testing.T) {
 
 // TestScrollingProgressStart verifies that Start initializes the shownHeaders map.
 func TestScrollingProgressStart(t *testing.T) {
-	sp := &ScrollingProgress{}
+	sp := &ScrollingProgress{out: io.Discard}
 	sp.Start(5, "Installing")
 	if sp.shownHeaders == nil {
 		t.Error("Start must initialize shownHeaders")
@@ -165,7 +167,7 @@ func TestNewProgressManagerScrollingFallbacks(t *testing.T) {
 // of services to display somehow shrinks between redraws, the extra lines are
 // cleared (not left as stale content on screen).
 func TestInteractiveProgressExtraLinesClearedOnShrink(t *testing.T) {
-	ip := &InteractiveProgress{}
+	ip := &InteractiveProgress{out: io.Discard}
 	ip.total = 3
 	ip.services = make(map[int]*serviceInfo)
 	ip.spinnerFrame = 0
@@ -194,7 +196,7 @@ func TestInteractiveProgressStatusTransitions(t *testing.T) {
 		StatusReady,
 	}
 
-	ip := &InteractiveProgress{}
+	ip := &InteractiveProgress{out: io.Discard}
 	ip.total = 2
 	ip.services = make(map[int]*serviceInfo)
 	ip.linesWritten = 0

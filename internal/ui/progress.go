@@ -2,6 +2,7 @@ package ui
 
 import (
 	"fmt"
+	"io"
 	"os"
 	"sync"
 	"time"
@@ -52,17 +53,17 @@ type ProgressManager interface {
 // the display fits, otherwise ScrollingProgress.
 func NewProgressManager(verbose bool, plain bool, total int) ProgressManager {
 	if plain || verbose || !isatty.IsTerminal(os.Stdout.Fd()) {
-		return &ScrollingProgress{verbose: verbose}
+		return &ScrollingProgress{verbose: verbose, out: os.Stdout}
 	}
 
 	if total > 0 {
 		_, height, err := term.GetSize(int(os.Stdout.Fd()))
 		if err != nil || height <= 0 || total+3 >= height {
-			return &ScrollingProgress{verbose: verbose}
+			return &ScrollingProgress{verbose: verbose, out: os.Stdout}
 		}
 	}
 
-	return &InteractiveProgress{}
+	return &InteractiveProgress{out: os.Stdout}
 }
 
 // ipServiceStartRow is the absolute row (1-indexed) of the [1/N] service line
@@ -83,6 +84,7 @@ const ipServiceStartRow = 4
 // (not the alternate buffer), so the user can scroll up at any time to see
 // prior output that was pushed into the terminal scrollback by the clear.
 type InteractiveProgress struct {
+	out           io.Writer
 	services      map[int]*serviceInfo
 	operation     string
 	total         int
@@ -91,6 +93,13 @@ type InteractiveProgress struct {
 	spinnerFrame  int
 	spinnerDone   chan bool
 	spinnerActive bool
+}
+
+func (ip *InteractiveProgress) w() io.Writer {
+	if ip.out != nil {
+		return ip.out
+	}
+	return os.Stdout
 }
 
 type serviceInfo struct {
@@ -115,11 +124,11 @@ func (ip *InteractiveProgress) Start(total int, operation string) {
 	// \033[2J clears only the visible screen, not the scrollback buffer, so the
 	// user can still scroll up to see cluster creation output. No blank lines
 	// are introduced into the output stream (unlike a newline-based pre-scroll).
-	fmt.Print("\033[2J\033[H")
+	fmt.Fprint(ip.w(), "\033[2J\033[H")
 
-	fmt.Printf("\n%s %d service(s)...\n\n", operation, total)
+	fmt.Fprintf(ip.w(), "\n%s %d service(s)...\n\n", operation, total)
 	for i := 0; i < total; i++ {
-		fmt.Printf("[%d/%d]\n", i+1, total)
+		fmt.Fprintf(ip.w(), "[%d/%d]\n", i+1, total)
 	}
 	ip.linesWritten = total
 
@@ -144,13 +153,13 @@ func (ip *InteractiveProgress) redraw() {
 	// Jump directly to the first service line. Because we cleared the screen
 	// before starting, this row is always correct regardless of terminal height
 	// or prior output — no cursor-up arithmetic can drift.
-	fmt.Printf("\033[%d;1H", ipServiceStartRow)
+	fmt.Fprintf(ip.w(), "\033[%d;1H", ipServiceStartRow)
 
 	lines := 0
 	for i := 0; i < ip.total; i++ {
 		svc := ip.services[i]
 		if svc == nil {
-			fmt.Printf("\r\033[K[%d/%d]\n", i+1, ip.total)
+			fmt.Fprintf(ip.w(), "\r\033[K[%d/%d]\n", i+1, ip.total)
 			lines++
 			continue
 		}
@@ -163,7 +172,7 @@ func (ip *InteractiveProgress) redraw() {
 		}
 		statusColor := getStatusColor(svc.status)
 
-		fmt.Printf("\r\033[K[%d/%d] %-20s %s %s  %s\n",
+		fmt.Fprintf(ip.w(), "\r\033[K[%d/%d] %-20s %s %s  %s\n",
 			i+1,
 			ip.total,
 			svc.name,
@@ -177,9 +186,9 @@ func (ip *InteractiveProgress) redraw() {
 	extraLines := ip.linesWritten - lines
 	if extraLines > 0 {
 		for i := 0; i < extraLines; i++ {
-			fmt.Print("\r\033[K\n")
+			fmt.Fprint(ip.w(), "\r\033[K\n")
 		}
-		fmt.Printf("\033[%dA", extraLines)
+		fmt.Fprintf(ip.w(), "\033[%dA", extraLines)
 	}
 	ip.linesWritten = lines
 }
@@ -198,9 +207,9 @@ func (ip *InteractiveProgress) Finish(successCount int) {
 	defer ip.mu.Unlock()
 
 	if ip.linesWritten > 0 {
-		fmt.Println()
+		fmt.Fprintln(ip.w())
 	}
-	fmt.Printf("%s %s %d service(s) successfully!\n",
+	fmt.Fprintf(ip.w(), "%s %s %d service(s) successfully!\n",
 		color.Checkmark(),
 		ip.operation,
 		successCount,
@@ -234,6 +243,7 @@ func (ip *InteractiveProgress) getSpinnerIcon() string {
 
 // ScrollingProgress uses traditional scrolling output
 type ScrollingProgress struct {
+	out          io.Writer
 	mu           sync.Mutex
 	verbose      bool
 	operation    string
@@ -242,12 +252,19 @@ type ScrollingProgress struct {
 	installing   map[int]bool
 }
 
+func (sp *ScrollingProgress) w() io.Writer {
+	if sp.out != nil {
+		return sp.out
+	}
+	return os.Stdout
+}
+
 func (sp *ScrollingProgress) Start(total int, operation string) {
 	sp.operation = operation
 	sp.total = total
 	sp.shownHeaders = make(map[int]bool)
 	sp.installing = make(map[int]bool)
-	fmt.Printf("%s %d service(s)...\n", operation, total)
+	fmt.Fprintf(sp.w(), "%s %d service(s)...\n", operation, total)
 }
 
 func (sp *ScrollingProgress) UpdateService(index int, name string, status ServiceStatus, message string) {
@@ -265,23 +282,23 @@ func (sp *ScrollingProgress) UpdateService(index int, name string, status Servic
 	case StatusInstalling, StatusUninstalling:
 		if !sp.shownHeaders[index] {
 			if len(sp.installing) == 0 {
-				fmt.Print("\n")
+				fmt.Fprint(sp.w(), "\n")
 			}
-			fmt.Printf("[%d/%d] %s '%s'...\n", index+1, sp.total, sp.operation, name)
+			fmt.Fprintf(sp.w(), "[%d/%d] %s '%s'...\n", index+1, sp.total, sp.operation, name)
 			sp.shownHeaders[index] = true
 			sp.installing[index] = true
 		}
 	case StatusReady:
 		delete(sp.installing, index)
-		fmt.Printf("%s Service '%s' %s successfully\n",
+		fmt.Fprintf(sp.w(), "%s Service '%s' %s successfully\n",
 			color.Checkmark(), name, getOperationPastTense(sp.operation))
 	case StatusFailed:
 		delete(sp.installing, index)
-		fmt.Printf("%s %s Service '%s' failed: %s\n",
+		fmt.Fprintf(sp.w(), "%s %s Service '%s' failed: %s\n",
 			icon, statusColor(string(status)), name, message)
 	case StatusSkipped:
 		delete(sp.installing, index)
-		fmt.Printf("Service '%s' %s, skipping...\n", name, message)
+		fmt.Fprintf(sp.w(), "Service '%s' %s, skipping...\n", name, message)
 	case StatusWaiting:
 		// suppress
 	}
@@ -290,7 +307,7 @@ func (sp *ScrollingProgress) UpdateService(index int, name string, status Servic
 func (sp *ScrollingProgress) Stop() {}
 
 func (sp *ScrollingProgress) Finish(successCount int) {
-	fmt.Printf("\n%s %s %d service(s)!\n",
+	fmt.Fprintf(sp.w(), "\n%s %s %d service(s)!\n",
 		color.Checkmark(),
 		getOperationPastTense(sp.operation),
 		successCount,
@@ -300,7 +317,7 @@ func (sp *ScrollingProgress) Finish(successCount int) {
 func (sp *ScrollingProgress) Verbose(format string, args ...interface{}) {
 	if sp.verbose {
 		sp.mu.Lock()
-		fmt.Printf("[VERBOSE] "+format+"\n", args...)
+		fmt.Fprintf(sp.w(), "[VERBOSE] "+format+"\n", args...)
 		sp.mu.Unlock()
 	}
 }
