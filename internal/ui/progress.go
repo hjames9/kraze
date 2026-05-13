@@ -66,23 +66,13 @@ func NewProgressManager(verbose bool, plain bool, total int) ProgressManager {
 	return &InteractiveProgress{out: os.Stdout}
 }
 
-// ipServiceStartRow is the absolute row (1-indexed) of the [1/N] service line
-// within the cleared screen. Layout after \033[2J\033[H:
-//
-//	row 1: blank          (from leading \n in header format)
-//	row 2: "Installing N service(s)..."
-//	row 3: blank
-//	row 4: [1/N]          ← ipServiceStartRow
-//	...
-//	row 4+N-1: [N/N]
-const ipServiceStartRow = 4
-
-// InteractiveProgress clears the main screen and displays service status
-// in-place using absolute cursor positioning. Because the screen is cleared
-// before the display starts, ipServiceStartRow=4 is always exact — no scroll
-// region is needed and no cursor arithmetic can drift. The main screen is used
-// (not the alternate buffer), so the user can scroll up at any time to see
-// prior output that was pushed into the terminal scrollback by the clear.
+// InteractiveProgress displays service status in-place using cursor-up
+// repositioning. After each redraw the cursor sits immediately after the last
+// service line; the next redraw moves up by exactly linesWritten to return to
+// the top of the service block, then reprints every line. Because interactive
+// mode suppresses all other stdout output between redraws, linesWritten is
+// always exact — no screen clear or absolute positioning is needed, and the
+// terminal scrollback is never disturbed.
 type InteractiveProgress struct {
 	out           io.Writer
 	services      map[int]*serviceInfo
@@ -120,12 +110,6 @@ func (ip *InteractiveProgress) Start(total int, operation string) {
 	ip.spinnerDone = make(chan bool)
 	ip.spinnerActive = true
 
-	// Clear the visible screen and move cursor to the top-left.
-	// \033[2J clears only the visible screen, not the scrollback buffer, so the
-	// user can still scroll up to see cluster creation output. No blank lines
-	// are introduced into the output stream (unlike a newline-based pre-scroll).
-	fmt.Fprint(ip.w(), "\033[2J\033[H")
-
 	fmt.Fprintf(ip.w(), "\n%s %d service(s)...\n\n", operation, total)
 	for i := 0; i < total; i++ {
 		fmt.Fprintf(ip.w(), "[%d/%d]\n", i+1, total)
@@ -150,10 +134,12 @@ func (ip *InteractiveProgress) UpdateService(index int, name string, status Serv
 }
 
 func (ip *InteractiveProgress) redraw() {
-	// Jump directly to the first service line. Because we cleared the screen
-	// before starting, this row is always correct regardless of terminal height
-	// or prior output — no cursor-up arithmetic can drift.
-	fmt.Fprintf(ip.w(), "\033[%d;1H", ipServiceStartRow)
+	// Move back to the start of the service block. linesWritten is the exact
+	// number of lines we drew last time; cursor-up by that count lands us on
+	// the first service line regardless of where the screen has scrolled.
+	if ip.linesWritten > 0 {
+		fmt.Fprintf(ip.w(), "\033[%dA\r", ip.linesWritten)
+	}
 
 	lines := 0
 	for i := 0; i < ip.total; i++ {
