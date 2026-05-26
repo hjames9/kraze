@@ -41,8 +41,9 @@ func driveInteractive(total int, updates []struct {
 }
 
 // TestInteractiveProgressLinesWrittenStable verifies that after the first redraw
-// linesWritten equals total regardless of how many services have been initialized.
-// This is the invariant that prevents display growth and the scrollback-repetition bug.
+// linesWritten equals total+1 (service rows + footer) regardless of how many
+// services have been initialized. This invariant prevents display growth and the
+// scrollback-repetition bug.
 func TestInteractiveProgressLinesWrittenStable(t *testing.T) {
 	total := 5
 
@@ -56,6 +57,7 @@ func TestInteractiveProgressLinesWrittenStable(t *testing.T) {
 	ip.spinnerActive = false
 
 	// Simulate the initialization loop: add one service at a time and redraw.
+	want := total + 1 // service rows + always-present footer line
 	for i := 0; i < total; i++ {
 		ip.services[i] = &serviceInfo{
 			name:   "svc",
@@ -63,8 +65,8 @@ func TestInteractiveProgressLinesWrittenStable(t *testing.T) {
 		}
 		ip.redraw()
 
-		if ip.linesWritten != total {
-			t.Errorf("after adding service %d: linesWritten = %d, want %d (display must not grow)", i, ip.linesWritten, total)
+		if ip.linesWritten != want {
+			t.Errorf("after adding service %d: linesWritten = %d, want %d (display must not grow)", i, ip.linesWritten, want)
 		}
 	}
 }
@@ -91,9 +93,9 @@ func TestInteractiveProgressNilServicesDrawn(t *testing.T) {
 
 	ip.redraw()
 
-	// After one partial initialization, linesWritten must equal total (3).
-	if ip.linesWritten != 3 {
-		t.Errorf("linesWritten = %d, want 3: nil services must produce output lines", ip.linesWritten)
+	// After one partial initialization, linesWritten must equal total+1 (3 service rows + footer).
+	if ip.linesWritten != 4 {
+		t.Errorf("linesWritten = %d, want 4: nil services must produce output lines", ip.linesWritten)
 	}
 }
 
@@ -178,11 +180,12 @@ func TestInteractiveProgressExtraLinesClearedOnShrink(t *testing.T) {
 	ip.services[1] = &serviceInfo{name: "beta", status: StatusPending}
 	ip.services[2] = &serviceInfo{name: "gamma", status: StatusPending}
 
-	// redraw must not panic and must update linesWritten to lines actually drawn.
+	// redraw must not panic and must update linesWritten to lines actually drawn
+	// (3 service rows + 1 footer = 4).
 	ip.redraw()
 
-	if ip.linesWritten != 3 {
-		t.Errorf("linesWritten = %d after redraw of 3 services, want 3", ip.linesWritten)
+	if ip.linesWritten != 4 {
+		t.Errorf("linesWritten = %d after redraw of 3 services, want 4", ip.linesWritten)
 	}
 }
 
@@ -208,8 +211,8 @@ func TestInteractiveProgressStatusTransitions(t *testing.T) {
 	for _, status := range transitions {
 		ip.services[0].status = status
 		ip.redraw()
-		if ip.linesWritten != 2 {
-			t.Errorf("status=%s: linesWritten = %d, want 2", status, ip.linesWritten)
+		if ip.linesWritten != 3 { // 2 service rows + 1 footer
+			t.Errorf("status=%s: linesWritten = %d, want 3", status, ip.linesWritten)
 		}
 	}
 }

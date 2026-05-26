@@ -333,6 +333,14 @@ func runUp(cmd *cobra.Command, args []string) error {
 			errChan := make(chan serviceError, len(level))
 			successChan := make(chan bool, len(level))
 
+			// Print "Installing" headers in order before launching goroutines so
+			// [N/total] lines appear sequentially in scrolling output, not in
+			// arbitrary goroutine-scheduling order.
+			startIdx := serviceIndex
+			for i, svc := range level {
+				progress.UpdateService(startIdx+i, svc.Name, ui.StatusInstalling, fmt.Sprintf("(%s)", svc.Type))
+			}
+
 			for _, svc := range level {
 				wg.Add(1)
 				itr := serviceIndex

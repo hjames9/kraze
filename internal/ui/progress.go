@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"strings"
 	"sync"
 	"time"
 
@@ -49,35 +50,37 @@ type ProgressManager interface {
 	Verbose(format string, args ...interface{})
 }
 
-// NewProgressManager returns InteractiveProgress when stdout is a terminal and
-// the display fits, otherwise ScrollingProgress.
+// NewProgressManager returns InteractiveProgress when stdout is a terminal,
+// otherwise ScrollingProgress. InteractiveProgress uses a viewport so it works
+// regardless of how many services there are relative to terminal height.
 func NewProgressManager(verbose bool, plain bool, total int) ProgressManager {
 	if plain || verbose || !isatty.IsTerminal(os.Stdout.Fd()) {
 		return &ScrollingProgress{verbose: verbose, out: os.Stdout}
 	}
 
-	if total > 0 {
-		_, height, err := term.GetSize(int(os.Stdout.Fd()))
-		if err != nil || height <= 0 || total+3 >= height {
-			return &ScrollingProgress{verbose: verbose, out: os.Stdout}
-		}
+	_, height, err := term.GetSize(int(os.Stdout.Fd()))
+	if err != nil || height <= 0 {
+		height = 24
 	}
 
-	return &InteractiveProgress{out: os.Stdout}
+	return &InteractiveProgress{out: os.Stdout, termHeight: height}
 }
 
 // InteractiveProgress displays service status in-place using cursor-up
-// repositioning. After each redraw the cursor sits immediately after the last
-// service line; the next redraw moves up by exactly linesWritten to return to
-// the top of the service block, then reprints every line. Because interactive
-// mode suppresses all other stdout output between redraws, linesWritten is
-// always exact — no screen clear or absolute positioning is needed, and the
-// terminal scrollback is never disturbed.
+// repositioning. When the service list is taller than the terminal it uses a
+// viewport: at most termHeight-4 rows are drawn at once, with a summary footer
+// showing overall counts. The viewport auto-scrolls to keep newly-active
+// services visible. linesWritten is always the number of terminal lines drawn
+// in the last redraw, so the cursor-up repositioning stays exact regardless of
+// viewport position.
 type InteractiveProgress struct {
 	out           io.Writer
 	services      map[int]*serviceInfo
 	operation     string
 	total         int
+	termHeight    int
+	viewportSize  int // rows to show at once (≤ total)
+	viewportStart int // index of first visible service
 	linesWritten  int
 	mu            sync.Mutex
 	spinnerFrame  int
@@ -98,6 +101,16 @@ type serviceInfo struct {
 	message string
 }
 
+// viewSize returns the effective viewport row count. When viewportSize is 0
+// (e.g. in tests that construct InteractiveProgress directly) we fall back to
+// showing the full service list, preserving the original behaviour.
+func (ip *InteractiveProgress) viewSize() int {
+	if ip.viewportSize <= 0 {
+		return ip.total
+	}
+	return ip.viewportSize
+}
+
 func (ip *InteractiveProgress) Start(total int, operation string) {
 	ip.mu.Lock()
 	defer ip.mu.Unlock()
@@ -109,12 +122,28 @@ func (ip *InteractiveProgress) Start(total int, operation string) {
 	ip.spinnerFrame = 0
 	ip.spinnerDone = make(chan bool)
 	ip.spinnerActive = true
+	ip.viewportStart = 0
+
+	// The header ("\n Installing N...\n\n") is printed once and scrolls into
+	// terminal history — it is not part of the redrawn area. Only the service
+	// rows + footer are redrawn, so the viewport is needed only when
+	// total+1 > termHeight (service rows + footer don't fit on screen).
+	if ip.termHeight > 0 && total+1 > ip.termHeight {
+		maxRows := ip.termHeight - 1
+		if maxRows < 1 {
+			maxRows = 1
+		}
+		ip.viewportSize = maxRows
+	}
 
 	fmt.Fprintf(ip.w(), "\n%s %d service(s)...\n\n", operation, total)
-	for i := 0; i < total; i++ {
+	shown := ip.viewSize()
+	for i := 0; i < shown; i++ {
 		fmt.Fprintf(ip.w(), "[%d/%d]\n", i+1, total)
 	}
-	ip.linesWritten = total
+	// Footer is always shown as a status bar.
+	fmt.Fprintf(ip.w(), "  0 %s  0 done  %d pending\n", strings.ToLower(ip.operation), total)
+	ip.linesWritten = shown + 1
 
 	go ip.animateSpinner()
 }
@@ -130,6 +159,22 @@ func (ip *InteractiveProgress) UpdateService(index int, name string, status Serv
 	ip.services[index].status = status
 	ip.services[index].message = message
 
+	// When a service starts installing outside the current viewport, scroll the
+	// viewport to show it (keep it within a half-window from the top).
+	vs := ip.viewSize()
+	if vs < ip.total && (status == StatusInstalling || status == StatusUninstalling) {
+		if index < ip.viewportStart || index >= ip.viewportStart+vs {
+			newStart := index - vs/2
+			if newStart < 0 {
+				newStart = 0
+			}
+			if newStart+vs > ip.total {
+				newStart = ip.total - vs
+			}
+			ip.viewportStart = newStart
+		}
+	}
+
 	ip.redraw()
 }
 
@@ -142,7 +187,12 @@ func (ip *InteractiveProgress) redraw() {
 	}
 
 	lines := 0
-	for i := 0; i < ip.total; i++ {
+	vs := ip.viewSize()
+	end := ip.viewportStart + vs
+	if end > ip.total {
+		end = ip.total
+	}
+	for i := ip.viewportStart; i < end; i++ {
 		svc := ip.services[i]
 		if svc == nil {
 			fmt.Fprintf(ip.w(), "\r\033[K[%d/%d]\n", i+1, ip.total)
@@ -168,6 +218,27 @@ func (ip *InteractiveProgress) redraw() {
 		)
 		lines++
 	}
+
+	// Footer summary — always shown as a status bar.
+	var pending, installing, done int
+	for j := 0; j < ip.total; j++ {
+		s := ip.services[j]
+		if s == nil {
+			pending++
+			continue
+		}
+		switch s.status {
+		case StatusPending, StatusWaiting:
+			pending++
+		case StatusInstalling, StatusUninstalling:
+			installing++
+		default:
+			done++
+		}
+	}
+	fmt.Fprintf(ip.w(), "\r\033[K  %d %s  %d done  %d pending\n",
+		installing, strings.ToLower(ip.operation), done, pending)
+	lines++
 
 	extraLines := ip.linesWritten - lines
 	if extraLines > 0 {
