@@ -1048,7 +1048,7 @@ func TestParseK8sVersion(test *testing.T) {
 		{
 			name:     "no version configured uses kind default",
 			cfg:      config.ClusterConfig{},
-			expected: "v1.35.1",
+			expected: "v1.36.1",
 		},
 		{
 			name:     "version field set",
@@ -1068,7 +1068,7 @@ func TestParseK8sVersion(test *testing.T) {
 		{
 			name:     "default image constant parses correctly",
 			cfg:      config.ClusterConfig{NodeImage: defaults.Image},
-			expected: "v1.35.1",
+			expected: "v1.36.1",
 		},
 	}
 
