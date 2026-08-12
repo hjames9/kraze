@@ -579,7 +579,7 @@ services:
 
 **Behavior:**
 - Disabled services are completely skipped during `kraze up` (not installed)
-- Disabled services are ignored during `kraze down` (not uninstalled)
+- Disabled services are ignored by a plain `kraze down` (not uninstalled). If you explicitly name a disabled service (`kraze down myservice`) or match it with `--label`, it's uninstalled anyway. To clean up *all* disabled services that are still installed (e.g. you flipped `enabled: false` after deploying one), use `kraze down --disabled`
 - `kraze status` shows disabled services with "DISABLED" status
 - `kraze plan` shows disabled services as "skipped"
 - **Validation:** Enabled services cannot depend on disabled services (validation error)

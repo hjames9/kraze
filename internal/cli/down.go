@@ -21,6 +21,7 @@ var (
 	downKeepCRDs                 bool
 	downLabels                   []string
 	downNamespaceDeletionTimeout time.Duration
+	downDisabledOnly             bool
 )
 
 var downCmd = &cobra.Command{
@@ -34,7 +35,12 @@ Services will be uninstalled in reverse dependency order.
 You can filter services by name or by labels:
   kraze down service1 service2    # Uninstall specific services
   kraze down --label env=dev      # Uninstall services with label env=dev
-  kraze down --label tier=backend # Uninstall services with label tier=backend`,
+  kraze down --label tier=backend # Uninstall services with label tier=backend
+
+Services with enabled: false are normally left alone. Use --disabled to
+instead target only services that are disabled in config but still
+installed (e.g. you flipped enabled: false after deploying it):
+  kraze down --disabled           # Remove disabled-but-installed services only`,
 	ValidArgsFunction: getServiceNames,
 	RunE:              runDown,
 }
@@ -68,6 +74,10 @@ func runDown(cmd *cobra.Command, args []string) error {
 	requestedServices := args
 	specificServicesRequested := len(requestedServices) > 0 || len(downLabels) > 0
 
+	if downDisabledOnly && specificServicesRequested {
+		return fmt.Errorf("--disabled cannot be combined with service names or --label")
+	}
+
 	// Check if both service names and labels are specified
 	if len(requestedServices) > 0 && len(downLabels) > 0 {
 		return fmt.Errorf("cannot specify both service names and labels, use one or the other")
@@ -89,37 +99,27 @@ func runDown(cmd *cobra.Command, args []string) error {
 			return fmt.Errorf("failed to filter services: %w", err)
 		}
 		cfg.Services = filteredServices
+	} else if downDisabledOnly {
+		Verbose("--disabled flag set, will only target services disabled in config that are still installed")
 	} else {
 		Verbose("No services specified, will uninstall all services")
 	}
 
-	// Filter out disabled services
-	disabledCount := 0
-	enabledServices := make(map[string]config.ServiceConfig)
-	for name, svc := range cfg.Services {
-		if svc.IsEnabled() {
-			enabledServices[name] = svc
-		} else {
-			disabledCount++
-			Verbose("Skipping disabled service '%s' (not attempting uninstall)", name)
+	// A disabled service that was explicitly named or matched by label is
+	// still uninstalled (an explicit request takes precedence over enabled:
+	// false); no extra filtering needed for that path below.
+	if specificServicesRequested {
+		for name, svc := range cfg.Services {
+			if !svc.IsEnabled() {
+				Verbose("Service '%s' is disabled but was explicitly requested, uninstalling anyway", name)
+			}
 		}
-	}
-	if disabledCount > 0 {
-		Verbose("Filtered out %d disabled service(s)", disabledCount)
-	}
-	cfg.Services = enabledServices
-
-	if dryRun {
-		fmt.Printf("[DRY RUN] Would uninstall %d service(s)\n", len(cfg.Services))
-		for name := range cfg.Services {
-			fmt.Printf("  - %s\n", name)
-		}
-		return nil
 	}
 
 	var orderedServices []*config.ServiceConfig
 
-	if specificServicesRequested {
+	switch {
+	case specificServicesRequested:
 		// When specific services are requested, uninstall them in the order specified
 		// (no dependency resolution needed - just uninstall what was asked)
 		if len(downLabels) > 0 {
@@ -137,8 +137,46 @@ func runDown(cmd *cobra.Command, args []string) error {
 				}
 			}
 		}
-	} else {
-		// When uninstalling all services, respect dependencies (reverse order)
+
+	case downDisabledOnly:
+		// Build the graph from the full config (not just disabled services)
+		// so DependsOn edges referencing enabled services still resolve
+		// correctly, then keep only the disabled ones from the resulting
+		// order. The IsInstalled() check in the uninstall loop below skips
+		// any disabled service that was never actually deployed.
+		depGraph := graph.NewDependencyGraph(cfg.Services)
+		fullOrder, err := depGraph.ReverseTopologicalSort()
+		if err != nil {
+			return fmt.Errorf("failed to resolve dependencies: %w", err)
+		}
+		for _, svc := range fullOrder {
+			if !svc.IsEnabled() {
+				orderedServices = append(orderedServices, svc)
+			}
+		}
+		if len(orderedServices) == 0 {
+			fmt.Println("No disabled services found in config")
+			return nil
+		}
+
+	default:
+		// When uninstalling all services, respect dependencies (reverse
+		// order). Disabled services are skipped entirely here; use
+		// 'kraze down --disabled' to remove disabled-but-installed services.
+		disabledCount := 0
+		enabledServices := make(map[string]config.ServiceConfig)
+		for name, svc := range cfg.Services {
+			if svc.IsEnabled() {
+				enabledServices[name] = svc
+			} else {
+				disabledCount++
+				Verbose("Skipping disabled service '%s' (use 'kraze down --disabled' to remove disabled-but-installed services)", name)
+			}
+		}
+		if disabledCount > 0 {
+			Verbose("Filtered out %d disabled service(s)", disabledCount)
+		}
+		cfg.Services = enabledServices
 
 		// Create dependency graph
 		depGraph := graph.NewDependencyGraph(cfg.Services)
@@ -149,6 +187,18 @@ func runDown(cmd *cobra.Command, args []string) error {
 		if err != nil {
 			return fmt.Errorf("failed to resolve dependencies: %w", err)
 		}
+	}
+
+	if dryRun {
+		fmt.Printf("[DRY RUN] Would uninstall %d service(s)\n", len(orderedServices))
+		for _, svc := range orderedServices {
+			if downDisabledOnly {
+				fmt.Printf("  - %s (disabled in config, removed only if still installed)\n", svc.Name)
+			} else {
+				fmt.Printf("  - %s\n", svc.Name)
+			}
+		}
+		return nil
 	}
 
 	// Verify cluster exists and get kubeconfig
@@ -211,11 +261,14 @@ func runDown(cmd *cobra.Command, args []string) error {
 
 	// Collect namespaces to clean up BEFORE uninstalling (since uninstall removes from state)
 	// For local dev environments, aggressively clean up namespaces when uninstalling services
-	// - When uninstalling specific services: clean up namespaces used by those services (if no other services need them)
+	// - When uninstalling specific (or --disabled-only) services: clean up namespaces used by those services (if no other services need them)
 	// - When uninstalling all services: clean up ALL namespaces (nothing will be using them)
 	var namespacesToCleanup map[string]int
-	if specificServicesRequested {
-		// Get list of service names being uninstalled
+	if specificServicesRequested || downDisabledOnly {
+		// Get list of service names being uninstalled. --disabled-only must
+		// use this targeted path too (not the "uninstalling everything"
+		// branch below), since it only tears down a subset of services and
+		// must not mark every other namespace for cleanup.
 		var serviceNames []string
 		for _, svc := range orderedServices {
 			serviceNames = append(serviceNames, svc.Name)
@@ -421,4 +474,5 @@ func init() {
 	downCmd.Flags().BoolVar(&downKeepCRDs, "keep-crds", false, "Keep CRDs when uninstalling Helm charts")
 	downCmd.Flags().StringSliceVarP(&downLabels, "label", "l", []string{}, "Filter services by label (format: key=value, can be specified multiple times)")
 	downCmd.Flags().DurationVar(&downNamespaceDeletionTimeout, "namespace-deletion-timeout", 30*time.Second, "How long to wait for each namespace to be deleted (0 = don't wait, e.g., 30s, 1m)")
+	downCmd.Flags().BoolVar(&downDisabledOnly, "disabled", false, "Only uninstall services that are disabled in config (enabled: false) but still installed")
 }
