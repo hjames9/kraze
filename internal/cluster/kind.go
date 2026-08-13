@@ -1365,6 +1365,11 @@ func (kind *KindManager) buildKindNode(node config.KindNode) v1alpha4.Node {
 		kindNode.Labels = node.Labels
 	}
 
+	// Set node-level kubeadm config patches (applied after any cluster-level patches)
+	if len(node.KubeadmConfigPatches) > 0 {
+		kindNode.KubeadmConfigPatches = node.KubeadmConfigPatches
+	}
+
 	return kindNode
 }
 

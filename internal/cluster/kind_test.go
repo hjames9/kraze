@@ -2,11 +2,37 @@ package cluster
 
 import (
 	"fmt"
+	"reflect"
 	"testing"
 
 	"github.com/hjames9/kraze/internal/config"
 	"sigs.k8s.io/kind/pkg/apis/config/defaults"
 	"sigs.k8s.io/kind/pkg/apis/config/v1alpha4"
+)
+
+// Representative node-level kubeadm merge patches, shared by the tests below.
+const (
+	controllerManagerPatch = `kind: ClusterConfiguration
+apiVersion: kubeadm.k8s.io/v1beta4
+controllerManager:
+  extraArgs:
+    - name: leader-elect-lease-duration
+      value: 180s
+`
+	schedulerPatch = `kind: ClusterConfiguration
+apiVersion: kubeadm.k8s.io/v1beta4
+scheduler:
+  extraArgs:
+    - name: leader-elect-renew-deadline
+      value: 120s
+`
+	workerPatch = `kind: JoinConfiguration
+apiVersion: kubeadm.k8s.io/v1beta4
+nodeRegistration:
+  kubeletExtraArgs:
+    - name: max-pods
+      value: "200"
+`
 )
 
 func TestBuildKindNode(test *testing.T) {
@@ -137,6 +163,34 @@ func TestBuildKindNode(test *testing.T) {
 				}
 			},
 		},
+		{
+			name: "node with kubeadm config patches",
+			input: config.KindNode{
+				Role: "control-plane",
+				KubeadmConfigPatches: []string{
+					controllerManagerPatch,
+					schedulerPatch,
+				},
+			},
+			validate: func(test *testing.T, node v1alpha4.Node) {
+				want := []string{controllerManagerPatch, schedulerPatch}
+				if !reflect.DeepEqual(node.KubeadmConfigPatches, want) {
+					test.Errorf("KubeadmConfigPatches: got %#v, want %#v", node.KubeadmConfigPatches, want)
+				}
+			},
+		},
+		{
+			name: "node without kubeadm config patches leaves field nil",
+			input: config.KindNode{
+				Role: "worker",
+			},
+			validate: func(test *testing.T, node v1alpha4.Node) {
+				// nil (not empty slice) so the key is omitted from the serialised kind config
+				if node.KubeadmConfigPatches != nil {
+					test.Errorf("KubeadmConfigPatches: got %#v, want nil", node.KubeadmConfigPatches)
+				}
+			},
+		},
 	}
 
 	for _, tt := range tests {
@@ -250,6 +304,128 @@ func TestBuildKindConfig(test *testing.T) {
 					if cluster.Nodes[itr].Role != v1alpha4.WorkerRole {
 						test.Errorf("Node[%d].Role: got %v, want WorkerRole", itr, cluster.Nodes[itr].Role)
 					}
+				}
+			},
+		},
+		{
+			name: "node-level kubeadm config patches reach the generated node",
+			input: config.ClusterConfig{
+				Name: "test-cluster",
+				Config: []config.KindNode{
+					{
+						Role:                 "control-plane",
+						KubeadmConfigPatches: []string{controllerManagerPatch, schedulerPatch},
+					},
+				},
+			},
+			validate: func(test *testing.T, cluster *v1alpha4.Cluster) {
+				if len(cluster.Nodes) != 1 {
+					test.Fatalf("Nodes: got %d, want 1", len(cluster.Nodes))
+				}
+				// Content and order must match exactly - kind applies patches in order
+				want := []string{controllerManagerPatch, schedulerPatch}
+				if !reflect.DeepEqual(cluster.Nodes[0].KubeadmConfigPatches, want) {
+					test.Errorf("Node[0].KubeadmConfigPatches: got %#v, want %#v",
+						cluster.Nodes[0].KubeadmConfigPatches, want)
+				}
+				// Node-level patches must not leak into the cluster-level field
+				if len(cluster.KubeadmConfigPatches) != 0 {
+					test.Errorf("cluster.KubeadmConfigPatches: got %d, want 0", len(cluster.KubeadmConfigPatches))
+				}
+			},
+		},
+		{
+			name: "kubeadm config patches land only on the node that declares them",
+			input: config.ClusterConfig{
+				Name: "test-cluster",
+				Config: []config.KindNode{
+					{
+						Role:                 "control-plane",
+						KubeadmConfigPatches: []string{controllerManagerPatch},
+					},
+					{Role: "worker"},
+					{
+						Role:                 "worker",
+						KubeadmConfigPatches: []string{workerPatch},
+					},
+				},
+			},
+			validate: func(test *testing.T, cluster *v1alpha4.Cluster) {
+				if len(cluster.Nodes) != 3 {
+					test.Fatalf("Nodes: got %d, want 3", len(cluster.Nodes))
+				}
+				if want := []string{controllerManagerPatch}; !reflect.DeepEqual(cluster.Nodes[0].KubeadmConfigPatches, want) {
+					test.Errorf("Node[0].KubeadmConfigPatches: got %#v, want %#v",
+						cluster.Nodes[0].KubeadmConfigPatches, want)
+				}
+				// The middle node declared none, so it must stay nil (omitted on serialise)
+				if cluster.Nodes[1].KubeadmConfigPatches != nil {
+					test.Errorf("Node[1].KubeadmConfigPatches: got %#v, want nil", cluster.Nodes[1].KubeadmConfigPatches)
+				}
+				if want := []string{workerPatch}; !reflect.DeepEqual(cluster.Nodes[2].KubeadmConfigPatches, want) {
+					test.Errorf("Node[2].KubeadmConfigPatches: got %#v, want %#v",
+						cluster.Nodes[2].KubeadmConfigPatches, want)
+				}
+			},
+		},
+		{
+			name: "replica expansion copies kubeadm config patches to every replica",
+			input: config.ClusterConfig{
+				Name: "test-cluster",
+				Config: []config.KindNode{
+					{Role: "control-plane"},
+					{
+						Role:                 "worker",
+						Replicas:             3,
+						KubeadmConfigPatches: []string{workerPatch},
+					},
+				},
+			},
+			validate: func(test *testing.T, cluster *v1alpha4.Cluster) {
+				if len(cluster.Nodes) != 4 {
+					test.Fatalf("Nodes: got %d, want 4 (1 control-plane + 3 workers)", len(cluster.Nodes))
+				}
+				if cluster.Nodes[0].KubeadmConfigPatches != nil {
+					test.Errorf("Node[0].KubeadmConfigPatches: got %#v, want nil", cluster.Nodes[0].KubeadmConfigPatches)
+				}
+				want := []string{workerPatch}
+				for itr := 1; itr <= 3; itr++ {
+					if !reflect.DeepEqual(cluster.Nodes[itr].KubeadmConfigPatches, want) {
+						test.Errorf("Node[%d].KubeadmConfigPatches: got %#v, want %#v",
+							itr, cluster.Nodes[itr].KubeadmConfigPatches, want)
+					}
+				}
+			},
+		},
+		{
+			name: "kubeadm config patches coexist with extra mounts and the injected GODEBUG mount",
+			input: config.ClusterConfig{
+				Name: "test-cluster",
+				Config: []config.KindNode{
+					{
+						Role:                 "control-plane",
+						KubeadmConfigPatches: []string{controllerManagerPatch},
+						ExtraMounts: []config.Mount{
+							{HostPath: "/mnt/cache", ContainerPath: "/mnt/cache"},
+						},
+					},
+				},
+			},
+			validate: func(test *testing.T, cluster *v1alpha4.Cluster) {
+				if len(cluster.Nodes) != 1 {
+					test.Fatalf("Nodes: got %d, want 1", len(cluster.Nodes))
+				}
+				node := cluster.Nodes[0]
+				// User mount first, then the always-appended GODEBUG mount
+				if len(node.ExtraMounts) != 2 {
+					test.Fatalf("ExtraMounts: got %d, want 2 (user mount + GODEBUG)", len(node.ExtraMounts))
+				}
+				if node.ExtraMounts[0].HostPath != "/mnt/cache" {
+					test.Errorf("ExtraMounts[0].HostPath: got %q, want %q", node.ExtraMounts[0].HostPath, "/mnt/cache")
+				}
+				// Mount appending must leave the patches untouched
+				if want := []string{controllerManagerPatch}; !reflect.DeepEqual(node.KubeadmConfigPatches, want) {
+					test.Errorf("KubeadmConfigPatches: got %#v, want %#v", node.KubeadmConfigPatches, want)
 				}
 			},
 		},

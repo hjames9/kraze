@@ -1,0 +1,58 @@
+# Values for the bitnami/keycloak chart.
+#
+# The `extraInitContainers` block below is a raw YAML *string* as far as the
+# chart is concerned. kraze's image auto-detection walks structured values and
+# cannot parse an image reference out of an opaque string, so the theme image
+# is listed explicitly under `images:` in kraze.yml.
+#
+# The keycloak image itself comes from the chart defaults and IS auto-detected.
+
+# Single replica is plenty for local development
+replicaCount: 1
+
+auth:
+  adminUser: admin
+  adminPassword: admin
+
+# Use the lightweight dev-mode database rather than a bundled PostgreSQL
+postgresql:
+  enabled: false
+
+extraEnvVars:
+  - name: KC_DB
+    value: dev-file
+
+# Copies a custom theme into the Keycloak themes directory before startup.
+# The image referenced here is invisible to auto-detection - see kraze.yml.
+extraInitContainers: |
+  - name: theme-provider
+    image: hjames/kora-keycloak-theme:latest
+    imagePullPolicy: IfNotPresent
+    command:
+      - sh
+      - -c
+      - cp -R /themes/. /shared-themes/
+    volumeMounts:
+      - name: themes
+        mountPath: /shared-themes
+
+extraVolumes:
+  - name: themes
+    emptyDir: {}
+
+extraVolumeMounts:
+  - name: themes
+    mountPath: /opt/bitnami/keycloak/themes/custom
+
+service:
+  type: ClusterIP
+  ports:
+    http: 80
+
+resources:
+  requests:
+    memory: "512Mi"
+    cpu: "250m"
+  limits:
+    memory: "1Gi"
+    cpu: "500m"

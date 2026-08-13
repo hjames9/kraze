@@ -3,7 +3,11 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"reflect"
+	"strings"
 	"testing"
+
+	"gopkg.in/yaml.v3"
 )
 
 func TestParse(test *testing.T) {
@@ -274,5 +278,100 @@ func TestResolvePaths(test *testing.T) {
 	expected := filepath.Join(tmpDir, "manifests")
 	if cfg.Services["api"].Path != expected {
 		test.Errorf("Expected path '%s', got '%s'", expected, cfg.Services["api"].Path)
+	}
+}
+
+// TestParseNodeKubeadmConfigPatches is the regression guard for node-level
+// kubeadmConfigPatches. The YAML decoder is lenient, so before KindNode carried
+// this field the key parsed "successfully" and was silently discarded - config
+// that did nothing still validated clean. These assertions fail loudly if the
+// field is ever removed or renamed.
+func TestParseNodeKubeadmConfigPatches(test *testing.T) {
+	tmpDir := test.TempDir()
+	configFile := filepath.Join(tmpDir, "kraze.yml")
+
+	configContent := `
+cluster:
+  name: dev-cluster
+  config:
+    - role: control-plane
+      kubeadmConfigPatches:
+        - |
+          kind: ClusterConfiguration
+          apiVersion: kubeadm.k8s.io/v1beta4
+          controllerManager:
+            extraArgs:
+              - name: leader-elect-lease-duration
+                value: 180s
+        - |
+          kind: ClusterConfiguration
+          apiVersion: kubeadm.k8s.io/v1beta4
+          scheduler:
+            extraArgs:
+              - name: leader-elect-renew-deadline
+                value: 120s
+      extraMounts:
+        - hostPath: /mnt/cache
+          containerPath: /mnt/cache
+    - role: worker
+
+services: {}
+`
+
+	if err := os.WriteFile(configFile, []byte(configContent), 0644); err != nil {
+		test.Fatalf("Failed to write test config: %v", err)
+	}
+
+	cfg, err := Parse(configFile)
+	if err != nil {
+		test.Fatalf("Failed to parse config: %v", err)
+	}
+
+	if len(cfg.Cluster.Config) != 2 {
+		test.Fatalf("Expected 2 node configs, got %d", len(cfg.Cluster.Config))
+	}
+
+	want := []string{
+		"kind: ClusterConfiguration\napiVersion: kubeadm.k8s.io/v1beta4\ncontrollerManager:\n  extraArgs:\n    - name: leader-elect-lease-duration\n      value: 180s\n",
+		"kind: ClusterConfiguration\napiVersion: kubeadm.k8s.io/v1beta4\nscheduler:\n  extraArgs:\n    - name: leader-elect-renew-deadline\n      value: 120s\n",
+	}
+
+	got := cfg.Cluster.Config[0].KubeadmConfigPatches
+	if !reflect.DeepEqual(got, want) {
+		test.Errorf("KubeadmConfigPatches: got %#v, want %#v", got, want)
+	}
+
+	// Sibling keys on the same node must still decode
+	if len(cfg.Cluster.Config[0].ExtraMounts) != 1 {
+		test.Fatalf("Expected 1 extra mount, got %d", len(cfg.Cluster.Config[0].ExtraMounts))
+	}
+	if cfg.Cluster.Config[0].ExtraMounts[0].HostPath != "/mnt/cache" {
+		test.Errorf("ExtraMounts[0].HostPath: got %q, want %q",
+			cfg.Cluster.Config[0].ExtraMounts[0].HostPath, "/mnt/cache")
+	}
+
+	// A node that declares no patches must stay nil, not an empty slice
+	if cfg.Cluster.Config[1].KubeadmConfigPatches != nil {
+		test.Errorf("Node[1].KubeadmConfigPatches: got %#v, want nil", cfg.Cluster.Config[1].KubeadmConfigPatches)
+	}
+
+	// Round-trip: re-marshalling must preserve the patches and, thanks to
+	// omitempty, must not emit the key for the node that has none.
+	out, err := yaml.Marshal(cfg)
+	if err != nil {
+		test.Fatalf("Failed to marshal config: %v", err)
+	}
+
+	var reparsed Config
+	if err := yaml.Unmarshal(out, &reparsed); err != nil {
+		test.Fatalf("Failed to re-parse marshalled config: %v", err)
+	}
+	if !reflect.DeepEqual(reparsed.Cluster.Config[0].KubeadmConfigPatches, want) {
+		test.Errorf("After round-trip: got %#v, want %#v",
+			reparsed.Cluster.Config[0].KubeadmConfigPatches, want)
+	}
+	if strings.Count(string(out), "kubeadmConfigPatches") != 1 {
+		test.Errorf("Expected exactly 1 kubeadmConfigPatches key in marshalled output (omitempty), got %d:\n%s",
+			strings.Count(string(out), "kubeadmConfigPatches"), out)
 	}
 }

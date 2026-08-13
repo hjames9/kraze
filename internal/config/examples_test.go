@@ -3,8 +3,75 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"slices"
+	"sort"
 	"testing"
 )
+
+// requiredExamples are the examples documented in CLAUDE.md. They must always
+// be present; every other example directory is discovered automatically.
+var requiredExamples = []string{
+	"minimal",
+	"charts",
+	"manifests",
+	"dependencies",
+	"corporate-network",
+}
+
+// discoverExamples returns the names of every example directory holding a
+// top-level kraze.yml - the same set `make validate-examples` iterates over.
+//
+// Discovery is deliberate: this list used to be hardcoded, so examples added
+// later (corporate-network, external-cluster, labels, vllm-rag-amd) were never
+// covered by the Go tests even though CLAUDE.md promises they are picked up
+// automatically.
+func discoverExamples(test *testing.T, examplesDir string) []string {
+	test.Helper()
+
+	matches, err := filepath.Glob(filepath.Join(examplesDir, "*", "kraze.yml"))
+	if err != nil {
+		test.Fatalf("Failed to scan examples directory: %v", err)
+	}
+
+	names := make([]string, 0, len(matches))
+	for _, match := range matches {
+		names = append(names, filepath.Base(filepath.Dir(match)))
+	}
+	sort.Strings(names)
+	return names
+}
+
+// assertReferencedPathsExist checks that every local file or directory a config
+// points at is actually present.
+//
+// `kraze validate` only checks schema and cross-references, so a config can
+// report "valid" while referencing a values file or manifest that was never
+// committed - the failure then only surfaces at `kraze up`. This caught
+// examples/explicit-images referencing two files that did not exist.
+func assertReferencedPathsExist(test *testing.T, label string, cfg *Config) {
+	test.Helper()
+
+	check := func(serviceName, field, path string) {
+		// Remote references are resolved at install time, not from disk.
+		if path == "" || IsHTTPURL(path) || IsOCIURL(path) {
+			return
+		}
+		if _, err := os.Stat(path); err != nil {
+			test.Errorf("%s: service %q references a %s that does not exist: %s",
+				label, serviceName, field, path)
+		}
+	}
+
+	for name, svc := range cfg.Services {
+		check(name, "path", svc.Path)
+		for _, path := range svc.Paths {
+			check(name, "paths entry", path)
+		}
+		for _, valuesFile := range svc.Values.Files() {
+			check(name, "values file", valuesFile)
+		}
+	}
+}
 
 // TestAllExamples validates that all example configurations parse successfully
 func TestAllExamples(test *testing.T) {
@@ -18,40 +85,25 @@ func TestAllExamples(test *testing.T) {
 		return
 	}
 
-	// Define expected examples
-	expectedExamples := []string{
-		"minimal",
-		"charts",
-		"manifests",
-		"dependencies",
-		"nvidia-gpu",
-		"amd-gpu",
-		"amd-rocminfo",
-		"vllm-amd",
-		"cuda-vectoradd",
-		"vllm",
-		"vllm-local",
-		"vllm-openwebui",
-		"vllm-rag",
-		"image-volumes",
-		"pack",
-		"explicit-images",
+	discovered := discoverExamples(test, examplesDir)
+	if len(discovered) == 0 {
+		test.Fatalf("No examples with a kraze.yml found under %s", examplesDir)
+	}
+
+	// The documented examples must not disappear.
+	for _, required := range requiredExamples {
+		if !slices.Contains(discovered, required) {
+			test.Errorf("Documented example %q is missing from %s", required, examplesDir)
+		}
 	}
 
 	// Track validation results
 	var passed, failed int
 
-	for _, exampleName := range expectedExamples {
+	for _, exampleName := range discovered {
 		examplePath := filepath.Join(examplesDir, exampleName, "kraze.yml")
 
 		test.Run(exampleName, func(test *testing.T) {
-			// Check if example file exists
-			if _, err := os.Stat(examplePath); os.IsNotExist(err) {
-				test.Errorf("Example file not found: %s", examplePath)
-				failed++
-				return
-			}
-
 			// Parse the configuration
 			cfg, err := Parse(examplePath)
 			if err != nil {
@@ -117,6 +169,10 @@ func TestAllExamples(test *testing.T) {
 					return
 				}
 			}
+
+			// Every local file the example points at must actually exist,
+			// otherwise the example validates but cannot be deployed.
+			assertReferencedPathsExist(test, "Example '"+exampleName+"'", cfg)
 
 			test.Logf("Example '%s' validated successfully (%d service(s))", exampleName, len(cfg.Services))
 			passed++
@@ -225,6 +281,10 @@ func TestMultiConfigExample(test *testing.T) {
 	if err != nil {
 		test.Fatalf("Failed to parse multi-config example: %v", err)
 	}
+
+	// The multi-config example is not covered by TestAllExamples (it has no
+	// top-level kraze.yml and is only valid when merged), so check its paths here.
+	assertReferencedPathsExist(test, "Example 'multi-config'", cfg)
 
 	if cfg.Cluster.Name == "" {
 		test.Error("Expected cluster name to be set")

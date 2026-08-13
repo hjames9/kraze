@@ -1,7 +1,10 @@
 package config
 
 import (
+	"bytes"
+	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -50,11 +53,59 @@ func readAndExpand(configPath string) ([]byte, error) {
 }
 
 // unmarshalConfig parses YAML bytes into a Config struct.
+//
+// Decoding is strict: unknown keys are rejected rather than silently discarded.
+// A lenient decoder lets a typo ("extramounts", "depends_onn") or an unsupported
+// key parse cleanly and do nothing, so `kraze validate` would report success for
+// a config that does not mean what it says.
 func unmarshalConfig(data []byte, config *Config) error {
-	if err := yaml.Unmarshal(data, config); err != nil {
-		return fmt.Errorf("failed to parse YAML: %w", err)
+	decoder := yaml.NewDecoder(bytes.NewReader(data))
+	decoder.KnownFields(true)
+
+	if err := decoder.Decode(config); err != nil {
+		// An empty (or comment-only) file decodes to EOF. Leave the zero-value
+		// Config in place and let Validate() report the missing required fields.
+		if errors.Is(err, io.EOF) {
+			return nil
+		}
+		return fmt.Errorf("failed to parse YAML: %w", friendlyYAMLError(err))
 	}
 	return nil
+}
+
+// configSectionNames maps internal Go type names to the kraze.yml section a user
+// would recognise, so strict-decoding errors don't leak implementation details.
+var configSectionNames = map[string]string{
+	"config.Config":                "top level",
+	"config.ClusterConfig":         "cluster",
+	"config.KindNode":              "cluster.config entry",
+	"config.PortMapping":           "extraPortMappings entry",
+	"config.Mount":                 "extraMounts entry",
+	"config.NetworkingConfig":      "cluster.networking",
+	"config.ProxyConfig":           "cluster.proxy",
+	"config.GPUConfig":             "cluster.gpu",
+	"config.GPUVendorConfig":       "cluster.gpu vendor",
+	"config.ExternalClusterConfig": "cluster.external",
+	"config.ServiceConfig":         "service",
+}
+
+// friendlyYAMLError rewrites yaml.v3's "field X not found in type config.Y"
+// messages to name the kraze.yml section instead of the Go type.
+func friendlyYAMLError(err error) error {
+	typeErr := &yaml.TypeError{}
+	if !errors.As(err, &typeErr) {
+		return err
+	}
+
+	rewritten := make([]string, 0, len(typeErr.Errors))
+	for _, msg := range typeErr.Errors {
+		for goType, section := range configSectionNames {
+			msg = strings.ReplaceAll(msg, "in type "+goType, "in "+section)
+		}
+		rewritten = append(rewritten, msg)
+	}
+
+	return fmt.Errorf("%s", strings.Join(rewritten, "\n  "))
 }
 
 // Validate performs validation on the entire configuration

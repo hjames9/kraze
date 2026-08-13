@@ -31,11 +31,12 @@ type ClusterConfig struct {
 
 // KindNode represents a kind node configuration
 type KindNode struct {
-	Role              string            `yaml:"role"` // control-plane or worker
-	Replicas          int               `yaml:"replicas,omitempty"`
-	ExtraPortMappings []PortMapping     `yaml:"extraPortMappings,omitempty"`
-	ExtraMounts       []Mount           `yaml:"extraMounts,omitempty"`
-	Labels            map[string]string `yaml:"labels,omitempty"`
+	Role                 string            `yaml:"role"` // control-plane or worker
+	Replicas             int               `yaml:"replicas,omitempty"`
+	ExtraPortMappings    []PortMapping     `yaml:"extraPortMappings,omitempty"`
+	ExtraMounts          []Mount           `yaml:"extraMounts,omitempty"`
+	Labels               map[string]string `yaml:"labels,omitempty"`
+	KubeadmConfigPatches []string          `yaml:"kubeadmConfigPatches,omitempty"` // Node-level kubeadm merge patches, applied after cluster-level patches
 }
 
 // PortMapping represents a port mapping from container to host

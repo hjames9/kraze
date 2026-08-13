@@ -391,6 +391,23 @@ kraze validate
 kraze validate -f dev.yml
 ```
 
+Validation is **strict**: unknown keys are errors, not warnings. A misspelled or
+unsupported key used to parse cleanly and be silently ignored, so a config that did
+nothing still reported "valid". All offending keys are reported at once:
+
+```console
+$ kraze validate
+Error: validation failed: failed to parse YAML: line 5: field extramounts not found in cluster.config entry
+  line 12: field depends_onn not found in service
+```
+
+Note that `name:` inside a service block is rejected — services take their name from
+the map key, so the key was always ignored. Remove it if you have one.
+
+Validation checks syntax, schema, and cross-references (dependencies, enabled/disabled
+constraints). It does **not** check that referenced values files or manifest paths exist
+on disk; those are resolved at `kraze up`.
+
 #### `kraze pack`
 Bundle a kraze deployment into a portable `.tar.gz` archive for sharing.
 
@@ -470,6 +487,21 @@ cluster:
         - containerPort: 30080
           hostPort: 8080
           protocol: TCP
+      extraMounts:                    # Mount host directories into the node
+        - hostPath: /mnt/cache
+          containerPath: /mnt/cache
+      kubeadmConfigPatches:           # Node-level kubeadm patches (applied at cluster creation)
+        - |
+          kind: ClusterConfiguration
+          apiVersion: kubeadm.k8s.io/v1beta4
+          controllerManager:
+            extraArgs:
+              - name: leader-elect-lease-duration
+                value: 180s
+          scheduler:
+            extraArgs:
+              - name: leader-elect-renew-deadline
+                value: 120s
 
   # Optional: Corporate network support
   # ca_certificates:                  # Trust custom CA certificates
@@ -549,6 +581,38 @@ services:
     images:
       - myorg/custom-theme:latest   # loaded before helm install, merged with auto-detected images
 ```
+
+#### Node-Level kubeadm Config Patches
+
+Each entry under `cluster.config` accepts `kubeadmConfigPatches`: a list of YAML
+[strategic merge patches](https://tools.ietf.org/html/rfc7386) applied to the kubeadm
+config that node is created with. Use it to tune control-plane component flags so they
+survive a `kraze destroy` / `kraze up` cycle instead of being re-applied by hand.
+
+```yaml
+cluster:
+  name: dev-cluster
+  config:
+    - role: control-plane
+      kubeadmConfigPatches:
+        - |
+          kind: ClusterConfiguration
+          apiVersion: kubeadm.k8s.io/v1beta4
+          controllerManager:
+            extraArgs:
+              - name: leader-elect-lease-duration
+                value: 180s
+```
+
+**Notes:**
+- Patches are applied in the order listed. The `kind` field must match the target object;
+  if `apiVersion` is given, only matching objects are patched.
+- Patches apply to the node that declares them. When a node sets `replicas`, each replica
+  gets the same patches.
+- Only takes effect at cluster creation — run `kraze destroy && kraze up` to apply changes.
+- **Limitation:** kubeadm cannot template static pod probes, so settings such as the
+  `kube-apiserver` livenessProbe `failureThreshold` cannot be set this way. Those remain a
+  manual edit to `/etc/kubernetes/manifests/kube-apiserver.yaml` on the node.
 
 #### Disabling Services
 
