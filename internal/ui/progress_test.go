@@ -217,6 +217,152 @@ func TestInteractiveProgressStatusTransitions(t *testing.T) {
 	}
 }
 
+// TestInteractiveProgressBlockFitsTerminalHeight verifies the height invariant:
+// the redrawn block plus the row the cursor rests on afterwards must fit on
+// screen. When it doesn't, the trailing newline scrolls the terminal, the next
+// cursor-up clamps at row 1 instead of the block's first row, and every frame
+// leaks a duplicate copy of the top row into the scrollback.
+func TestInteractiveProgressBlockFitsTerminalHeight(t *testing.T) {
+	cases := []struct{ total, height int }{
+		{37, 38}, // the reported case: block exactly filled the screen
+		{37, 39},
+		{37, 24},
+		{5, 6},
+		{5, 7},
+		{1, 3},
+		{100, 40},
+		{3, 80}, // fits comfortably: no viewport needed
+	}
+
+	for _, tc := range cases {
+		ip := &InteractiveProgress{
+			out:        io.Discard,
+			operation:  "Installing",
+			total:      tc.total,
+			termHeight: tc.height,
+			services:   make(map[int]*serviceInfo),
+		}
+		ip.applyViewport()
+		ip.redraw()
+
+		if ip.linesWritten+1 > tc.height {
+			t.Errorf("total=%d height=%d: drew %d lines, needs %d rows but only %d available",
+				tc.total, tc.height, ip.linesWritten, ip.linesWritten+1, tc.height)
+		}
+		// Redrawing repeatedly must not change the block size.
+		before := ip.linesWritten
+		ip.redraw()
+		if ip.linesWritten != before {
+			t.Errorf("total=%d height=%d: linesWritten changed between redraws (%d → %d)",
+				tc.total, tc.height, before, ip.linesWritten)
+		}
+	}
+}
+
+// TestInteractiveProgressNoViewportWhenItFits verifies the whole list is shown
+// when there is room, so the viewport doesn't kick in needlessly.
+func TestInteractiveProgressNoViewportWhenItFits(t *testing.T) {
+	ip := &InteractiveProgress{
+		out:        io.Discard,
+		operation:  "Installing",
+		total:      10,
+		termHeight: 40,
+		services:   make(map[int]*serviceInfo),
+	}
+	ip.applyViewport()
+	ip.redraw()
+
+	if ip.linesWritten != 11 { // 10 service rows + footer
+		t.Errorf("linesWritten = %d, want 11: all services should be visible when they fit", ip.linesWritten)
+	}
+}
+
+// TestInteractiveProgressLinesFitTerminalWidth verifies the width invariant: no
+// drawn row may exceed the terminal width. A long message (e.g. a
+// CrashLoopBackOff error) that wraps consumes terminal rows linesWritten never
+// counted, so the following cursor-up undershoots and the redraw overwrites the
+// middle of the block instead of the top.
+func TestInteractiveProgressLinesFitTerminalWidth(t *testing.T) {
+	const width = 40
+
+	var buf bytes.Buffer
+	ip := &InteractiveProgress{
+		out:        &buf,
+		operation:  "Installing",
+		total:      2,
+		termWidth:  width,
+		termHeight: 24,
+		services:   make(map[int]*serviceInfo),
+	}
+	ip.services[0] = &serviceInfo{
+		name:    "ripster",
+		status:  StatusFailed,
+		message: strings.Repeat("failed waiting for resources ", 20),
+	}
+	ip.services[1] = &serviceInfo{name: "seaweedfs", status: StatusReady, message: "Deployed"}
+
+	ip.redraw()
+
+	for i, line := range strings.Split(strings.TrimSuffix(buf.String(), "\n"), "\n") {
+		if w := displayWidth(strings.TrimPrefix(line, "\r")); w >= width {
+			t.Errorf("line %d occupies %d columns, terminal is %d wide: it will wrap", i, w, width)
+		}
+	}
+}
+
+func TestTruncateToWidth(t *testing.T) {
+	tests := []struct {
+		name  string
+		in    string
+		width int
+		want  string
+	}{
+		{"fits unchanged", "hello", 10, "hello"},
+		{"exact fit unchanged", "hello", 5, "hello"},
+		{"unknown width unchanged", strings.Repeat("x", 50), 0, strings.Repeat("x", 50)},
+		{"truncates with ellipsis", "hello world", 8, "hello w…"},
+		{"width one", "hello", 1, "h"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := truncateToWidth(tt.in, tt.width); got != tt.want {
+				t.Errorf("truncateToWidth(%q, %d) = %q, want %q", tt.in, tt.width, got, tt.want)
+			}
+		})
+	}
+}
+
+// TestTruncateToWidthIgnoresANSI verifies color escapes cost no columns and that
+// a cut line still resets the color it opened.
+func TestTruncateToWidthIgnoresANSI(t *testing.T) {
+	colored := "\033[32mReady\033[0m"
+
+	if got := truncateToWidth(colored, 5); got != colored {
+		t.Errorf("colored text within width was altered: %q", got)
+	}
+
+	long := "\033[31m" + strings.Repeat("error ", 20) + "\033[0m"
+	got := truncateToWidth(long, 10)
+	if w := displayWidth(got); w > 10 {
+		t.Errorf("truncated to %d columns, want ≤ 10 (%q)", w, got)
+	}
+	if !strings.HasSuffix(got, "\033[0m") {
+		t.Errorf("truncated colored text must end with a reset, got %q", got)
+	}
+}
+
+// TestDisplayWidthWideRunes verifies status icons are measured by the columns
+// they actually occupy, not by rune count.
+func TestDisplayWidthWideRunes(t *testing.T) {
+	if got := displayWidth(IconPending); got != 2 {
+		t.Errorf("displayWidth(%q) = %d, want 2 (wide rune)", IconPending, got)
+	}
+	if got := displayWidth("abc"); got != 3 {
+		t.Errorf("displayWidth(\"abc\") = %d, want 3", got)
+	}
+}
+
 // TestGetStatusIcon verifies that all defined statuses return a non-empty icon.
 func TestGetStatusIcon(t *testing.T) {
 	statuses := []ServiceStatus{

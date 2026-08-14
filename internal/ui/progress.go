@@ -10,6 +10,7 @@ import (
 
 	"github.com/hjames9/kraze/internal/color"
 	"github.com/mattn/go-isatty"
+	"github.com/mattn/go-runewidth"
 	"golang.org/x/term"
 )
 
@@ -58,29 +59,44 @@ func NewProgressManager(verbose bool, plain bool, total int) ProgressManager {
 		return &ScrollingProgress{verbose: verbose, out: os.Stdout}
 	}
 
-	_, height, err := term.GetSize(int(os.Stdout.Fd()))
+	fd := int(os.Stdout.Fd())
+	sizeFn := func() (int, int, error) { return term.GetSize(fd) }
+
+	width, height, err := sizeFn()
 	if err != nil || height <= 0 {
 		height = 24
 	}
+	if err != nil || width <= 0 {
+		width = 80
+	}
 
-	return &InteractiveProgress{out: os.Stdout, termHeight: height}
+	return &InteractiveProgress{out: os.Stdout, termWidth: width, termHeight: height, sizeFn: sizeFn}
 }
 
 // InteractiveProgress displays service status in-place using cursor-up
 // repositioning. When the service list is taller than the terminal it uses a
-// viewport: at most termHeight-4 rows are drawn at once, with a summary footer
-// showing overall counts. The viewport auto-scrolls to keep newly-active
-// services visible. linesWritten is always the number of terminal lines drawn
-// in the last redraw, so the cursor-up repositioning stays exact regardless of
-// viewport position.
+// viewport: at most termHeight-2 rows of services are drawn at once, with a
+// summary footer showing overall counts. The viewport auto-scrolls to keep
+// newly-active services visible. linesWritten is always the number of terminal
+// lines drawn in the last redraw, so the cursor-up repositioning stays exact
+// regardless of viewport position.
+//
+// Two invariants keep the cursor-up arithmetic honest, and violating either one
+// spills duplicate rows into the scrollback on every frame:
+//   - Height: the drawn block plus the row the cursor rests on afterwards must
+//     fit on screen (see applyViewport).
+//   - Width: no drawn row may exceed the terminal width, or it wraps onto extra
+//     terminal rows that linesWritten doesn't know about (see truncateToWidth).
 type InteractiveProgress struct {
 	out           io.Writer
 	services      map[int]*serviceInfo
 	operation     string
 	total         int
+	termWidth     int
 	termHeight    int
-	viewportSize  int // rows to show at once (≤ total)
-	viewportStart int // index of first visible service
+	sizeFn        func() (width, height int, err error) // nil ⇒ fixed size (tests)
+	viewportSize  int                                   // rows to show at once (≤ total)
+	viewportStart int                                   // index of first visible service
 	linesWritten  int
 	mu            sync.Mutex
 	spinnerFrame  int
@@ -111,6 +127,56 @@ func (ip *InteractiveProgress) viewSize() int {
 	return ip.viewportSize
 }
 
+// applyViewport (re)computes viewportSize from the current terminal height.
+//
+// A redraw writes N lines each terminated by "\n", which leaves the cursor on a
+// fresh row *below* the block — so the block needs N+1 rows on screen, not N.
+// If it only gets N, the trailing newline scrolls the screen, the next
+// cursor-up clamps at row 1 instead of reaching the block's first row, and each
+// frame pushes another copy of the top row into the scrollback. With the
+// spinner redrawing 10x/second that is dozens of duplicates.
+//
+// N is viewportSize+1 (service rows + footer), so viewportSize ≤ termHeight-2.
+func (ip *InteractiveProgress) applyViewport() {
+	if ip.termHeight <= 0 || ip.total+2 <= ip.termHeight {
+		ip.viewportSize = 0 // everything fits; show the full list
+		ip.viewportStart = 0
+		return
+	}
+
+	maxRows := ip.termHeight - 2
+	if maxRows < 1 {
+		maxRows = 1
+	}
+	ip.viewportSize = maxRows
+
+	if ip.viewportStart+maxRows > ip.total {
+		ip.viewportStart = ip.total - maxRows
+	}
+	if ip.viewportStart < 0 {
+		ip.viewportStart = 0
+	}
+}
+
+// refreshSize re-reads the terminal dimensions so that resizing the window
+// mid-run doesn't leave the viewport sized for the old geometry.
+func (ip *InteractiveProgress) refreshSize() {
+	if ip.sizeFn == nil {
+		return
+	}
+	width, height, err := ip.sizeFn()
+	if err != nil {
+		return
+	}
+	if width > 0 {
+		ip.termWidth = width
+	}
+	if height > 0 && height != ip.termHeight {
+		ip.termHeight = height
+		ip.applyViewport()
+	}
+}
+
 func (ip *InteractiveProgress) Start(total int, operation string) {
 	ip.mu.Lock()
 	defer ip.mu.Unlock()
@@ -126,15 +192,8 @@ func (ip *InteractiveProgress) Start(total int, operation string) {
 
 	// The header ("\n Installing N...\n\n") is printed once and scrolls into
 	// terminal history — it is not part of the redrawn area. Only the service
-	// rows + footer are redrawn, so the viewport is needed only when
-	// total+1 > termHeight (service rows + footer don't fit on screen).
-	if ip.termHeight > 0 && total+1 > ip.termHeight {
-		maxRows := ip.termHeight - 1
-		if maxRows < 1 {
-			maxRows = 1
-		}
-		ip.viewportSize = maxRows
-	}
+	// rows + footer are redrawn, so the viewport depends on those alone.
+	ip.applyViewport()
 
 	fmt.Fprintf(ip.w(), "\n%s %d service(s)...\n\n", operation, total)
 	shown := ip.viewSize()
@@ -179,6 +238,8 @@ func (ip *InteractiveProgress) UpdateService(index int, name string, status Serv
 }
 
 func (ip *InteractiveProgress) redraw() {
+	ip.refreshSize()
+
 	// Move back to the start of the service block. linesWritten is the exact
 	// number of lines we drew last time; cursor-up by that count lands us on
 	// the first service line regardless of where the screen has scrolled.
@@ -195,7 +256,7 @@ func (ip *InteractiveProgress) redraw() {
 	for i := ip.viewportStart; i < end; i++ {
 		svc := ip.services[i]
 		if svc == nil {
-			fmt.Fprintf(ip.w(), "\r\033[K[%d/%d]\n", i+1, ip.total)
+			ip.drawLine(fmt.Sprintf("[%d/%d]", i+1, ip.total))
 			lines++
 			continue
 		}
@@ -208,14 +269,14 @@ func (ip *InteractiveProgress) redraw() {
 		}
 		statusColor := getStatusColor(svc.status)
 
-		fmt.Fprintf(ip.w(), "\r\033[K[%d/%d] %-20s %s %s  %s\n",
+		ip.drawLine(fmt.Sprintf("[%d/%d] %-20s %s %s  %s",
 			i+1,
 			ip.total,
 			svc.name,
 			statusIcon,
 			statusColor(fmt.Sprintf("%-12s", svc.status)),
 			svc.message,
-		)
+		))
 		lines++
 	}
 
@@ -236,8 +297,8 @@ func (ip *InteractiveProgress) redraw() {
 			done++
 		}
 	}
-	fmt.Fprintf(ip.w(), "\r\033[K  %d %s  %d done  %d pending\n",
-		installing, strings.ToLower(ip.operation), done, pending)
+	ip.drawLine(fmt.Sprintf("  %d %s  %d done  %d pending",
+		installing, strings.ToLower(ip.operation), done, pending))
 	lines++
 
 	extraLines := ip.linesWritten - lines
@@ -248,6 +309,98 @@ func (ip *InteractiveProgress) redraw() {
 		fmt.Fprintf(ip.w(), "\033[%dA", extraLines)
 	}
 	ip.linesWritten = lines
+}
+
+// drawLine writes one row of the redrawn block: return to column 0, clear the
+// row, then emit the content truncated to a single terminal row. Truncation is
+// what keeps one logical line equal to one terminal row — a message longer than
+// the terminal (a multi-line CrashLoopBackOff error, say) would otherwise wrap
+// onto rows that linesWritten never counted, so the next cursor-up would
+// undershoot and start overwriting the middle of the block.
+func (ip *InteractiveProgress) drawLine(content string) {
+	// One column of slack: a row filled to the last column leaves some
+	// terminals in a pending-wrap state that a following newline resolves
+	// inconsistently.
+	fmt.Fprintf(ip.w(), "\r\033[K%s\n", truncateToWidth(content, ip.termWidth-1))
+}
+
+// truncateToWidth cuts s to at most width display columns, counting ANSI escape
+// sequences as zero-width and preserving them intact. A width ≤ 0 means the
+// terminal size is unknown, in which case s is returned unchanged.
+func truncateToWidth(s string, width int) string {
+	if width <= 0 || displayWidth(s) <= width {
+		return s
+	}
+
+	var (
+		b        strings.Builder
+		cols     int
+		sawEsc   bool
+		runes    = []rune(s)
+		maxCols  = width - 1 // room for the ellipsis
+		ellipsis = "…"
+	)
+	if maxCols < 1 {
+		maxCols, ellipsis = width, ""
+	}
+
+	for i := 0; i < len(runes); i++ {
+		if runes[i] == escByte {
+			sawEsc = true
+			j := escapeEnd(runes, i)
+			b.WriteString(string(runes[i:j]))
+			i = j - 1
+			continue
+		}
+		w := runewidth.RuneWidth(runes[i])
+		if cols+w > maxCols {
+			break
+		}
+		b.WriteRune(runes[i])
+		cols += w
+	}
+
+	b.WriteString(ellipsis)
+	if sawEsc {
+		// The cut may have dropped the sequence that resets the color.
+		b.WriteString("\033[0m")
+	}
+	return b.String()
+}
+
+// displayWidth reports the number of terminal columns s occupies, ignoring ANSI
+// escape sequences.
+func displayWidth(s string) int {
+	runes := []rune(s)
+	cols := 0
+	for i := 0; i < len(runes); i++ {
+		if runes[i] == escByte {
+			i = escapeEnd(runes, i) - 1
+			continue
+		}
+		cols += runewidth.RuneWidth(runes[i])
+	}
+	return cols
+}
+
+const escByte = '\033'
+
+// escapeEnd returns the index just past the ANSI escape sequence starting at
+// runes[start]. Only the CSI form kraze emits (color codes) is recognized; an
+// unterminated sequence consumes the rest of the string.
+func escapeEnd(runes []rune, start int) int {
+	i := start + 1
+	if i < len(runes) && runes[i] == '[' {
+		i++
+	}
+	for i < len(runes) {
+		// A CSI sequence ends at its first byte in the range @ to ~.
+		if runes[i] >= '@' && runes[i] <= '~' {
+			return i + 1
+		}
+		i++
+	}
+	return len(runes)
 }
 
 func (ip *InteractiveProgress) Stop() {
