@@ -19,6 +19,7 @@ import (
 	"helm.sh/helm/v4/pkg/chart/loader"
 	"helm.sh/helm/v4/pkg/cli"
 	"helm.sh/helm/v4/pkg/getter"
+	"helm.sh/helm/v4/pkg/helmpath"
 	"helm.sh/helm/v4/pkg/kube"
 	"helm.sh/helm/v4/pkg/registry"
 	ri "helm.sh/helm/v4/pkg/release"
@@ -426,8 +427,9 @@ func (helm *HelmProvider) pullHTTPChart(service *config.ServiceConfig) (string, 
 		return "", fmt.Errorf("failed to create temp directory: %w", err)
 	}
 
-	// Add the repository first so Pull can find it
-	repoName, err := helm.addHTTPRepository(service.Repo)
+	// Add the repository first so Pull can find it, refreshing its index when
+	// the requested chart version is not already cached
+	repoName, err := helm.addHTTPRepositoryForChart(service.Repo, service.Chart, service.Version)
 	if err != nil {
 		return "", fmt.Errorf("failed to add repository: %w", err)
 	}
@@ -504,8 +506,17 @@ func (helm *HelmProvider) pullHTTPChart(service *config.ServiceConfig) (string, 
 	return chartPath, nil
 }
 
-// addHTTPRepository adds an HTTP(S) Helm repository and returns its name
-func (helm *HelmProvider) addHTTPRepository(repoURL string) (string, error) {
+// addHTTPRepositoryForChart adds an HTTP(S) Helm repository and returns its
+// name, refreshing the cached repository index when it cannot already satisfy
+// chartName at version.
+//
+// Helm's downloader resolves 'reponame/chart' purely from the index cached on
+// disk, so a repository added on an earlier run keeps resolving against a
+// stale snapshot: bumping a chart version in kraze.yml then fails with
+// "not found in <repo> index. (try 'helm repo update')". Refreshing here keeps
+// `kraze up` self-sufficient. An exact version already present in the cache
+// needs no refresh, which avoids re-downloading large indexes on every run.
+func (helm *HelmProvider) addHTTPRepositoryForChart(repoURL, chartName, version string) (string, error) {
 	// Generate a unique repository name from the URL
 	repoName := generateRepoName(repoURL)
 
@@ -536,44 +547,108 @@ func (helm *HelmProvider) addHTTPRepository(repoURL string) (string, error) {
 		}
 	}
 
-	// Check if repository already exists
-	if file.Has(repoName) {
+	known := file.Has(repoName)
+	if known {
+		// Reuse the stored entry so credentials and TLS settings configured for
+		// this repository survive the refresh.
+		if existing := file.Get(repoName); existing != nil {
+			chartRepo = existing
+		}
 		if helm.opts.Verbose {
 			fmt.Printf("Repository '%s' already exists\n", repoName)
+		}
+	}
+
+	// A cached index that already contains the exact requested version is
+	// authoritative - there is nothing newer we need from the repository.
+	if known && helm.cachedIndexHasVersion(repoName, chartName, version) {
+		if helm.opts.Verbose {
+			fmt.Printf("Using cached index for repository '%s' (%s %s)\n", repoName, chartName, version)
 		}
 		return repoName, nil
 	}
 
-	// Add repository
 	getters := getter.All(helm.settings)
 	chartRepoClient, err := repov1.NewChartRepository(chartRepo, getters)
 	if err != nil {
 		return "", fmt.Errorf("failed to create chart repository: %w", err)
 	}
 
+	// NewChartRepository defaults CachePath to helmpath.CachePath("repository"),
+	// which diverges from settings.RepositoryCache when HELM_REPOSITORY_CACHE is
+	// set. The downloader reads the latter, so write the index where it looks.
+	chartRepoClient.CachePath = helm.settings.RepositoryCache
+
 	// Download index file
 	if helm.opts.Verbose {
-		fmt.Printf("Adding Helm repository '%s' (%s)\n", repoName, repoURL)
+		if known {
+			fmt.Printf("Refreshing Helm repository index '%s' (%s)\n", repoName, repoURL)
+		} else {
+			fmt.Printf("Adding Helm repository '%s' (%s)\n", repoName, repoURL)
+		}
 	}
 
-	_, err = chartRepoClient.DownloadIndexFile()
-	if err != nil {
+	if _, err := chartRepoClient.DownloadIndexFile(); err != nil {
+		// A repository we already know about with a usable cached index should
+		// not break offline runs just because the refresh failed.
+		if known && helm.hasCachedIndex(repoName) {
+			if !helm.opts.Quiet {
+				fmt.Printf("Warning: failed to refresh index for repository '%s', using cached index: %v\n", repoName, err)
+			}
+			return repoName, nil
+		}
 		return "", fmt.Errorf("failed to download repository index: %w", err)
 	}
 
-	// Add to repository file
-	file.Update(chartRepo)
+	// A known repository is already recorded; rewriting its entry would be a
+	// no-op at best and could drop fields we did not round-trip.
+	if !known {
+		file.Update(chartRepo)
 
-	// Write repository file
-	if err := file.WriteFile(repoFile, 0644); err != nil {
-		return "", fmt.Errorf("failed to write repository file: %w", err)
-	}
+		if err := file.WriteFile(repoFile, 0644); err != nil {
+			return "", fmt.Errorf("failed to write repository file: %w", err)
+		}
 
-	if helm.opts.Verbose {
-		fmt.Printf("Repository '%s' added successfully\n", repoName)
+		if helm.opts.Verbose {
+			fmt.Printf("Repository '%s' added successfully\n", repoName)
+		}
 	}
 
 	return repoName, nil
+}
+
+// cachedIndexPath returns the path Helm's downloader reads when resolving a
+// chart from the named repository.
+func (helm *HelmProvider) cachedIndexPath(repoName string) string {
+	return filepath.Join(helm.settings.RepositoryCache, helmpath.CacheIndexFile(repoName))
+}
+
+// hasCachedIndex reports whether a cached index exists for the repository.
+func (helm *HelmProvider) hasCachedIndex(repoName string) bool {
+	_, err := os.Stat(helm.cachedIndexPath(repoName))
+	return err == nil
+}
+
+// cachedIndexHasVersion reports whether the cached index already lists an exact
+// match for chartName at version. Version ranges and an unset version both mean
+// "resolve the newest match", which requires a fresh index, so they never match.
+func (helm *HelmProvider) cachedIndexHasVersion(repoName, chartName, version string) bool {
+	if chartName == "" || version == "" {
+		return false
+	}
+
+	index, err := repov1.LoadIndexFile(helm.cachedIndexPath(repoName))
+	if err != nil {
+		return false
+	}
+
+	for _, chartVersion := range index.Entries[chartName] {
+		if chartVersion.Version == version {
+			return true
+		}
+	}
+
+	return false
 }
 
 // NewHelmProviderForPacking creates a minimal HelmProvider that can pull charts
@@ -618,7 +693,7 @@ func (helm *HelmProvider) PullChartToDir(service *config.ServiceConfig, destDir 
 	if config.IsOCIURL(service.Repo) {
 		chartRef = fmt.Sprintf("%s/%s", service.Repo, service.Chart)
 	} else if config.IsHTTPURL(service.Repo) {
-		repoName, err := helm.addHTTPRepository(service.Repo)
+		repoName, err := helm.addHTTPRepositoryForChart(service.Repo, service.Chart, service.Version)
 		if err != nil {
 			return "", fmt.Errorf("failed to add repository %s: %w", service.Repo, err)
 		}
