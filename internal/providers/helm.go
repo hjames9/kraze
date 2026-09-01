@@ -531,7 +531,7 @@ func (helm *HelmProvider) addHTTPRepositoryForChart(repoURL, chartName, version 
 
 	// Ensure the directory exists
 	repoDir := filepath.Dir(repoFile)
-	if err := os.MkdirAll(repoDir, 0755); err != nil {
+	if err := os.MkdirAll(repoDir, 0750); err != nil {
 		return "", fmt.Errorf("failed to create repository directory: %w", err)
 	}
 

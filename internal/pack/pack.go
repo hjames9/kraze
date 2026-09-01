@@ -22,6 +22,14 @@ const (
 	bundleDir       = ".krazepack"
 	MetadataFile    = "kraze-package.json"
 	metadataVersion = "1"
+
+	// Bounds on what a single package may expand to when extracted. A package
+	// can arrive from an untrusted source, and gzip compresses pathological
+	// input at ratios high enough that an unbounded extract can fill the disk.
+	// The limits are generous compared to a realistic bundle (charts, values
+	// files, and manifests) and only reject archives that are clearly hostile.
+	maxExtractedEntrySize = 1 << 30 // 1 GiB per file
+	maxExtractedTotalSize = 4 << 30 // 4 GiB per package
 )
 
 // Asset represents a single local file to include in the archive.
@@ -318,7 +326,7 @@ func CreatePackage(configPaths []string, cfg *config.Config, krazeVersion string
 		}
 		svcCopy := svc
 		chartDir := filepath.Join(stagingDir, "charts", name)
-		if err := os.MkdirAll(chartDir, 0755); err != nil {
+		if err := os.MkdirAll(chartDir, 0750); err != nil {
 			return fmt.Errorf("creating chart staging dir for %s: %w", name, err)
 		}
 		if verbose {
@@ -745,6 +753,7 @@ func extractTar(archivePath, destDir string) error {
 	defer gr.Close()
 
 	tr := tar.NewReader(gr)
+	var totalWritten int64
 	for {
 		header, err := tr.Next()
 		if err == io.EOF {
@@ -764,21 +773,31 @@ func extractTar(archivePath, destDir string) error {
 
 		switch header.Typeflag {
 		case tar.TypeDir:
-			if err := os.MkdirAll(destPath, 0755); err != nil {
+			if err := os.MkdirAll(destPath, 0750); err != nil {
 				return err
 			}
 		case tar.TypeReg:
-			if err := os.MkdirAll(filepath.Dir(destPath), 0755); err != nil {
+			if err := os.MkdirAll(filepath.Dir(destPath), 0750); err != nil {
 				return err
 			}
-			out, err := os.OpenFile(destPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, os.FileMode(header.Mode))
+			// Mask to the permission bits: a hostile archive must not be able
+			// to set setuid/setgid/sticky on an extracted file.
+			mode := os.FileMode(header.Mode & 0o777)
+			out, err := os.OpenFile(destPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, mode)
 			if err != nil {
 				return err
 			}
-			_, copyErr := io.Copy(out, tr)
+			written, copyErr := io.Copy(out, io.LimitReader(tr, maxExtractedEntrySize+1))
 			out.Close()
 			if copyErr != nil {
 				return copyErr
+			}
+			if written > maxExtractedEntrySize {
+				return fmt.Errorf("invalid archive entry: %q exceeds the %d byte per-file limit", header.Name, int64(maxExtractedEntrySize))
+			}
+			totalWritten += written
+			if totalWritten > maxExtractedTotalSize {
+				return fmt.Errorf("invalid archive: extracted contents exceed the %d byte limit", int64(maxExtractedTotalSize))
 			}
 		}
 	}

@@ -3,6 +3,7 @@ package cluster
 import (
 	"fmt"
 	"reflect"
+	"regexp"
 	"testing"
 
 	"github.com/hjames9/kraze/internal/config"
@@ -1213,8 +1214,23 @@ func findInString(str, substr string) bool {
 	return false
 }
 
+// nodeImageVersion extracts the version tag from a node image reference using an
+// expression independent of parseK8sVersion, so the cases below assert the
+// parser's behaviour rather than a specific Kubernetes version. Pinning versions
+// in the table made the suite fail whenever a default was bumped, which is a
+// property of the image reference and not a regression in kraze.
+func nodeImageVersion(test *testing.T, image string) string {
+	test.Helper()
+	matches := regexp.MustCompile(`:(v[^@]+)`).FindStringSubmatch(image)
+	if len(matches) != 2 {
+		test.Fatalf("could not derive a version tag from %q", image)
+	}
+	return matches[1]
+}
+
 func TestParseK8sVersion(test *testing.T) {
 	km := NewKindManager()
+	kindDefault := nodeImageVersion(test, defaults.Image)
 
 	tests := []struct {
 		name     string
@@ -1224,7 +1240,7 @@ func TestParseK8sVersion(test *testing.T) {
 		{
 			name:     "no version configured uses kind default",
 			cfg:      config.ClusterConfig{},
-			expected: "v1.36.1",
+			expected: kindDefault,
 		},
 		{
 			name:     "version field set",
@@ -1244,7 +1260,7 @@ func TestParseK8sVersion(test *testing.T) {
 		{
 			name:     "default image constant parses correctly",
 			cfg:      config.ClusterConfig{NodeImage: defaults.Image},
-			expected: "v1.36.1",
+			expected: kindDefault,
 		},
 	}
 

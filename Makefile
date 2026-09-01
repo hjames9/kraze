@@ -1,4 +1,4 @@
-.PHONY: all build test clean install fmt vet lint help run-tests coverage validate-examples release release-publish bump-patch bump-minor bump-major show-version
+.PHONY: all build test clean install fmt vet lint sec vuln security help run-tests coverage validate-examples release release-publish bump-patch bump-minor bump-major show-version
 
 BINARY_NAME=kraze
 VERSION?=$(shell cat VERSION 2>/dev/null || echo "dev")
@@ -155,6 +155,28 @@ vet: ## Run go vet
 lint: ## Run golangci-lint
 	@echo "Running linter..."
 	golangci-lint run ./...
+
+# gosec rules that fire on kraze's core design rather than on defects. Each is a
+# whole-class exclusion because the finding is inherent to being a cluster tool,
+# not because individual instances were reviewed and dismissed:
+#   G204 - subprocess with variable args: kraze orchestrates docker/kind/crictl by design
+#   G304 - file open via variable path: kraze reads user-specified values files,
+#          manifests, and CA certificates by design
+#   G107 - HTTP request with variable URL: kraze fetches user-specified chart and
+#          manifest URLs by design
+#   G104 - unhandled errors: a lint concern (errcheck) rather than a security gate
+GOSEC_EXCLUDE=G104,G107,G204,G304
+
+sec: ## Run gosec static security analysis
+	@echo "Running gosec..."
+	@go run github.com/securego/gosec/v2/cmd/gosec@latest \
+		-quiet -exclude=$(GOSEC_EXCLUDE) ./...
+	@echo "gosec: no issues found"
+
+vuln: ## Scan dependencies for known vulnerabilities (govulncheck)
+	@./scripts/govulncheck.sh
+
+security: vuln sec ## Run all security scans (govulncheck + gosec)
 
 deps: ## Download and tidy dependencies
 	@echo "Downloading dependencies..."

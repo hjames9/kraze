@@ -1049,6 +1049,9 @@ func (kind *KindManager) buildGODEBUGMount(clusterName string) (v1alpha4.Mount, 
 	}
 
 	krazeDir := filepath.Join(homeDir, ".kraze", "clusters", clusterName)
+	// #nosec G301 -- the drop-in below is bind-mounted into the node container and
+	// read by systemd there. Under userns-remapped Docker the container's root maps
+	// to an unprivileged host uid, so this path must stay traversable by others.
 	if err := os.MkdirAll(krazeDir, 0755); err != nil {
 		return v1alpha4.Mount{}, fmt.Errorf("failed to create kraze directory: %w", err)
 	}
@@ -1058,6 +1061,9 @@ func (kind *KindManager) buildGODEBUGMount(clusterName string) (v1alpha4.Mount, 
 	godebugContent := `[Service]
 Environment="GODEBUG=x509negativeserial=1"
 `
+	// #nosec G306 -- read by systemd inside the node container via the bind mount
+	// below; must stay world-readable for userns-remapped Docker. Contents are a
+	// fixed, non-secret GODEBUG setting.
 	if err := os.WriteFile(godebugPath, []byte(godebugContent), 0644); err != nil {
 		return v1alpha4.Mount{}, fmt.Errorf("failed to write GODEBUG config file: %w", err)
 	}

@@ -921,3 +921,56 @@ func TestExtractTar_PathTraversal(t *testing.T) {
 		t.Errorf("expected 'path traversal' in error, got: %v", err)
 	}
 }
+
+func TestExtractTar_StripsSetuidBits(t *testing.T) {
+	// A package can come from an untrusted source, so the mode recorded in the
+	// archive must not be able to set setuid/setgid/sticky on extraction.
+	outFile := filepath.Join(t.TempDir(), "setuid.tar.gz")
+	f, err := os.Create(outFile)
+	if err != nil {
+		t.Fatalf("creating archive: %v", err)
+	}
+	gw := gzip.NewWriter(f)
+	tw := tar.NewWriter(gw)
+
+	// os.FileMode does not use the POSIX 0o4000 setuid bit -- it uses
+	// os.ModeSetuid (1<<23), and os.OpenFile honours that. An unmasked mode read
+	// straight out of an archive header therefore reaches os.OpenFile as Go mode
+	// bits, so a hostile archive can request setuid by setting 1<<23 directly.
+	//
+	// The entry is deliberately zero-length: Linux clears S_ISUID when an
+	// unprivileged process writes to a file, so a file with content would have
+	// the bit stripped by the kernel and would pass this test even unmasked.
+	// An empty entry is never written to, which is the case that actually leaks.
+	hdr := &tar.Header{Name: "payload", Mode: 0755 | (1 << 23), Size: 0, Typeflag: tar.TypeReg}
+	if err := tw.WriteHeader(hdr); err != nil {
+		t.Fatalf("writing header: %v", err)
+	}
+	tw.Close()
+	gw.Close()
+	f.Close()
+
+	destDir := t.TempDir()
+	if err := extractTar(outFile, destDir); err != nil {
+		t.Fatalf("extractTar() error: %v", err)
+	}
+
+	info, err := os.Stat(filepath.Join(destDir, "payload"))
+	if err != nil {
+		t.Fatalf("stat extracted file: %v", err)
+	}
+
+	mode := info.Mode()
+	if mode&os.ModeSetuid != 0 {
+		t.Errorf("extracted file has setuid bit set: %v", mode)
+	}
+	if mode&os.ModeSetgid != 0 {
+		t.Errorf("extracted file has setgid bit set: %v", mode)
+	}
+	if mode&os.ModeSticky != 0 {
+		t.Errorf("extracted file has sticky bit set: %v", mode)
+	}
+	if perm := mode.Perm(); perm != 0755 {
+		t.Errorf("expected permission bits 0755 preserved, got %04o", perm)
+	}
+}

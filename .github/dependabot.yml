@@ -1,0 +1,35 @@
+version: 2
+
+updates:
+  # kraze links a large transitive tree (Helm, client-go, the Docker client).
+  # Keeping it current is what stops govulncheck findings from accumulating into
+  # a batch that is too large to triage.
+  - package-ecosystem: gomod
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 10
+    groups:
+      # The k8s.io/* modules are released in lockstep and must be upgraded
+      # together; separate PRs for each would not build.
+      kubernetes:
+        patterns:
+          - "k8s.io/*"
+          - "sigs.k8s.io/*"
+      # Everything else, batched by semver impact to keep the PR count sane.
+      minor-and-patch:
+        patterns:
+          - "*"
+        exclude-patterns:
+          - "k8s.io/*"
+          - "sigs.k8s.io/*"
+        update-types:
+          - minor
+          - patch
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
