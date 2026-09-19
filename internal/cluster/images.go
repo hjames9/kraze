@@ -14,7 +14,7 @@ import (
 	"strings"
 
 	"github.com/hjames9/kraze/internal/config"
-	"gopkg.in/yaml.v3"
+	"go.yaml.in/yaml/v3"
 	"helm.sh/helm/v4/pkg/action"
 	chartcommon "helm.sh/helm/v4/pkg/chart/common"
 	chartcommonutil "helm.sh/helm/v4/pkg/chart/common/util"
@@ -474,14 +474,12 @@ func (im *ImageManager) ExtractImagesFromHelmChart(ctx context.Context, svc *con
 // extractImagesFromLocalChart extracts images from a local Helm chart
 // extractImagesFromRemoteChart downloads and templates a remote Helm chart to extract images
 func (im *ImageManager) extractImagesFromRemoteChart(ctx context.Context, svc *config.ServiceConfig) ([]string, error) {
-	images := make([]string, 0)
-
 	// Create temp directory for chart download
 	tmpDir, err := os.MkdirTemp("", "kraze-chart-*")
 	if err != nil {
 		return nil, fmt.Errorf("failed to create temp dir: %w", err)
 	}
-	defer os.RemoveAll(tmpDir)
+	defer func() { _ = os.RemoveAll(tmpDir) }()
 
 	// Create Helm settings
 	settings := cli.New()
@@ -570,7 +568,7 @@ func (im *ImageManager) extractImagesFromRemoteChart(ctx context.Context, svc *c
 		LintMode: false,
 	}
 
-	rendered, err := eng.Render(chart, valuesToRender)
+	rendered, err := eng.RenderWithContext(ctx, chart, valuesToRender)
 	if err != nil {
 		return nil, fmt.Errorf("failed to render chart templates: %w", err)
 	}
@@ -583,7 +581,7 @@ func (im *ImageManager) extractImagesFromRemoteChart(ctx context.Context, svc *c
 	}
 
 	// Extract images from rendered manifests
-	images = im.extractImagesFromManifest(allManifests.String())
+	images := im.extractImagesFromManifest(allManifests.String())
 
 	if im.verbose {
 		fmt.Printf("  Extracted %d image(s) from chart templates\n", len(images))

@@ -10,7 +10,7 @@ import (
 	"testing"
 
 	"github.com/hjames9/kraze/internal/config"
-	"gopkg.in/yaml.v3"
+	"go.yaml.in/yaml/v3"
 )
 
 func TestParseImageReference(test *testing.T) {
@@ -907,7 +907,6 @@ func makeChartTGZ(t *testing.T, dir, chartName string, valuesYAML string) string
 	if err != nil {
 		t.Fatalf("create tgz: %v", err)
 	}
-	defer f.Close()
 
 	gw, _ := gzip.NewWriterLevel(f, gzip.BestSpeed)
 	tw := tar.NewWriter(gw)
@@ -934,6 +933,9 @@ func makeChartTGZ(t *testing.T, dir, chartName string, valuesYAML string) string
 	}
 	if err := gw.Close(); err != nil {
 		t.Fatalf("gzip close: %v", err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatalf("close tgz: %v", err)
 	}
 	return tgzPath
 }
@@ -1166,22 +1168,6 @@ image:
 		t.Fatal(err)
 	}
 
-	svc := &config.ServiceConfig{
-		Name:   "myservice",
-		Type:   "helm",
-		Chart:  "mychart",
-		Values: config.ValuesField{},
-		Images: []string{
-			"hjames/kora-keycloak-theme:latest",
-			"myrepo/myapp:1.0", // duplicate — should be deduplicated
-		},
-	}
-	if err := svc.Values.UnmarshalYAML(func(v interface{}) error {
-		*(v.(*string)) = valuesFile
-		return nil
-	}); err != nil {
-		// Directly set the values file path via the Files method workaround.
-	}
 	// Build via YAML round-trip so ValuesField is populated correctly.
 	raw := fmt.Sprintf(`
 name: myservice

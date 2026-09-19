@@ -1,7 +1,6 @@
 package cli
 
 import (
-	"context"
 	"fmt"
 	"strings"
 
@@ -12,6 +11,7 @@ import (
 	"github.com/hjames9/kraze/internal/providers"
 	"github.com/hjames9/kraze/internal/state"
 	"github.com/spf13/cobra"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
 var (
@@ -44,13 +44,70 @@ type ServicePlanInfo struct {
 	Action          string // "add", "change", "no-change"
 	Version         string
 	Namespace       string
-	NamespaceAction string // "create", "exists"
+	NamespaceAction string // one of the namespace* constants
 	DependsOn       []string
 	Details         string
 }
 
+// Namespace actions shown by plan
+const (
+	namespaceManaged      = "managed by kraze"
+	namespaceExisting     = "existing"
+	namespaceWillCreate   = "will be created"
+	namespaceMissing      = "missing, and create_namespace is false"
+	namespaceCreateIfNeed = "will be created if missing"
+	namespaceMustExist    = "must already exist"
+)
+
+// builtinNamespaces exist in every new cluster, so a plan for a kind cluster that
+// has not been created yet can treat them as existing
+var builtinNamespaces = []string{"default", "kube-system", "kube-public", "kube-node-lease"}
+
+// clusterNamespaces is what plan knows about the namespaces in the cluster.
+// known is false when the cluster could not be queried.
+type clusterNamespaces struct {
+	known    bool
+	existing map[string]bool
+}
+
+func newClusterNamespaces(names ...string) clusterNamespaces {
+	cn := clusterNamespaces{known: true, existing: make(map[string]bool, len(names))}
+	for _, name := range names {
+		cn.existing[name] = true
+	}
+	return cn
+}
+
+// namespaceAction decides what kraze up would do with a service's namespace,
+// mirroring installService: a namespace is created only if it does not exist and
+// create_namespace allows it. created counts the namespaces kraze has created,
+// from cluster state.
+func namespaceAction(namespace string, shouldCreate bool, created map[string]int, cn clusterNamespaces) string {
+	if !cn.known {
+		if created[namespace] > 0 {
+			return namespaceManaged
+		}
+		if shouldCreate {
+			return namespaceCreateIfNeed
+		}
+		return namespaceMustExist
+	}
+
+	if cn.existing[namespace] {
+		if created[namespace] > 0 {
+			return namespaceManaged
+		}
+		return namespaceExisting
+	}
+	// Missing, even if state says kraze created it once (it was deleted since)
+	if shouldCreate {
+		return namespaceWillCreate
+	}
+	return namespaceMissing
+}
+
 func runPlan(cmd *cobra.Command, args []string) error {
-	ctx := context.Background()
+	ctx := cmd.Context()
 
 	cfgPaths, cleanupPack, err := resolveAndExtractConfigFiles(cmd)
 	if err != nil {
@@ -120,6 +177,7 @@ func runPlan(cmd *cobra.Command, args []string) error {
 
 	// Load cluster state to compare
 	var st *state.ClusterState
+	var namespaces clusterNamespaces
 
 	// Check cluster existence
 	kindMgr := cluster.NewKindManager()
@@ -144,6 +202,7 @@ func runPlan(cmd *cobra.Command, args []string) error {
 				Verbose("Warning: failed to check cluster: %v", err)
 			} else {
 				Verbose("Cluster doesn't exist yet")
+				namespaces = newClusterNamespaces(builtinNamespaces...)
 			}
 			Verbose("Treating as empty state (no services installed)")
 			st = state.New(cfg.Cluster.Name, isExternal, false, 0, false, 0)
@@ -167,6 +226,16 @@ func runPlan(cmd *cobra.Command, args []string) error {
 			Verbose("Treating as empty state (no services installed)")
 			st = state.New(cfg.Cluster.Name, isExternal, false, 0, false, 0)
 		} else {
+			if nsList, err := clientset.CoreV1().Namespaces().List(ctx, metav1.ListOptions{}); err != nil {
+				Verbose("Warning: failed to list namespaces: %v", err)
+			} else {
+				names := make([]string, 0, len(nsList.Items))
+				for _, ns := range nsList.Items {
+					names = append(names, ns.Name)
+				}
+				namespaces = newClusterNamespaces(names...)
+			}
+
 			st, err = state.Load(ctx, clientset, cfg.Cluster.Name)
 			if err != nil {
 				Verbose("Warning: failed to load cluster state: %v", err)
@@ -222,7 +291,7 @@ func runPlan(cmd *cobra.Command, args []string) error {
 			continue
 		}
 
-		info := analyzeService(ctx, &svcCopy, st, cfg)
+		info := analyzeService(&svcCopy, st, namespaces)
 		serviceInfos[name] = info
 
 		switch info.Action {
@@ -288,7 +357,7 @@ func printClusterPlan(cfg *config.Config, exists bool) {
 	}
 }
 
-func analyzeService(ctx context.Context, svc *config.ServiceConfig, st *state.ClusterState, cfg *config.Config) *ServicePlanInfo {
+func analyzeService(svc *config.ServiceConfig, st *state.ClusterState, namespaces clusterNamespaces) *ServicePlanInfo {
 	info := &ServicePlanInfo{
 		Name:      svc.Name,
 		Type:      svc.Type,
@@ -307,17 +376,7 @@ func analyzeService(ctx context.Context, svc *config.ServiceConfig, st *state.Cl
 		info.Action = "no-change"
 	}
 
-	// Determine namespace action
-	if svcState, exists := st.Services[svc.Name]; exists && svcState.CreatedNamespace {
-		info.NamespaceAction = "managed by kraze"
-	} else {
-		// Check if namespace would be created
-		if svc.ShouldCreateNamespace() {
-			info.NamespaceAction = "will be created"
-		} else {
-			info.NamespaceAction = "existing"
-		}
-	}
+	info.NamespaceAction = namespaceAction(info.Namespace, svc.ShouldCreateNamespace(), st.GetCreatedNamespaces(), namespaces)
 
 	// Build details string based on type
 	if svc.IsHelm() {
@@ -344,21 +403,14 @@ func analyzeService(ctx context.Context, svc *config.ServiceConfig, st *state.Cl
 
 func printServicePlan(info *ServicePlanInfo) {
 	// Action symbol and formatting
-	symbol := " "
-	var formattedSymbol string
+	formattedSymbol := " " // no-change, and a safe default for unknown actions
 	switch info.Action {
 	case "add":
-		symbol = "+"
-		formattedSymbol = color.Green(symbol)
+		formattedSymbol = color.Green("+")
 	case "change":
-		symbol = "~"
-		formattedSymbol = color.Yellow(symbol)
-	case "no-change":
-		symbol = " "
-		formattedSymbol = symbol
+		formattedSymbol = color.Yellow("~")
 	case "skipped":
-		symbol = "-"
-		formattedSymbol = color.Gray(symbol)
+		formattedSymbol = color.Gray("-")
 	}
 
 	// Print service line
@@ -375,13 +427,18 @@ func printServicePlan(info *ServicePlanInfo) {
 
 	// Print namespace
 	nsSymbol := " "
+	nsAction := info.NamespaceAction
 	switch info.NamespaceAction {
-	case "will be created":
+	case namespaceWillCreate:
 		nsSymbol = color.Green("+")
-	case "managed by kraze":
+	case namespaceManaged:
 		nsSymbol = color.Green("✓")
+	case namespaceMissing:
+		// kraze up will fail for this service unless the namespace is created first
+		nsSymbol = color.Yellow("!")
+		nsAction = color.Yellow(nsAction)
 	}
-	fmt.Printf("    %s Namespace: %s (%s)\n", nsSymbol, info.Namespace, info.NamespaceAction)
+	fmt.Printf("    %s Namespace: %s (%s)\n", nsSymbol, info.Namespace, nsAction)
 
 	// Print dependencies
 	if len(info.DependsOn) > 0 {

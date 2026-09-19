@@ -1201,19 +1201,6 @@ func boolPtr(bl bool) *bool {
 	return &bl
 }
 
-func containsString(str, substr string) bool {
-	return len(str) > 0 && len(substr) > 0 && (str == substr || len(str) > len(substr) && (str[:len(substr)] == substr || str[len(str)-len(substr):] == substr || findInString(str, substr)))
-}
-
-func findInString(str, substr string) bool {
-	for iter := 0; iter <= len(str)-len(substr); iter++ {
-		if str[iter:iter+len(substr)] == substr {
-			return true
-		}
-	}
-	return false
-}
-
 // nodeImageVersion extracts the version tag from a node image reference using an
 // expression independent of parseK8sVersion, so the cases below assert the
 // parser's behaviour rather than a specific Kubernetes version. Pinning versions

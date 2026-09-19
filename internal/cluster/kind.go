@@ -303,10 +303,9 @@ func (kind *KindManager) patchKubeconfigForNativeHost(clusterName, kubeconfig st
 	hostPort := parts[len(parts)-1] // Get the last part (the port number)
 
 	// Replace container name with localhost and the mapped port
-	patchedConfig := strings.Replace(kubeconfig,
+	patchedConfig := strings.ReplaceAll(kubeconfig,
 		"https://"+containerName+":6443",
-		"https://127.0.0.1:"+hostPort,
-		-1)
+		"https://127.0.0.1:"+hostPort)
 
 	if !quiet {
 		fmt.Printf("%s Using localhost port forwarding: 127.0.0.1:%s -> %s:6443\n",
@@ -319,10 +318,7 @@ func (kind *KindManager) patchKubeconfigForNativeHost(clusterName, kubeconfig st
 // patchKubeconfigWithContainerIP replaces the server address with the container's IP
 // This provides better compatibility across different Docker network configurations
 func (kind *KindManager) patchKubeconfigWithContainerIP(clusterName, kubeconfig string, customNetwork string, quiet ...bool) (string, error) {
-	shouldPrint := true
-	if len(quiet) > 0 && quiet[0] {
-		shouldPrint = false
-	}
+	shouldPrint := len(quiet) == 0 || !quiet[0]
 	containerName := clusterName + "-control-plane"
 
 	// Determine networks to try - prioritize custom network if specified
@@ -350,7 +346,7 @@ func (kind *KindManager) patchKubeconfigWithContainerIP(clusterName, kubeconfig 
 				patchedConfig := kubeconfig
 
 				// Replace hostname with container IP:6443
-				patchedConfig = strings.Replace(patchedConfig, containerName+":6443", containerIP+":6443", -1)
+				patchedConfig = strings.ReplaceAll(patchedConfig, containerName+":6443", containerIP+":6443")
 
 				// Replace any https://127.0.0.1:PORT or https://localhost:PORT with container IP:6443
 				re := regexp.MustCompile(`https://(127\.0\.0\.1|localhost):\d+`)
@@ -379,7 +375,7 @@ func (kind *KindManager) patchKubeconfigWithContainerIP(clusterName, kubeconfig 
 
 	// Replace hostname and URL addresses with container IP
 	patchedConfig := kubeconfig
-	patchedConfig = strings.Replace(patchedConfig, containerName+":6443", containerIP+":6443", -1)
+	patchedConfig = strings.ReplaceAll(patchedConfig, containerName+":6443", containerIP+":6443")
 
 	// Replace any https://127.0.0.1:PORT or https://localhost:PORT with container IP:6443
 	re := regexp.MustCompile(`https://(127\.0\.0\.1|localhost):\d+`)
@@ -654,7 +650,7 @@ func (kind *KindManager) LoadImage(ctx context.Context, clusterName, imageName s
 	if err != nil {
 		return fmt.Errorf("failed to create temp dir: %w", err)
 	}
-	defer os.RemoveAll(tmpDir)
+	defer func() { _ = os.RemoveAll(tmpDir) }()
 
 	// Save the image as a tar archive
 	imageTar := filepath.Join(tmpDir, "image.tar")
@@ -1185,8 +1181,8 @@ func (kind *KindManager) registerNvidiaRuntimeClass(ctx context.Context, cluster
 		return fmt.Errorf("failed to build REST config: %w", err)
 	}
 	// Use insecure TLS since kubeconfig uses the container IP (same pattern as UpdateKubeconfigFile)
-	restConfig.TLSClientConfig.Insecure = true
-	restConfig.TLSClientConfig.CAData = nil
+	restConfig.Insecure = true
+	restConfig.CAData = nil
 
 	dynClient, err := dynamic.NewForConfig(restConfig)
 	if err != nil {

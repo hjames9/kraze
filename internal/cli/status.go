@@ -1,7 +1,6 @@
 package cli
 
 import (
-	"context"
 	"fmt"
 	"strings"
 
@@ -29,7 +28,7 @@ You can filter services by name or by labels:
 }
 
 func runStatus(cmd *cobra.Command, args []string) error {
-	ctx := context.Background()
+	ctx := cmd.Context()
 
 	cfgPaths, cleanupPack, err := resolveAndExtractConfigFiles(cmd)
 	if err != nil {

@@ -1,13 +1,14 @@
 package cli
 
 import (
-	"context"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/hjames9/kraze/internal/cluster"
 	"github.com/hjames9/kraze/internal/color"
 	"github.com/hjames9/kraze/internal/config"
+	"github.com/hjames9/kraze/internal/history"
 	"github.com/hjames9/kraze/internal/providers"
 	"github.com/hjames9/kraze/internal/state"
 	"github.com/spf13/cobra"
@@ -26,8 +27,8 @@ For kind clusters (default):
 For external clusters (cluster.external.enabled: true):
   - Verify the cluster is accessible
   - Initialize the state file`,
-	RunE: func(cmd *cobra.Command, args []string) error {
-		ctx := context.Background()
+	RunE: func(cmd *cobra.Command, args []string) (retErr error) {
+		ctx := cmd.Context()
 
 		cfgPaths, cleanupPack, err := resolveAndExtractConfigFiles(cmd)
 		if err != nil {
@@ -110,14 +111,24 @@ For external clusters (cluster.external.enabled: true):
 			}
 		}
 
-		// Preload images if specified
+		// Preload images if specified. Results are recorded in the history once the
+		// cluster client exists below.
+		type preloadResult struct {
+			image    string
+			duration time.Duration
+			err      error
+		}
+		var preloaded []preloadResult
 		if len(cfg.Cluster.PreloadImages) > 0 {
 			fmt.Printf("\nPreloading %d image(s) into cluster...\n", len(cfg.Cluster.PreloadImages))
 
 			for itr, image := range cfg.Cluster.PreloadImages {
 				fmt.Printf("[%d/%d] Loading image '%s'...\n", itr+1, len(cfg.Cluster.PreloadImages), image)
 
-				if err := kindMgr.LoadImage(ctx, cfg.Cluster.Name, image); err != nil {
+				start := time.Now()
+				err := kindMgr.LoadImage(ctx, cfg.Cluster.Name, image)
+				preloaded = append(preloaded, preloadResult{image, time.Since(start), err})
+				if err != nil {
 					// Don't fail cluster creation if image loading fails
 					fmt.Printf("Warning: failed to load image '%s': %v\n", image, err)
 					fmt.Printf("  You can load it later with: kraze load-image %s\n", image)
@@ -151,6 +162,12 @@ For external clusters (cluster.external.enabled: true):
 		clientset, err := providers.GetClientsetFromKubeconfigContent(kubeconfig, !isExternal)
 		if err != nil {
 			return fmt.Errorf("failed to create Kubernetes client: %w", err)
+		}
+
+		rec := beginHistory(ctx, clientset, "init", !isExternal)
+		defer func() { finishHistory(rec, retErr) }()
+		for _, p := range preloaded {
+			rec.RecordChange(p.image, history.ActionLoadImage, p.duration, p.err)
 		}
 
 		// Create and save cluster state

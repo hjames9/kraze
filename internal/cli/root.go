@@ -4,8 +4,10 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"strings"
+	"syscall"
 
 	"github.com/hjames9/kraze/internal/cluster"
 	"github.com/hjames9/kraze/internal/pack"
@@ -43,7 +45,35 @@ services defined in a declarative YAML configuration file.`,
 // Execute adds all child commands to the root command and sets flags appropriately.
 // This is called by main.main(). It only needs to happen once to the rootCmd.
 func Execute() error {
-	return rootCmd.Execute()
+	ctx, stop := interruptContext()
+	defer stop()
+	return rootCmd.ExecuteContext(ctx)
+}
+
+// interruptContext returns a context that is cancelled on the first SIGINT or
+// SIGTERM, so commands can stop cleanly and record their outcome in the cluster
+// history. A second signal exits immediately.
+func interruptContext() (context.Context, func()) {
+	ctx, cancel := context.WithCancel(context.Background())
+	sigs := make(chan os.Signal, 2)
+	signal.Notify(sigs, os.Interrupt, syscall.SIGTERM)
+
+	go func() {
+		select {
+		case <-sigs:
+		case <-ctx.Done():
+			return
+		}
+		fmt.Fprintln(os.Stderr, "\nInterrupted, stopping (press Ctrl-C again to force quit)")
+		cancel()
+		<-sigs
+		os.Exit(130)
+	}()
+
+	return ctx, func() {
+		signal.Stop(sigs)
+		cancel()
+	}
 }
 
 func init() {
@@ -58,6 +88,7 @@ func init() {
 	rootCmd.AddCommand(upCmd)
 	rootCmd.AddCommand(downCmd)
 	rootCmd.AddCommand(statusCmd)
+	rootCmd.AddCommand(historyCmd)
 	rootCmd.AddCommand(destroyCmd)
 	rootCmd.AddCommand(versionCmd)
 	rootCmd.AddCommand(validateCmd)
@@ -102,7 +133,10 @@ func resolveConfigFiles(cmd *cobra.Command) ([]string, error) {
 		var viableClusters []viableCluster
 		krazeClusterFound := false
 
-		ctx := context.Background()
+		ctx := cmd.Context()
+		if ctx == nil {
+			ctx = context.Background() // not run via Execute (tests)
+		}
 		for _, clusterName := range clusters {
 			kubeconfig, err := kindMgr.GetKubeConfig(clusterName, false)
 			if err != nil {

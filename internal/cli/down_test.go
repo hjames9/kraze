@@ -71,8 +71,11 @@ func captureStdout(t *testing.T, fn func()) string {
 
 	fn()
 
-	w.Close()
+	closeErr := w.Close()
 	os.Stdout = orig
+	if closeErr != nil {
+		t.Fatalf("failed to close pipe: %v", closeErr)
+	}
 
 	var buf bytes.Buffer
 	if _, err := io.Copy(&buf, r); err != nil {

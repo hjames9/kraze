@@ -19,9 +19,10 @@ func main() {
 	// Suppress klog output (used by Kubernetes client libraries)
 	// This prevents "Warning: unrecognized format" and other k8s client warnings
 	klog.InitFlags(nil)
-	flag.Set("logtostderr", "false")
-	flag.Set("alsologtostderr", "false")
-	flag.Set("stderrthreshold", "FATAL")
+	// These flags are registered by klog.InitFlags above, so Set cannot fail
+	_ = flag.Set("logtostderr", "false")
+	_ = flag.Set("alsologtostderr", "false")
+	_ = flag.Set("stderrthreshold", "FATAL")
 	flag.Parse()
 
 	cli.SetVersionInfo(Version, GitCommit, BuildDate)

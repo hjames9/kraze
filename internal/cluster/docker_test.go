@@ -3,6 +3,8 @@ package cluster
 import (
 	"context"
 	"testing"
+
+	dockerclient "github.com/moby/moby/client"
 )
 
 // Note: These tests require Docker to be running.
@@ -40,13 +42,13 @@ func TestGetDockerClient(test *testing.T) {
 	}
 
 	// Try to ping Docker to verify client works
-	_, err = client.Ping(ctx)
+	_, err = client.Ping(ctx, dockerclient.PingOptions{})
 	if err != nil {
 		test.Errorf("Failed to ping Docker with returned client: %v", err)
 	}
 
 	// Clean up
-	client.Close()
+	_ = client.Close()
 }
 
 func TestGetDockerClient_MultipleClients(test *testing.T) {
@@ -62,20 +64,20 @@ func TestGetDockerClient_MultipleClients(test *testing.T) {
 	if err != nil {
 		test.Fatalf("GetDockerClient() client1 error: %v", err)
 	}
-	defer client1.Close()
+	defer func() { _ = client1.Close() }()
 
 	client2, err := GetDockerClient(ctx)
 	if err != nil {
 		test.Fatalf("GetDockerClient() client2 error: %v", err)
 	}
-	defer client2.Close()
+	defer func() { _ = client2.Close() }()
 
 	// Both should be able to ping
-	if _, err := client1.Ping(ctx); err != nil {
+	if _, err := client1.Ping(ctx, dockerclient.PingOptions{}); err != nil {
 		test.Errorf("client1 ping failed: %v", err)
 	}
 
-	if _, err := client2.Ping(ctx); err != nil {
+	if _, err := client2.Ping(ctx, dockerclient.PingOptions{}); err != nil {
 		test.Errorf("client2 ping failed: %v", err)
 	}
 }

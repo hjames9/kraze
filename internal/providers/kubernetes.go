@@ -3,10 +3,8 @@ package providers
 import (
 	"context"
 	"fmt"
+	"io"
 	"net/http"
-	"net/url"
-	"os"
-	"path/filepath"
 	"strings"
 
 	"github.com/hjames9/kraze/internal/config"
@@ -62,9 +60,9 @@ func GetClientsetFromKubeconfigContent(kubeconfigContent string, skipTLSVerify b
 	// Skip TLS verification only for kind clusters where IP patching may cause cert hostname mismatches
 	// This is safe for local development but should NEVER be used for external/production clusters
 	if skipTLSVerify {
-		restConfig.TLSClientConfig.Insecure = true
-		restConfig.TLSClientConfig.CAData = nil
-		restConfig.TLSClientConfig.CAFile = ""
+		restConfig.Insecure = true
+		restConfig.CAData = nil
+		restConfig.CAFile = ""
 	}
 
 	// Create clientset
@@ -160,10 +158,10 @@ func PortForward(ctx context.Context, kubeconfigContent, namespace, podName stri
 	}
 
 	// Skip TLS verification for kind clusters
-	if restConfig.TLSClientConfig.CAData != nil || restConfig.TLSClientConfig.CAFile != "" {
-		restConfig.TLSClientConfig.Insecure = true
-		restConfig.TLSClientConfig.CAData = nil
-		restConfig.TLSClientConfig.CAFile = ""
+	if restConfig.CAData != nil || restConfig.CAFile != "" {
+		restConfig.Insecure = true
+		restConfig.CAData = nil
+		restConfig.CAFile = ""
 	}
 
 	// Create clientset
@@ -192,26 +190,7 @@ func PortForward(ctx context.Context, kubeconfigContent, namespace, podName stri
 	stopChan := make(chan struct{}, 1)
 	readyChan := make(chan struct{}, 1)
 
-	// Create a temporary directory for port-forward output (required by the API but we don't use it)
-	tmpDir, err := os.MkdirTemp("", "kraze-portforward-*")
-	if err != nil {
-		return fmt.Errorf("failed to create temp directory: %w", err)
-	}
-	defer os.RemoveAll(tmpDir)
-
-	outFile, err := os.Create(filepath.Join(tmpDir, "out.log"))
-	if err != nil {
-		return fmt.Errorf("failed to create output file: %w", err)
-	}
-	defer outFile.Close()
-
-	errFile, err := os.Create(filepath.Join(tmpDir, "err.log"))
-	if err != nil {
-		return fmt.Errorf("failed to create error file: %w", err)
-	}
-	defer errFile.Close()
-
-	forwarder, err := portforward.New(dialer, ports, stopChan, readyChan, outFile, errFile)
+	forwarder, err := portforward.New(dialer, ports, stopChan, readyChan, io.Discard, io.Discard) // output is unused
 	if err != nil {
 		return fmt.Errorf("failed to create port forwarder: %w", err)
 	}
@@ -243,49 +222,4 @@ func PortForward(ctx context.Context, kubeconfigContent, namespace, podName stri
 		close(stopChan)
 		return nil
 	}
-}
-
-// getKubeconfigFromFile reads kubeconfig from a file path and returns the content
-func getKubeconfigFromFile(path string) (string, error) {
-	// Expand ~ if present
-	if strings.HasPrefix(path, "~/") {
-		home, err := os.UserHomeDir()
-		if err != nil {
-			return "", fmt.Errorf("failed to get user home directory: %w", err)
-		}
-		path = filepath.Join(home, path[2:])
-	}
-
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return "", fmt.Errorf("failed to read kubeconfig: %w", err)
-	}
-
-	return string(data), nil
-}
-
-// buildKubeconfigURL builds the URL for a kubeconfig from path
-func buildKubeconfigURL(kubeconfigPath string) (*url.URL, error) {
-	// Parse kubeconfig to get the server URL
-	config, err := clientcmd.LoadFromFile(kubeconfigPath)
-	if err != nil {
-		return nil, fmt.Errorf("failed to load kubeconfig: %w", err)
-	}
-
-	currentContext := config.CurrentContext
-	if currentContext == "" {
-		return nil, fmt.Errorf("no current context in kubeconfig")
-	}
-
-	context, ok := config.Contexts[currentContext]
-	if !ok {
-		return nil, fmt.Errorf("context %s not found in kubeconfig", currentContext)
-	}
-
-	cluster, ok := config.Clusters[context.Cluster]
-	if !ok {
-		return nil, fmt.Errorf("cluster %s not found in kubeconfig", context.Cluster)
-	}
-
-	return url.Parse(cluster.Server)
 }

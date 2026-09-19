@@ -1,7 +1,6 @@
 package cli
 
 import (
-	"context"
 	"fmt"
 	"strings"
 	"sync"
@@ -11,6 +10,7 @@ import (
 	"github.com/hjames9/kraze/internal/color"
 	"github.com/hjames9/kraze/internal/config"
 	"github.com/hjames9/kraze/internal/graph"
+	"github.com/hjames9/kraze/internal/history"
 	"github.com/hjames9/kraze/internal/providers"
 	"github.com/hjames9/kraze/internal/state"
 	"github.com/hjames9/kraze/internal/ui"
@@ -45,8 +45,8 @@ installed (e.g. you flipped enabled: false after deploying it):
 	RunE:              runDown,
 }
 
-func runDown(cmd *cobra.Command, args []string) error {
-	ctx := context.Background()
+func runDown(cmd *cobra.Command, args []string) (retErr error) {
+	ctx := cmd.Context()
 
 	cfgPaths, cleanupPack, err := resolveAndExtractConfigFiles(cmd)
 	if err != nil {
@@ -248,6 +248,9 @@ func runDown(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("failed to create Kubernetes client: %w", err)
 	}
 
+	rec := beginHistory(ctx, clientset, "down", false)
+	defer func() { finishHistory(rec, retErr) }()
+
 	// Load cluster state
 	st, err := state.Load(ctx, clientset, cfg.Cluster.Name)
 	if err != nil {
@@ -306,6 +309,12 @@ func runDown(cmd *cobra.Command, args []string) error {
 
 	// Uninstall each service in reverse dependency order
 	for itr, svc := range orderedServices {
+		// Helm uninstalls ignore the context, so stop between services on Ctrl-C
+		if ctx.Err() != nil {
+			progress.UpdateService(itr, svc.Name, ui.StatusSkipped, "Cancelled")
+			continue
+		}
+
 		// Update progress to show we're uninstalling this service
 		progress.UpdateService(itr, svc.Name, ui.StatusUninstalling, fmt.Sprintf("(%s)", svc.Type))
 		progress.Verbose("Uninstalling '%s' (%s)...", svc.Name, svc.Type)
@@ -343,7 +352,10 @@ func runDown(cmd *cobra.Command, args []string) error {
 		progress.UpdateService(itr, svc.Name, ui.StatusUninstalling, "Removing resources")
 
 		// Uninstall the service
-		if err := provider.Uninstall(ctx, svc); err != nil {
+		start := time.Now()
+		err = provider.Uninstall(ctx, svc)
+		rec.RecordChange(svc.Name, history.ActionUninstall, time.Since(start), err)
+		if err != nil {
 			progress.Verbose("Warning: failed to uninstall '%s': %v", svc.Name, err)
 			progress.UpdateService(itr, svc.Name, ui.StatusFailed, err.Error())
 			continue
@@ -362,6 +374,10 @@ func runDown(cmd *cobra.Command, args []string) error {
 
 	// Finish progress display
 	progress.Finish(uninstalledCount)
+
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
 
 	// Clean up namespaces
 	// For local dev environments, aggressively delete namespaces used by uninstalled services

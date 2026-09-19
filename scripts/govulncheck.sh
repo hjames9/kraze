@@ -4,9 +4,9 @@
 # kraze's own code and not explicitly allowlisted below.
 #
 # govulncheck has no native suppression mechanism, and kraze depends on modules
-# (notably github.com/docker/docker) that periodically carry advisories with no
-# fixed version available. Without an allowlist the gate would be permanently red
-# and would stop being read. Every entry needs a reason and a re-check trigger.
+# that periodically carry advisories with no fixed version available. Without an
+# allowlist the gate would be permanently red and would stop being read. Every
+# entry needs a reason and a re-check trigger.
 #
 # Usage: scripts/govulncheck.sh [-v]
 
@@ -16,37 +16,12 @@ set -euo pipefail
 # bumped: an entry whose advisory has since been fixed should be REMOVED so the
 # fix actually gets picked up, not left here indefinitely.
 #
-# GO-2026-4887 (CVE-2026-34040) / GO-2026-4883 (CVE-2026-33997):
-#   Moby AuthZ plugin bypass and plugin-privilege off-by-one. Both are flaws in
-#   the Docker *daemon*, fixed in Docker Engine 29.3.1. kraze links
-#   github.com/docker/docker only as an API client (inspect containers, manage
-#   networks) and never executes daemon-side plugin code, so neither is
-#   exploitable through this binary. Whoever runs the daemon fixes them by
-#   upgrading Docker Engine; bumping this module cannot.
+# Entry format: "# <OSV ID> (<CVE>): why it is not exploitable through kraze, and
+# the re-check trigger that should remove it", then the ID in the array.
 #
-#   They are unfixable *here* because the fix landed under Moby's renamed module
-#   path: OSV lists github.com/moby/moby/v2 as fixed in 2.0.0-beta.8, while the
-#   github.com/docker/docker path kraze imports carries an open-ended
-#   "introduced: 0" range with no fixed event -- hence "Fixed in: N/A". Escaping
-#   these would mean migrating to the github.com/moby/moby/v2 import path, not a
-#   version bump.
-#
-#   They also match at MODULE level, not symbol level: the OSV records carry no
-#   affected-symbol list, so govulncheck cannot narrow them and flags ordinary
-#   client calls (client.init, Ping, Close) as reachable. That is why they are
-#   reachable-but-not-applicable rather than simply unreachable.
-#
-#   Verify the claim that no vulnerable code is linked with:
-#     go list -deps ./cmd/kraze | grep -E "docker.*(plugin|authorization|daemon)"
-#   That must stay empty -- kraze should link only api/types/* and client. If it
-#   ever prints something, this allowlist entry is void and needs re-review.
-#
-#   Re-check trigger: drop these if kraze migrates to github.com/moby/moby/v2,
-#   or if the docker/docker range ever gains a fixed event.
-ALLOWLIST=(
-  GO-2026-4887
-  GO-2026-4883
-)
+# (Empty: the last entries were Moby daemon advisories matched against the
+# github.com/docker/docker module, which kraze no longer depends on.)
+ALLOWLIST=()
 
 cd "$(dirname "$0")/.."
 
@@ -80,7 +55,8 @@ fail=0
 for osv in "${reachable[@]:-}"; do
   [[ -z "$osv" ]] && continue
   allowed=0
-  for a in "${ALLOWLIST[@]}"; do
+  # The ${var+...} form keeps an empty array safe under set -u on bash < 4.4 (macOS)
+  for a in ${ALLOWLIST[@]+"${ALLOWLIST[@]}"}; do
     [[ "$osv" == "$a" ]] && allowed=1 && break
   done
 

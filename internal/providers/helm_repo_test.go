@@ -46,7 +46,7 @@ func newIndexServer(test *testing.T) (server *httptest.Server, setIndex func(ver
 			return
 		}
 		counter.Add(1)
-		fmt.Fprint(writer, current.Load().(string))
+		_, _ = fmt.Fprint(writer, current.Load().(string))
 	}))
 	test.Cleanup(server.Close)
 

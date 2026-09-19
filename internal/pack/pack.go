@@ -15,7 +15,7 @@ import (
 
 	"github.com/hjames9/kraze/internal/config"
 	"github.com/hjames9/kraze/internal/providers"
-	"gopkg.in/yaml.v3"
+	"go.yaml.in/yaml/v3"
 )
 
 const (
@@ -315,7 +315,7 @@ func CreatePackage(configPaths []string, cfg *config.Config, krazeVersion string
 	if err != nil {
 		return fmt.Errorf("creating staging dir: %w", err)
 	}
-	defer os.RemoveAll(stagingDir)
+	defer func() { _ = os.RemoveAll(stagingDir) }()
 
 	// Pull remote Helm charts.
 	remoteCharts := make(map[string]remoteChartInfo)
@@ -406,7 +406,7 @@ func CreatePackage(configPaths []string, cfg *config.Config, krazeVersion string
 	if err != nil {
 		return fmt.Errorf("creating output file: %w", err)
 	}
-	defer os.Remove(tmpOutput)
+	defer func() { _ = os.Remove(tmpOutput) }() // no-op once renamed into place
 
 	gw := gzip.NewWriter(f)
 	tw := tar.NewWriter(gw)
@@ -640,7 +640,7 @@ func MaybeExtract(cfgPaths []string) ([]string, func(), error) {
 	if err != nil {
 		return nil, noop, fmt.Errorf("creating temp dir for package extraction: %w", err)
 	}
-	cleanup := func() { os.RemoveAll(tmpDir) }
+	cleanup := func() { _ = os.RemoveAll(tmpDir) }
 
 	if err := extractTar(archivePath, tmpDir); err != nil {
 		cleanup()
@@ -691,7 +691,7 @@ func downloadURL(url string) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("HTTP %d fetching %s", resp.StatusCode, url)
 	}
@@ -703,7 +703,7 @@ func addFileToTar(tw *tar.Writer, srcPath, archPath string) error {
 	if err != nil {
 		return err
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }() // read-only
 
 	info, err := f.Stat()
 	if err != nil {
@@ -744,13 +744,13 @@ func extractTar(archivePath, destDir string) error {
 	if err != nil {
 		return err
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }() // read-only
 
 	gr, err := gzip.NewReader(f)
 	if err != nil {
 		return fmt.Errorf("not a valid gzip archive: %w", err)
 	}
-	defer gr.Close()
+	defer func() { _ = gr.Close() }()
 
 	tr := tar.NewReader(gr)
 	var totalWritten int64
@@ -788,9 +788,13 @@ func extractTar(archivePath, destDir string) error {
 				return err
 			}
 			written, copyErr := io.Copy(out, io.LimitReader(tr, maxExtractedEntrySize+1))
-			out.Close()
+			closeErr := out.Close()
 			if copyErr != nil {
 				return copyErr
+			}
+			if closeErr != nil {
+				// A failed close can mean the file was not fully written
+				return closeErr
 			}
 			if written > maxExtractedEntrySize {
 				return fmt.Errorf("invalid archive entry: %q exceeds the %d byte per-file limit", header.Name, int64(maxExtractedEntrySize))

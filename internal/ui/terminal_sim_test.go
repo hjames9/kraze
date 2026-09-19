@@ -42,12 +42,12 @@ func blankRow(cols int) []rune {
 func (ts *termSim) Write(p []byte) (int, error) {
 	runes := []rune(string(p))
 	for i := 0; i < len(runes); i++ {
-		switch r := runes[i]; {
-		case r == '\033':
+		switch r := runes[i]; r {
+		case '\033':
 			i = ts.applyEscape(runes, i)
-		case r == '\r':
+		case '\r':
 			ts.col = 0
-		case r == '\n':
+		case '\n':
 			ts.lineFeed()
 		default:
 			ts.put(r)

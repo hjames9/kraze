@@ -11,6 +11,7 @@ import (
 	"github.com/hjames9/kraze/internal/color"
 	"github.com/hjames9/kraze/internal/config"
 	"github.com/hjames9/kraze/internal/graph"
+	"github.com/hjames9/kraze/internal/history"
 	"github.com/hjames9/kraze/internal/pack"
 	"github.com/hjames9/kraze/internal/providers"
 	"github.com/hjames9/kraze/internal/state"
@@ -45,8 +46,8 @@ You can filter services by name or by labels:
 	RunE:              runUp,
 }
 
-func runUp(cmd *cobra.Command, args []string) error {
-	ctx := context.Background()
+func runUp(cmd *cobra.Command, args []string) (retErr error) {
+	ctx := cmd.Context()
 
 	cfgPaths, err := resolveConfigFiles(cmd)
 	if err != nil {
@@ -196,6 +197,7 @@ func runUp(cmd *cobra.Command, args []string) error {
 	kindMgr := cluster.NewKindManager()
 	isExternal := cfg.Cluster.IsExternal()
 	var kubeconfig string
+	clusterCreated := false
 
 	if isExternal {
 		// External cluster mode - don't create, just verify access
@@ -224,6 +226,7 @@ func runUp(cmd *cobra.Command, args []string) error {
 			if err := kindMgr.CreateCluster(ctx, &cfg.Cluster); err != nil {
 				return fmt.Errorf("failed to create cluster: %w", err)
 			}
+			clusterCreated = true
 
 			// Update ~/.kube/config with cluster access (Use container IP)
 			Verbose("Updating kubeconfig...")
@@ -250,6 +253,9 @@ func runUp(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return fmt.Errorf("failed to create Kubernetes client: %w", err)
 	}
+
+	rec := beginHistory(ctx, clientset, "up", clusterCreated)
+	defer func() { finishHistory(rec, retErr) }()
 
 	// Load or create cluster state
 	st, err := state.Load(ctx, clientset, cfg.Cluster.Name)
@@ -311,12 +317,24 @@ func runUp(cmd *cobra.Command, args []string) error {
 	for levelNum, level := range serviceLevels {
 		progress.Verbose("Installing level %d with %d service(s)", levelNum, len(level))
 
+		// Decide install vs upgrade before any goroutine starts writing to st
+		actions := make(map[string]string, len(level))
+		for _, svc := range level {
+			actions[svc.Name] = history.ActionInstall
+			if st.IsServiceInstalled(svc.Name) {
+				actions[svc.Name] = history.ActionUpgrade
+			}
+		}
+
 		if len(level) == 1 {
 			// Single service - install sequentially without goroutine overhead
 			svc := level[0]
 			itr := serviceIndex
 
-			if err := installService(ctx, svc, itr, cfg, kubeconfig, st, clientset, kindMgr, imgMgr, progress, globalWait, globalTimeout, verbose); err != nil {
+			start := time.Now()
+			err := installService(ctx, svc, itr, cfg, kubeconfig, st, clientset, kindMgr, imgMgr, progress, globalWait, globalTimeout, verbose)
+			rec.RecordChange(svc.Name, actions[svc.Name], time.Since(start), err)
+			if err != nil {
 				return fmt.Errorf("failed to install service '%s' in level %d: %w", svc.Name, levelNum, err)
 			}
 			successCount++
@@ -349,7 +367,10 @@ func runUp(cmd *cobra.Command, args []string) error {
 				go func(service *config.ServiceConfig, idx int) {
 					defer wg.Done()
 
-					if err := installService(ctx, service, idx, cfg, kubeconfig, st, clientset, kindMgr, imgMgr, progress, globalWait, globalTimeout, verbose); err != nil {
+					start := time.Now()
+					err := installService(ctx, service, idx, cfg, kubeconfig, st, clientset, kindMgr, imgMgr, progress, globalWait, globalTimeout, verbose)
+					rec.RecordChange(service.Name, actions[service.Name], time.Since(start), err)
+					if err != nil {
 						progress.Verbose("Service '%s' failed in level %d: %v", service.Name, levelNum, err)
 						errChan <- serviceError{serviceName: service.Name, err: err}
 					} else {

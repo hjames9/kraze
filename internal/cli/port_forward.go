@@ -3,11 +3,8 @@ package cli
 import (
 	"context"
 	"fmt"
-	"os"
-	"os/signal"
 	"strconv"
 	"strings"
-	"syscall"
 
 	"github.com/hjames9/kraze/internal/cluster"
 	"github.com/hjames9/kraze/internal/config"
@@ -83,7 +80,7 @@ func parsePortMapping(portStr string) (*PortMapping, error) {
 }
 
 func runPortForward(cmd *cobra.Command, args []string) error {
-	ctx := context.Background()
+	ctx := cmd.Context()
 
 	serviceName := args[0]
 	portSpecs := args[1:]
@@ -208,11 +205,7 @@ func runPortForward(cmd *cobra.Command, args []string) error {
 	}
 	fmt.Println("\nPress Ctrl+C to stop forwarding")
 
-	// Set up signal handling
-	sigChan := make(chan os.Signal, 1)
-	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
-
-	// Create a context that will be cancelled on interrupt
+	// The command context is cancelled on Ctrl+C (see interruptContext)
 	pfCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
@@ -227,8 +220,8 @@ func runPortForward(cmd *cobra.Command, args []string) error {
 
 	// Wait for interrupt or error
 	select {
-	case <-sigChan:
-		fmt.Println("\nStopping port-forward...")
+	case <-ctx.Done():
+		fmt.Println("Stopping port-forward...")
 		cancel()
 		return nil
 	case err := <-errChan:

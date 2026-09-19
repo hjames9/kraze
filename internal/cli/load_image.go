@@ -2,11 +2,15 @@ package cli
 
 import (
 	"fmt"
+	"time"
 
 	"github.com/hjames9/kraze/internal/cluster"
 	"github.com/hjames9/kraze/internal/color"
 	"github.com/hjames9/kraze/internal/config"
+	"github.com/hjames9/kraze/internal/history"
+	"github.com/hjames9/kraze/internal/providers"
 	"github.com/spf13/cobra"
+	"k8s.io/client-go/kubernetes"
 )
 
 var loadImageCmd = &cobra.Command{
@@ -31,7 +35,7 @@ Examples:
 	RunE: runLoadImage,
 }
 
-func runLoadImage(cmd *cobra.Command, args []string) error {
+func runLoadImage(cmd *cobra.Command, args []string) (retErr error) {
 	ctx := cmd.Context()
 	images := args
 
@@ -78,11 +82,24 @@ func runLoadImage(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("cluster '%s' does not exist. Run 'kraze up' first", clusterName)
 	}
 
+	// The cluster client is only needed for history, so a failure here is not fatal
+	var clientset kubernetes.Interface
+	if kubeconfig, err := kindMgr.GetKubeConfig(clusterName, false); err != nil {
+		Verbose("Warning: failed to get kubeconfig, history will not be recorded: %v", err)
+	} else if clientset, err = providers.GetClientsetFromKubeconfigContent(kubeconfig, true); err != nil {
+		Verbose("Warning: failed to create Kubernetes client, history will not be recorded: %v", err)
+	}
+	rec := beginHistory(ctx, clientset, "load-image", false)
+	defer func() { finishHistory(rec, retErr) }()
+
 	// Load each image
 	for _, image := range images {
 		fmt.Printf("Loading image '%s'...\n", image)
 
-		if err := kindMgr.LoadImage(ctx, clusterName, image); err != nil {
+		start := time.Now()
+		err := kindMgr.LoadImage(ctx, clusterName, image)
+		rec.RecordChange(image, history.ActionLoadImage, time.Since(start), err)
+		if err != nil {
 			return fmt.Errorf("failed to load image '%s': %w", image, err)
 		}
 

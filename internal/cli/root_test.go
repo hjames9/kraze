@@ -227,12 +227,13 @@ func TestLoadImageCommand(test *testing.T) {
 
 func TestResolveConfigFileExplicitFlag(t *testing.T) {
 	// Create a temp file to use as the config
-	tmp, err := os.CreateTemp("", "kraze-*.yml")
+	tmp, err := os.CreateTemp(t.TempDir(), "kraze-*.yml")
 	if err != nil {
 		t.Fatalf("Failed to create temp file: %v", err)
 	}
-	defer os.Remove(tmp.Name())
-	tmp.Close()
+	if err := tmp.Close(); err != nil {
+		t.Fatalf("Failed to close temp file: %v", err)
+	}
 
 	// Save and restore the global configFiles variable
 	orig := configFiles
@@ -258,11 +259,7 @@ func TestResolveConfigFileCwd(t *testing.T) {
 	}
 
 	// Create a temp directory with a kraze.yml file
-	dir, err := os.MkdirTemp("", "kraze-test-*")
-	if err != nil {
-		t.Fatalf("Failed to create temp dir: %v", err)
-	}
-	defer os.RemoveAll(dir)
+	dir := t.TempDir()
 
 	krazeYml := filepath.Join(dir, "kraze.yml")
 	if err := os.WriteFile(krazeYml, []byte("cluster:\n  name: test\n"), 0644); err != nil {
@@ -305,11 +302,7 @@ func TestResolveConfigFileFallback(t *testing.T) {
 		t.Skip("kind clusters are running; cluster state takes precedence — skipping last-resort fallback test")
 	}
 
-	dir, err := os.MkdirTemp("", "kraze-test-*")
-	if err != nil {
-		t.Fatalf("Failed to create temp dir: %v", err)
-	}
-	defer os.RemoveAll(dir)
+	dir := t.TempDir()
 
 	orig, err := os.Getwd()
 	if err != nil {

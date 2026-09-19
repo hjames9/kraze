@@ -111,6 +111,12 @@ func (ip *InteractiveProgress) w() io.Writer {
 	return os.Stdout
 }
 
+// printf writes progress output. A failed terminal write has no useful recovery,
+// so the error is deliberately dropped here rather than at every call site.
+func (ip *InteractiveProgress) printf(format string, args ...any) {
+	_, _ = fmt.Fprintf(ip.w(), format, args...)
+}
+
 type serviceInfo struct {
 	name    string
 	status  ServiceStatus
@@ -195,13 +201,13 @@ func (ip *InteractiveProgress) Start(total int, operation string) {
 	// rows + footer are redrawn, so the viewport depends on those alone.
 	ip.applyViewport()
 
-	fmt.Fprintf(ip.w(), "\n%s %d service(s)...\n\n", operation, total)
+	ip.printf("\n%s %d service(s)...\n\n", operation, total)
 	shown := ip.viewSize()
 	for i := 0; i < shown; i++ {
-		fmt.Fprintf(ip.w(), "[%d/%d]\n", i+1, total)
+		ip.printf("[%d/%d]\n", i+1, total)
 	}
 	// Footer is always shown as a status bar.
-	fmt.Fprintf(ip.w(), "  0 %s  0 done  %d pending\n", strings.ToLower(ip.operation), total)
+	ip.printf("  0 %s  0 done  %d pending\n", strings.ToLower(ip.operation), total)
 	ip.linesWritten = shown + 1
 
 	go ip.animateSpinner()
@@ -244,7 +250,7 @@ func (ip *InteractiveProgress) redraw() {
 	// number of lines we drew last time; cursor-up by that count lands us on
 	// the first service line regardless of where the screen has scrolled.
 	if ip.linesWritten > 0 {
-		fmt.Fprintf(ip.w(), "\033[%dA\r", ip.linesWritten)
+		ip.printf("\033[%dA\r", ip.linesWritten)
 	}
 
 	lines := 0
@@ -304,9 +310,9 @@ func (ip *InteractiveProgress) redraw() {
 	extraLines := ip.linesWritten - lines
 	if extraLines > 0 {
 		for i := 0; i < extraLines; i++ {
-			fmt.Fprint(ip.w(), "\r\033[K\n")
+			ip.printf("\r\033[K\n")
 		}
-		fmt.Fprintf(ip.w(), "\033[%dA", extraLines)
+		ip.printf("\033[%dA", extraLines)
 	}
 	ip.linesWritten = lines
 }
@@ -321,7 +327,7 @@ func (ip *InteractiveProgress) drawLine(content string) {
 	// One column of slack: a row filled to the last column leaves some
 	// terminals in a pending-wrap state that a following newline resolves
 	// inconsistently.
-	fmt.Fprintf(ip.w(), "\r\033[K%s\n", truncateToWidth(content, ip.termWidth-1))
+	ip.printf("\r\033[K%s\n", truncateToWidth(content, ip.termWidth-1))
 }
 
 // truncateToWidth cuts s to at most width display columns, counting ANSI escape
@@ -417,9 +423,9 @@ func (ip *InteractiveProgress) Finish(successCount int) {
 	defer ip.mu.Unlock()
 
 	if ip.linesWritten > 0 {
-		fmt.Fprintln(ip.w())
+		ip.printf("\n")
 	}
-	fmt.Fprintf(ip.w(), "%s %s %d service(s) successfully!\n",
+	ip.printf("%s %s %d service(s) successfully!\n",
 		color.Checkmark(),
 		ip.operation,
 		successCount,
@@ -469,12 +475,17 @@ func (sp *ScrollingProgress) w() io.Writer {
 	return os.Stdout
 }
 
+// printf writes progress output; see InteractiveProgress.printf
+func (sp *ScrollingProgress) printf(format string, args ...any) {
+	_, _ = fmt.Fprintf(sp.w(), format, args...)
+}
+
 func (sp *ScrollingProgress) Start(total int, operation string) {
 	sp.operation = operation
 	sp.total = total
 	sp.shownHeaders = make(map[int]bool)
 	sp.installing = make(map[int]bool)
-	fmt.Fprintf(sp.w(), "%s %d service(s)...\n", operation, total)
+	sp.printf("%s %d service(s)...\n", operation, total)
 }
 
 func (sp *ScrollingProgress) UpdateService(index int, name string, status ServiceStatus, message string) {
@@ -492,23 +503,23 @@ func (sp *ScrollingProgress) UpdateService(index int, name string, status Servic
 	case StatusInstalling, StatusUninstalling:
 		if !sp.shownHeaders[index] {
 			if len(sp.installing) == 0 {
-				fmt.Fprint(sp.w(), "\n")
+				sp.printf("\n")
 			}
-			fmt.Fprintf(sp.w(), "[%d/%d] %s '%s'...\n", index+1, sp.total, sp.operation, name)
+			sp.printf("[%d/%d] %s '%s'...\n", index+1, sp.total, sp.operation, name)
 			sp.shownHeaders[index] = true
 			sp.installing[index] = true
 		}
 	case StatusReady:
 		delete(sp.installing, index)
-		fmt.Fprintf(sp.w(), "%s Service '%s' %s successfully\n",
+		sp.printf("%s Service '%s' %s successfully\n",
 			color.Checkmark(), name, getOperationPastTense(sp.operation))
 	case StatusFailed:
 		delete(sp.installing, index)
-		fmt.Fprintf(sp.w(), "%s %s Service '%s' failed: %s\n",
+		sp.printf("%s %s Service '%s' failed: %s\n",
 			icon, statusColor(string(status)), name, message)
 	case StatusSkipped:
 		delete(sp.installing, index)
-		fmt.Fprintf(sp.w(), "Service '%s' %s, skipping...\n", name, message)
+		sp.printf("Service '%s' %s, skipping...\n", name, message)
 	case StatusWaiting:
 		// suppress
 	}
@@ -517,7 +528,7 @@ func (sp *ScrollingProgress) UpdateService(index int, name string, status Servic
 func (sp *ScrollingProgress) Stop() {}
 
 func (sp *ScrollingProgress) Finish(successCount int) {
-	fmt.Fprintf(sp.w(), "\n%s %s %d service(s)!\n",
+	sp.printf("\n%s %s %d service(s)!\n",
 		color.Checkmark(),
 		getOperationPastTense(sp.operation),
 		successCount,
@@ -527,7 +538,7 @@ func (sp *ScrollingProgress) Finish(successCount int) {
 func (sp *ScrollingProgress) Verbose(format string, args ...interface{}) {
 	if sp.verbose {
 		sp.mu.Lock()
-		fmt.Fprintf(sp.w(), "[VERBOSE] "+format+"\n", args...)
+		sp.printf("[VERBOSE] "+format+"\n", args...)
 		sp.mu.Unlock()
 	}
 }

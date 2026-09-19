@@ -7,7 +7,7 @@ import (
 	"strings"
 	"testing"
 
-	"gopkg.in/yaml.v3"
+	"go.yaml.in/yaml/v3"
 )
 
 func TestParse(test *testing.T) {
@@ -273,7 +273,9 @@ func TestResolvePaths(test *testing.T) {
 		},
 	}
 
-	cfg.ResolvePaths(configFile)
+	if err := cfg.ResolvePaths(configFile); err != nil {
+		test.Fatalf("ResolvePaths failed: %v", err)
+	}
 
 	expected := filepath.Join(tmpDir, "manifests")
 	if cfg.Services["api"].Path != expected {

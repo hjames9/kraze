@@ -14,7 +14,7 @@ import (
 
 	"github.com/hjames9/kraze/internal/color"
 	"github.com/hjames9/kraze/internal/config"
-	"gopkg.in/yaml.v3"
+	"go.yaml.in/yaml/v3"
 	"helm.sh/helm/v4/pkg/action"
 	"helm.sh/helm/v4/pkg/chart/loader"
 	"helm.sh/helm/v4/pkg/cli"
@@ -404,7 +404,7 @@ func (helm *HelmProvider) getChartPath(ctx context.Context, service *config.Serv
 				client.Version = service.Version
 			}
 			chartRef := fmt.Sprintf("%s/%s", service.Repo, service.Chart)
-			return client.ChartPathOptions.LocateChart(chartRef, helm.settings)
+			return client.LocateChart(chartRef, helm.settings)
 		}
 
 		// For HTTP/HTTPS repositories, we need to pull the chart using the SDK

@@ -6,7 +6,7 @@ import (
 	"os"
 	"path/filepath"
 
-	"github.com/docker/docker/client"
+	"github.com/moby/moby/client"
 )
 
 // getCommonDockerSockets returns a list of common Docker socket paths to try
@@ -57,18 +57,16 @@ func tryDockerSocket(ctx context.Context, socketPath string) (*client.Client, er
 	}
 
 	// Try to create client with this socket
-	cli, err := client.NewClientWithOpts(
-		client.WithHost("unix://"+socketPath),
-		client.WithAPIVersionNegotiation(),
-	)
+	// API version negotiation is the client's default
+	cli, err := client.New(client.WithHost("unix://" + socketPath))
 	if err != nil {
 		return nil, err
 	}
 
 	// Try to ping the daemon
-	_, err = cli.Ping(ctx)
+	_, err = cli.Ping(ctx, client.PingOptions{})
 	if err != nil {
-		cli.Close()
+		_ = cli.Close()
 		return nil, err
 	}
 
@@ -80,13 +78,13 @@ func tryDockerSocket(ctx context.Context, socketPath string) (*client.Client, er
 func getDockerClientWithFallback(ctx context.Context) (*client.Client, error) {
 	// First, try DOCKER_HOST if set (respects user's explicit configuration)
 	if dockerHost := os.Getenv("DOCKER_HOST"); dockerHost != "" {
-		cli, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
+		cli, err := client.New(client.FromEnv)
 		if err == nil {
 			// Verify it works
-			if _, pingErr := cli.Ping(ctx); pingErr == nil {
+			if _, pingErr := cli.Ping(ctx, client.PingOptions{}); pingErr == nil {
 				return cli, nil
 			}
-			cli.Close()
+			_ = cli.Close()
 		}
 	}
 
@@ -133,7 +131,7 @@ func CheckDockerAvailable(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	defer cli.Close()
+	defer func() { _ = cli.Close() }()
 
 	return nil
 }

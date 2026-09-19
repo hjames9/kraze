@@ -1,7 +1,6 @@
 package config
 
 import (
-	"os"
 	"testing"
 )
 
@@ -60,8 +59,7 @@ func TestExpandEnvVars(test *testing.T) {
 		test.Run(tt.name, func(test *testing.T) {
 			// Set environment variables
 			for key, val := range tt.envVars {
-				os.Setenv(key, val)
-				defer os.Unsetenv(key)
+				test.Setenv(key, val)
 			}
 
 			result := ExpandEnvVars(tt.input)
@@ -73,10 +71,8 @@ func TestExpandEnvVars(test *testing.T) {
 }
 
 func TestExpandEnvVarsInStruct(test *testing.T) {
-	os.Setenv("CLUSTER_NAME", "test-cluster")
-	os.Setenv("REDIS_NAMESPACE", "data")
-	defer os.Unsetenv("CLUSTER_NAME")
-	defer os.Unsetenv("REDIS_NAMESPACE")
+	test.Setenv("CLUSTER_NAME", "test-cluster")
+	test.Setenv("REDIS_NAMESPACE", "data")
 
 	// Test that expansion works when manually applied
 	clusterName := ExpandEnvVars("${CLUSTER_NAME}")

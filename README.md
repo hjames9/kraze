@@ -19,6 +19,7 @@
     - [`kraze up [services...]`](#kraze-up-services)
     - [`kraze down [services...]`](#kraze-down-services)
     - [`kraze status`](#kraze-status)
+    - [`kraze history [services...]`](#kraze-history-services)
     - [`kraze plan [services...]`](#kraze-plan-services)
     - [`kraze init`](#kraze-init)
     - [`kraze destroy`](#kraze-destroy)
@@ -107,7 +108,7 @@ The interactive UI shows real-time progress with:
 ### Prerequisites
 
 - **Docker-compatible runtime** - Docker Desktop, Colima, Podman, or Rancher Desktop must be running
-- **Go 1.25+** - Required to build from source (not needed for Homebrew installation)
+- **Go 1.27.1+** - Required to build from source (not needed for Homebrew installation)
 
 ### Homebrew (macOS)
 
@@ -316,6 +317,33 @@ kraze status
 # Verbose output
 kraze status -v
 ```
+
+#### `kraze history [services...]`
+Show the commands that changed the cluster, newest first: who ran them, when, and which
+services were installed, upgraded, or removed.
+
+```bash
+# The 20 most recent commands
+kraze history
+
+# Only commands that changed backend
+kraze history backend
+
+# All recorded commands, with per-service durations and errors
+kraze history --limit 0 -v
+
+# Machine-readable output
+kraze history -o json
+```
+
+`kraze up`, `down`, `init`, and `load-image` are recorded, including failed and
+interrupted (Ctrl-C) runs. A run that was killed before it could finish shows as
+`incomplete`. Dry runs and read-only commands are not recorded.
+
+History is stored in the cluster (the `kraze-history` ConfigMap in `kube-system`), so it
+is shared by everyone using the cluster. It keeps the most recent 200 commands and is
+removed by `kraze destroy`. The user shown is taken from the local environment, so treat
+history as a convenience, not a security audit trail.
 
 #### `kraze plan [services...]`
 Show a detailed plan of what would be installed or changed without actually executing.

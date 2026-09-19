@@ -1,7 +1,6 @@
 package cli
 
 import (
-	"context"
 	"fmt"
 	"strings"
 
@@ -23,7 +22,7 @@ Examples:
 }
 
 func runListImages(cmd *cobra.Command, args []string) error {
-	ctx := context.Background()
+	ctx := cmd.Context()
 
 	cfgPaths, cleanupPack, err := resolveAndExtractConfigFiles(cmd)
 	if err != nil {

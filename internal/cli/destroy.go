@@ -1,13 +1,13 @@
 package cli
 
 import (
-	"context"
 	"fmt"
 	"strings"
 
 	"github.com/hjames9/kraze/internal/cluster"
 	"github.com/hjames9/kraze/internal/color"
 	"github.com/hjames9/kraze/internal/config"
+	"github.com/hjames9/kraze/internal/history"
 	"github.com/hjames9/kraze/internal/providers"
 	"github.com/hjames9/kraze/internal/state"
 	"github.com/spf13/cobra"
@@ -28,7 +28,7 @@ For external clusters (cluster.external.enabled: true):
 WARNING: For kind clusters, this will permanently delete the cluster and all data.
 Services do not need to be uninstalled first - the entire cluster is removed.`,
 	RunE: func(cmd *cobra.Command, args []string) error {
-		ctx := context.Background()
+		ctx := cmd.Context()
 
 		cfgPaths, cleanupPack, err := resolveAndExtractConfigFiles(cmd)
 		if err != nil {
@@ -77,6 +77,11 @@ Services do not need to be uninstalled first - the entire cluster is removed.`,
 						fmt.Printf("Warning: failed to delete cluster state: %v\n", err)
 					} else {
 						Verbose("Cluster state ConfigMap deleted from kube-system namespace")
+					}
+					if err := history.Delete(ctx, clientset); err != nil {
+						fmt.Printf("Warning: failed to delete cluster history: %v\n", err)
+					} else {
+						Verbose("Cluster history ConfigMap deleted from kube-system namespace")
 					}
 				}
 			}

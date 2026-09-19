@@ -16,7 +16,7 @@ import (
 
 	"github.com/hjames9/kraze/internal/color"
 	"github.com/hjames9/kraze/internal/config"
-	yamlv3 "gopkg.in/yaml.v3"
+	yamlv3 "go.yaml.in/yaml/v3"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -389,7 +389,7 @@ func (manifest *ManifestsProvider) downloadManifest(url string) (string, error) 
 	if err != nil {
 		return "", fmt.Errorf("failed to fetch URL: %w", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
 		return "", fmt.Errorf("HTTP %d: %s", resp.StatusCode, resp.Status)
@@ -422,7 +422,7 @@ func (manifest *ManifestsProvider) parseManifest(content string) (*unstructured.
 	}
 
 	// Skip empty objects
-	if obj.Object == nil || len(obj.Object) == 0 {
+	if len(obj.Object) == 0 {
 		return nil, nil
 	}
 

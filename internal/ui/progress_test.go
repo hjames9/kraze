@@ -7,39 +7,6 @@ import (
 	"testing"
 )
 
-// captureInteractiveOutput drives an InteractiveProgress through a sequence of
-// UpdateService calls and captures everything written to the provided buffer.
-// It does NOT start the spinner goroutine (that requires a real TTY) so the
-// output is deterministic.
-func driveInteractive(total int, updates []struct {
-	index   int
-	name    string
-	status  ServiceStatus
-	message string
-}) *InteractiveProgress {
-	ip := &InteractiveProgress{out: io.Discard}
-
-	// Manually call Start internals without the spinner goroutine.
-	ip.operation = "Installing"
-	ip.total = total
-	ip.services = make(map[int]*serviceInfo)
-	ip.linesWritten = 0
-	ip.spinnerFrame = 0
-	ip.spinnerDone = make(chan bool, 1)
-	ip.spinnerActive = false
-
-	for _, u := range updates {
-		if ip.services[u.index] == nil {
-			ip.services[u.index] = &serviceInfo{}
-		}
-		ip.services[u.index].name = u.name
-		ip.services[u.index].status = u.status
-		ip.services[u.index].message = u.message
-	}
-
-	return ip
-}
-
 // TestInteractiveProgressLinesWrittenStable verifies that after the first redraw
 // linesWritten equals total+1 (service rows + footer) regardless of how many
 // services have been initialized. This invariant prevents display growth and the

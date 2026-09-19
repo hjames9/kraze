@@ -119,11 +119,11 @@ func getRESTConfigFromKubeconfig(kubeconfigContent string) (*rest.Config, error)
 
 	// Skip TLS verification when connecting via container IP
 	// This is necessary because the API server cert may not include all network IPs
-	if restConfig.TLSClientConfig.CAData != nil || restConfig.TLSClientConfig.CAFile != "" {
-		restConfig.TLSClientConfig.Insecure = true
+	if restConfig.CAData != nil || restConfig.CAFile != "" {
+		restConfig.Insecure = true
 		// Clear CA data when using insecure mode
-		restConfig.TLSClientConfig.CAData = nil
-		restConfig.TLSClientConfig.CAFile = ""
+		restConfig.CAData = nil
+		restConfig.CAFile = ""
 	}
 
 	return restConfig, nil
@@ -578,7 +578,7 @@ func parseYAMLToUnstructured(content string) (*unstructured.Unstructured, error)
 	}
 
 	// Skip empty objects
-	if obj.Object == nil || len(obj.Object) == 0 {
+	if len(obj.Object) == 0 {
 		return nil, nil
 	}
 
@@ -1202,7 +1202,7 @@ func getContainerLogs(ctx context.Context, clientset *kubernetes.Clientset, name
 	if err != nil {
 		return nil, err
 	}
-	defer logs.Close()
+	defer func() { _ = logs.Close() }()
 
 	var logLines []string
 	scanner := bufio.NewScanner(logs)
@@ -1307,14 +1307,16 @@ func hasReadyCondition(status map[string]interface{}) (bool, error) {
 }
 
 // patchWorkloadWithConfigChecksum patches a Deployment, StatefulSet, or DaemonSet
-// with a config checksum annotation to force a rollout when the checksum changes
+// with a config checksum annotation to force a rollout when the checksum changes.
+// It is best-effort: the resource may not exist yet or may not support patching,
+// so failures are only reported in verbose mode.
 func patchWorkloadWithConfigChecksum(
 	ctx context.Context,
 	dynamicClient dynamic.Interface,
 	mapper *restmapper.DeferredDiscoveryRESTMapper,
 	kind, name, namespace, checksum string,
 	verbose bool,
-) error {
+) {
 	// Get the GVR for this resource
 	gvk := schema.GroupVersionKind{
 		Group:   "apps",
@@ -1332,7 +1334,7 @@ func patchWorkloadWithConfigChecksum(
 		if verbose {
 			fmt.Printf("Warning: failed to get REST mapping for %s: %v\n", kind, err)
 		}
-		return err
+		return
 	}
 
 	// Get the resource interface
@@ -1348,12 +1350,10 @@ func patchWorkloadWithConfigChecksum(
 		if verbose {
 			fmt.Printf("Warning: failed to patch %s/%s with config checksum: %v\n", kind, name, err)
 		}
-		return err
+		return
 	}
 
 	if verbose {
 		fmt.Printf("Added config checksum annotation to %s/%s (hash: %s)\n", kind, name, checksum[:8])
 	}
-
-	return nil
 }

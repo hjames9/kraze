@@ -46,45 +46,60 @@ func containsPath(paths []string, want string) bool {
 func buildMinimalPackage(t *testing.T, configContent string, extraFiles map[string]string) string {
 	t.Helper()
 	outFile := filepath.Join(t.TempDir(), "test.tar.gz")
-	f, err := os.Create(outFile)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer f.Close()
 
-	gw := gzip.NewWriter(f)
-	tw := tar.NewWriter(gw)
-
-	addEntry := func(name, content string) {
-		hdr := &tar.Header{
-			Name:     name,
-			Mode:     0644,
-			Size:     int64(len(content)),
-			Typeflag: tar.TypeReg,
-		}
-		if err := tw.WriteHeader(hdr); err != nil {
-			t.Fatal(err)
-		}
-		if _, err := tw.Write([]byte(content)); err != nil {
-			t.Fatal(err)
-		}
-	}
-
-	addEntry("kraze.yml", configContent)
+	entries := []tarEntry{{name: "kraze.yml", content: configContent}}
 	for name, content := range extraFiles {
-		addEntry(name, content)
+		entries = append(entries, tarEntry{name: name, content: content})
 	}
 	meta := PackageMetadata{Version: "1", ConfigFiles: []string{"kraze.yml"}}
 	metaBytes, _ := json.Marshal(meta)
-	addEntry(MetadataFile, string(metaBytes))
+	entries = append(entries, tarEntry{name: MetadataFile, content: string(metaBytes)})
+
+	writeTarGz(t, outFile, entries...)
+	return outFile
+}
+
+// tarEntry is a regular file to write into a test archive. mode defaults to 0644.
+type tarEntry struct {
+	name    string
+	content string
+	mode    int64
+}
+
+// writeTarGz writes entries to a gzipped tar at path, failing the test on any
+// write error so a broken fixture can't masquerade as a passing test
+func writeTarGz(t *testing.T, path string, entries ...tarEntry) {
+	t.Helper()
+	f, err := os.Create(path)
+	if err != nil {
+		t.Fatalf("creating archive: %v", err)
+	}
+	gw := gzip.NewWriter(f)
+	tw := tar.NewWriter(gw)
+
+	for _, e := range entries {
+		mode := e.mode
+		if mode == 0 {
+			mode = 0644
+		}
+		hdr := &tar.Header{Name: e.name, Mode: mode, Size: int64(len(e.content)), Typeflag: tar.TypeReg}
+		if err := tw.WriteHeader(hdr); err != nil {
+			t.Fatalf("writing header for %s: %v", e.name, err)
+		}
+		if _, err := tw.Write([]byte(e.content)); err != nil {
+			t.Fatalf("writing %s: %v", e.name, err)
+		}
+	}
 
 	if err := tw.Close(); err != nil {
-		t.Fatal(err)
+		t.Fatalf("closing tar writer: %v", err)
 	}
 	if err := gw.Close(); err != nil {
-		t.Fatal(err)
+		t.Fatalf("closing gzip writer: %v", err)
 	}
-	return outFile
+	if err := f.Close(); err != nil {
+		t.Fatalf("closing archive: %v", err)
+	}
 }
 
 // ---- CommonAncestor --------------------------------------------------------
@@ -582,26 +597,13 @@ func TestMaybeExtract_TgzExtension(t *testing.T) {
 
 func TestMaybeExtract_MultipleConfigFiles(t *testing.T) {
 	outFile := filepath.Join(t.TempDir(), "multi.tar.gz")
-	f, err := os.Create(outFile)
-	if err != nil {
-		t.Fatal(err)
-	}
-	gw := gzip.NewWriter(f)
-	tw := tar.NewWriter(gw)
-
-	addEntry := func(name, content string) {
-		hdr := &tar.Header{Name: name, Mode: 0644, Size: int64(len(content)), Typeflag: tar.TypeReg}
-		tw.WriteHeader(hdr)
-		tw.Write([]byte(content))
-	}
-	addEntry("kraze.yml", "cluster:\n  name: test\n")
-	addEntry("services/db.yml", "services:\n  postgres:\n    type: helm\n    path: ./.krazepack/charts/postgres.tgz\n")
 	meta := PackageMetadata{Version: "1", ConfigFiles: []string{"kraze.yml", "services/db.yml"}}
 	metaBytes, _ := json.Marshal(meta)
-	addEntry(MetadataFile, string(metaBytes))
-	tw.Close()
-	gw.Close()
-	f.Close()
+	writeTarGz(t, outFile,
+		tarEntry{name: "kraze.yml", content: "cluster:\n  name: test\n"},
+		tarEntry{name: "services/db.yml", content: "services:\n  postgres:\n    type: helm\n    path: ./.krazepack/charts/postgres.tgz\n"},
+		tarEntry{name: MetadataFile, content: string(metaBytes)},
+	)
 
 	resolved, cleanup, err := MaybeExtract([]string{outFile})
 	if err != nil {
@@ -654,17 +656,7 @@ func TestMaybeExtract_ExtractedAssetsAccessible(t *testing.T) {
 func TestMaybeExtract_FallbackNoMetadata(t *testing.T) {
 	// Archive without kraze-package.json — should fall back to kraze.yml.
 	outFile := filepath.Join(t.TempDir(), "noMeta.tar.gz")
-	f, _ := os.Create(outFile)
-	gw := gzip.NewWriter(f)
-	tw := tar.NewWriter(gw)
-
-	cfgContent := "cluster:\n  name: test\nservices: {}\n"
-	hdr := &tar.Header{Name: "kraze.yml", Mode: 0644, Size: int64(len(cfgContent)), Typeflag: tar.TypeReg}
-	tw.WriteHeader(hdr)
-	tw.Write([]byte(cfgContent))
-	tw.Close()
-	gw.Close()
-	f.Close()
+	writeTarGz(t, outFile, tarEntry{name: "kraze.yml", content: "cluster:\n  name: test\nservices: {}\n"})
 
 	resolved, cleanup, err := MaybeExtract([]string{outFile})
 	if err != nil {
@@ -900,17 +892,7 @@ func TestCollectLocalAssets_SkipsHTTPManifestInPaths(t *testing.T) {
 func TestExtractTar_PathTraversal(t *testing.T) {
 	// Build a .tar.gz with a path traversal entry.
 	outFile := filepath.Join(t.TempDir(), "evil.tar.gz")
-	f, _ := os.Create(outFile)
-	gw := gzip.NewWriter(f)
-	tw := tar.NewWriter(gw)
-
-	evil := "../../etc/passwd"
-	hdr := &tar.Header{Name: evil, Mode: 0644, Size: 5, Typeflag: tar.TypeReg}
-	tw.WriteHeader(hdr)
-	tw.Write([]byte("hello"))
-	tw.Close()
-	gw.Close()
-	f.Close()
+	writeTarGz(t, outFile, tarEntry{name: "../../etc/passwd", content: "hello"})
 
 	destDir := t.TempDir()
 	err := extractTar(outFile, destDir)
@@ -926,13 +908,6 @@ func TestExtractTar_StripsSetuidBits(t *testing.T) {
 	// A package can come from an untrusted source, so the mode recorded in the
 	// archive must not be able to set setuid/setgid/sticky on extraction.
 	outFile := filepath.Join(t.TempDir(), "setuid.tar.gz")
-	f, err := os.Create(outFile)
-	if err != nil {
-		t.Fatalf("creating archive: %v", err)
-	}
-	gw := gzip.NewWriter(f)
-	tw := tar.NewWriter(gw)
-
 	// os.FileMode does not use the POSIX 0o4000 setuid bit -- it uses
 	// os.ModeSetuid (1<<23), and os.OpenFile honours that. An unmasked mode read
 	// straight out of an archive header therefore reaches os.OpenFile as Go mode
@@ -942,13 +917,7 @@ func TestExtractTar_StripsSetuidBits(t *testing.T) {
 	// unprivileged process writes to a file, so a file with content would have
 	// the bit stripped by the kernel and would pass this test even unmasked.
 	// An empty entry is never written to, which is the case that actually leaks.
-	hdr := &tar.Header{Name: "payload", Mode: 0755 | (1 << 23), Size: 0, Typeflag: tar.TypeReg}
-	if err := tw.WriteHeader(hdr); err != nil {
-		t.Fatalf("writing header: %v", err)
-	}
-	tw.Close()
-	gw.Close()
-	f.Close()
+	writeTarGz(t, outFile, tarEntry{name: "payload", mode: 0755 | (1 << 23)})
 
 	destDir := t.TempDir()
 	if err := extractTar(outFile, destDir); err != nil {
