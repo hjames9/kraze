@@ -389,6 +389,11 @@ func runDown(cmd *cobra.Command, args []string) (retErr error) {
 		// Uninstall the service
 		start := time.Now()
 		err = provider.Uninstall(ctx, svc)
+		if providers.IsReleaseNotFound(err) {
+			// Removed since IsInstalled saw it, e.g. by deleting its namespace
+			progress.Verbose("Helm release '%s' is already gone", svc.Name)
+			err = nil
+		}
 		rec.RecordChange(svc.Name, history.ActionUninstall, time.Since(start), err)
 		if err != nil {
 			progress.Verbose("Warning: failed to uninstall '%s': %v", svc.Name, err)

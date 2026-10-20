@@ -29,6 +29,7 @@ import (
 	ri "helm.sh/helm/v4/pkg/release"
 	rcommon "helm.sh/helm/v4/pkg/release/common"
 	repov1 "helm.sh/helm/v4/pkg/repo/v1"
+	"helm.sh/helm/v4/pkg/storage/driver"
 	apiextv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
@@ -344,6 +345,15 @@ func (helm *HelmProvider) Uninstall(ctx context.Context, service *config.Service
 	}
 
 	return nil
+}
+
+// IsReleaseNotFound reports whether err is Helm's error for a release that
+// doesn't exist, as Uninstall returns for one already removed (e.g. by deleting
+// its namespace). Helm returns it only when listing the release's records
+// succeeded and found none; failing to list them (unauthorized, unreachable) is
+// a different error.
+func IsReleaseNotFound(err error) bool {
+	return stderrors.Is(err, driver.ErrReleaseNotFound)
 }
 
 // Status returns the status of a Helm release

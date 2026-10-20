@@ -224,7 +224,7 @@ func removeOrphans(ctx context.Context, st *state.ClusterState, clientset kubern
 func removeOrphan(ctx context.Context, o state.ServiceMetadata, backend orphanBackend, verbosef func(string, ...interface{})) (bool, error) {
 	switch o.Type {
 	case "helm":
-		return true, backend.uninstallHelm(ctx, orphanServiceConfig(o, "helm"))
+		return true, uninstallOrphanRelease(ctx, orphanServiceConfig(o, "helm"), backend, verbosef)
 	case "manifests":
 		deleted, err := backend.deleteManifests(ctx, o.Name, o.Resources)
 		verbosef("Deleted %d object(s) of '%s'", deleted, o.Name)
@@ -239,5 +239,18 @@ func removeOrphan(ctx context.Context, o state.ServiceMetadata, backend orphanBa
 	if !exists {
 		return false, nil
 	}
-	return true, backend.uninstallHelm(ctx, svc)
+	return true, uninstallOrphanRelease(ctx, svc, backend, verbosef)
+}
+
+// uninstallOrphanRelease uninstalls an orphan's Helm release. A release that is
+// already gone counts as removed: deleting its namespace removes Helm's release
+// records with it, and the release can also vanish after helmReleaseExists saw
+// it. Any other error is a failure, and the caller keeps the orphan's entry.
+func uninstallOrphanRelease(ctx context.Context, svc *config.ServiceConfig, backend orphanBackend, verbosef func(string, ...interface{})) error {
+	err := backend.uninstallHelm(ctx, svc)
+	if providers.IsReleaseNotFound(err) {
+		verbosef("Helm release '%s' in namespace '%s' is already gone", svc.Name, svc.Namespace)
+		return nil
+	}
+	return err
 }

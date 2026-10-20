@@ -20,6 +20,7 @@ import (
 type fakeOrphanBackend struct {
 	helmReleases  map[string]bool // releases that exist, by name
 	failUninstall map[string]bool
+	uninstallErr  map[string]error // returned by uninstallHelm, by name
 	uninstalled   []string
 	deleted       map[string][]state.ResourceRef
 	keepCRDs      map[string]bool
@@ -32,6 +33,9 @@ func (b *fakeOrphanBackend) helmReleaseExists(_ context.Context, svc *config.Ser
 func (b *fakeOrphanBackend) uninstallHelm(_ context.Context, svc *config.ServiceConfig) error {
 	if b.failUninstall[svc.Name] {
 		return errors.New("boom")
+	}
+	if err := b.uninstallErr[svc.Name]; err != nil {
+		return err
 	}
 	b.uninstalled = append(b.uninstalled, svc.Name)
 	b.keepCRDs[svc.Name] = svc.KeepCRDs != nil && *svc.KeepCRDs
