@@ -2,6 +2,8 @@ package graph
 
 import (
 	"fmt"
+	"slices"
+	"sort"
 	"strings"
 
 	"github.com/hjames9/kraze/internal/config"
@@ -24,7 +26,14 @@ func NewDependencyGraph(services map[string]config.ServiceConfig) *DependencyGra
 	for name, svc := range services {
 		svcCopy := svc
 		graph.services[name] = &svcCopy
-		graph.edges[name] = svc.DependsOn
+		// A dependency listed twice is still one edge
+		var deps []string
+		for _, dep := range svc.DependsOn {
+			if !slices.Contains(deps, dep) {
+				deps = append(deps, dep)
+			}
+		}
+		graph.edges[name] = deps
 	}
 
 	return graph
@@ -33,137 +42,70 @@ func NewDependencyGraph(services map[string]config.ServiceConfig) *DependencyGra
 // TopologicalSort returns services in dependency order (dependencies first)
 // Returns an error if there are cyclic dependencies
 func (graph *DependencyGraph) TopologicalSort() ([]*config.ServiceConfig, error) {
-	// Detect cycles first
-	if cycle := graph.detectCycle(); cycle != nil {
-		return nil, fmt.Errorf("circular dependency detected: %s", formatCycle(cycle))
+	levels, err := graph.TopologicalSortByLevel()
+	if err != nil {
+		return nil, err
 	}
-
-	// Kahn's algorithm for topological sort
-	// Calculate in-degrees: how many dependencies each service has
-	inDegree := make(map[string]int)
-	for name, deps := range graph.edges {
-		if _, exists := inDegree[name]; !exists {
-			inDegree[name] = 0
-		}
-		inDegree[name] += len(deps)
+	var result []*config.ServiceConfig
+	for _, level := range levels {
+		result = append(result, level...)
 	}
-
-	// Ensure all services are in inDegree map
-	for name := range graph.services {
-		if _, exists := inDegree[name]; !exists {
-			inDegree[name] = 0
-		}
-	}
-
-	// Queue of services with no dependencies (in-degree = 0)
-	queue := []string{}
-	for name, degree := range inDegree {
-		if degree == 0 {
-			queue = append(queue, name)
-		}
-	}
-
-	// Process queue
-	result := []*config.ServiceConfig{}
-
-	for len(queue) > 0 {
-		// Pop from queue
-		current := queue[0]
-		queue = queue[1:]
-
-		result = append(result, graph.services[current])
-
-		// For each service that depends on current, decrement its in-degree
-		for name, deps := range graph.edges {
-			for _, dep := range deps {
-				if dep == current {
-					inDegree[name]--
-					if inDegree[name] == 0 {
-						queue = append(queue, name)
-					}
-					break
-				}
-			}
-		}
-	}
-
-	if len(result) != len(graph.services) {
-		return nil, fmt.Errorf("failed to resolve all dependencies (possible cycle)")
-	}
-
 	return result, nil
 }
 
 // TopologicalSortByLevel returns services grouped by dependency level
 // Services in the same level have no dependencies on each other and can be installed in parallel
 // Level 0 has no dependencies, Level 1 depends only on Level 0, etc.
+// Each service is in the earliest level its dependencies allow, and each level
+// is sorted by name. A dependency that isn't in the graph (not part of this
+// run) counts as satisfied; Validate reports it.
 func (graph *DependencyGraph) TopologicalSortByLevel() ([][]*config.ServiceConfig, error) {
 	// Detect cycles first
 	if cycle := graph.detectCycle(); cycle != nil {
 		return nil, fmt.Errorf("circular dependency detected: %s", formatCycle(cycle))
 	}
 
-	// Calculate in-degrees
-	inDegree := make(map[string]int)
-	for name, deps := range graph.edges {
-		if _, exists := inDegree[name]; !exists {
-			inDegree[name] = 0
-		}
-		inDegree[name] += len(deps)
-	}
-
-	// Ensure all services are in inDegree map
+	// Kahn's algorithm, one level at a time: unmet counts each service's
+	// dependencies not yet placed, dependents the reverse edges
+	unmet := make(map[string]int, len(graph.services))
+	dependents := make(map[string][]string)
+	var current []string
 	for name := range graph.services {
-		if _, exists := inDegree[name]; !exists {
-			inDegree[name] = 0
+		for _, dep := range graph.edges[name] {
+			if _, ok := graph.services[dep]; ok {
+				unmet[name]++
+				dependents[dep] = append(dependents[dep], name)
+			}
+		}
+		if unmet[name] == 0 {
+			current = append(current, name)
 		}
 	}
 
-	// Process level by level
 	var levels [][]*config.ServiceConfig
 	processed := 0
-
-	for processed < len(graph.services) {
-		// Find all services with in-degree 0 (no remaining dependencies)
-		currentLevel := []*config.ServiceConfig{}
-		currentLevelNames := []string{}
-
-		for name, degree := range inDegree {
-			if degree == 0 {
-				currentLevel = append(currentLevel, graph.services[name])
-				currentLevelNames = append(currentLevelNames, name)
-			}
-		}
-
-		if len(currentLevel) == 0 {
-			// No progress possible - shouldn't happen after cycle detection
-			return nil, fmt.Errorf("failed to resolve all dependencies")
-		}
-
-		levels = append(levels, currentLevel)
-		processed += len(currentLevel)
-
-		// Remove processed services and update in-degrees
-		for _, name := range currentLevelNames {
-			delete(inDegree, name)
-		}
-
-		// Decrement in-degrees for services that depended on current level
-		for name, deps := range graph.edges {
-			if _, exists := inDegree[name]; !exists {
-				continue // Already processed
-			}
-			for _, dep := range deps {
-				for _, levelName := range currentLevelNames {
-					if dep == levelName {
-						inDegree[name]--
-						break
-					}
+	for len(current) > 0 {
+		sort.Strings(current)
+		level := make([]*config.ServiceConfig, 0, len(current))
+		var next []string
+		for _, name := range current {
+			level = append(level, graph.services[name])
+			for _, dependent := range dependents[name] {
+				unmet[dependent]--
+				if unmet[dependent] == 0 {
+					next = append(next, dependent)
 				}
 			}
 		}
+		levels = append(levels, level)
+		processed += len(current)
+		current = next
 	}
 
+	if processed != len(graph.services) {
+		// Unreachable after cycle detection
+		return nil, fmt.Errorf("failed to resolve all dependencies")
+	}
 	return levels, nil
 }
 

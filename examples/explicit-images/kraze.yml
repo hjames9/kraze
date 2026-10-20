@@ -18,6 +18,8 @@
 #   kraze up     # Install all services
 #   kraze down   # Uninstall all
 
+project: explicit-images
+
 cluster:
   name: explicit-images-cluster
 

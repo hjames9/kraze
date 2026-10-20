@@ -13,6 +13,8 @@
 #   ls /dev/kfd             # should exist
 #   ls /dev/dri/renderD*    # should list one device per GPU
 
+project: amd-gpu
+
 cluster:
   name: amd-gpu-cluster
 

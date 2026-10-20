@@ -1,7 +1,9 @@
 package cli
 
 import (
+	"context"
 	"fmt"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -15,6 +17,7 @@ import (
 	"github.com/hjames9/kraze/internal/state"
 	"github.com/hjames9/kraze/internal/ui"
 	"github.com/spf13/cobra"
+	"k8s.io/client-go/kubernetes"
 )
 
 var (
@@ -22,6 +25,8 @@ var (
 	downLabels                   []string
 	downNamespaceDeletionTimeout time.Duration
 	downDisabledOnly             bool
+	downDeleteNamespaces         bool
+	downRemoveOrphans            bool
 )
 
 var downCmd = &cobra.Command{
@@ -40,7 +45,17 @@ You can filter services by name or by labels:
 Services with enabled: false are normally left alone. Use --disabled to
 instead target only services that are disabled in config but still
 installed (e.g. you flipped enabled: false after deploying it):
-  kraze down --disabled           # Remove disabled-but-installed services only`,
+  kraze down --disabled           # Remove disabled-but-installed services only
+
+Namespaces are deleted only if kraze created them and no other service uses
+them. Namespaces created by kraze before it labeled them are kept; to remove
+them once, use --delete-namespaces. It also deletes unlabeled namespaces that
+no other service uses, unless workloads remain in them:
+  kraze down --delete-namespaces
+
+Services this project installed that are no longer in its config (orphans)
+are left alone; --remove-orphans removes them too:
+  kraze down --remove-orphans`,
 	ValidArgsFunction: getServiceNames,
 	RunE:              runDown,
 }
@@ -77,6 +92,10 @@ func runDown(cmd *cobra.Command, args []string) (retErr error) {
 	if downDisabledOnly && specificServicesRequested {
 		return fmt.Errorf("--disabled cannot be combined with service names or --label")
 	}
+	if downRemoveOrphans && (specificServicesRequested || downDisabledOnly) {
+		return fmt.Errorf("--remove-orphans can't be combined with service names, --label or --disabled")
+	}
+	configured := configuredServices(cfg)
 
 	// Check if both service names and labels are specified
 	if len(requestedServices) > 0 && len(downLabels) > 0 {
@@ -198,6 +217,12 @@ func runDown(cmd *cobra.Command, args []string) (retErr error) {
 				fmt.Printf("  - %s\n", svc.Name)
 			}
 		}
+		if downRemoveOrphans {
+			fmt.Printf("[DRY RUN] --remove-orphans: services this project installed that are no longer in its config are also removed (`kraze plan` lists them)\n")
+		}
+		if downDeleteNamespaces {
+			fmt.Printf("[DRY RUN] --delete-namespaces: unlabeled namespaces of these services are also deleted if no other service uses them and no workloads remain\n")
+		}
 		return nil
 	}
 
@@ -248,7 +273,7 @@ func runDown(cmd *cobra.Command, args []string) (retErr error) {
 		return fmt.Errorf("failed to create Kubernetes client: %w", err)
 	}
 
-	rec := beginHistory(ctx, clientset, "down", false)
+	rec := beginHistory(ctx, clientset, cfg.Project, "down", false)
 	defer func() { finishHistory(rec, retErr) }()
 
 	// Load cluster state
@@ -262,37 +287,13 @@ func runDown(cmd *cobra.Command, args []string) (retErr error) {
 		st = state.New(cfg.Cluster.Name, cfg.Cluster.IsExternal(), false, 0, false, 0)
 	}
 
-	// Collect namespaces to clean up BEFORE uninstalling (since uninstall removes from state)
-	// For local dev environments, aggressively clean up namespaces when uninstalling services
-	// - When uninstalling specific (or --disabled-only) services: clean up namespaces used by those services (if no other services need them)
-	// - When uninstalling all services: clean up ALL namespaces (nothing will be using them)
-	var namespacesToCleanup map[string]int
-	if specificServicesRequested || downDisabledOnly {
-		// Get list of service names being uninstalled. --disabled-only must
-		// use this targeted path too (not the "uninstalling everything"
-		// branch below), since it only tears down a subset of services and
-		// must not mark every other namespace for cleanup.
-		var serviceNames []string
-		for _, svc := range orderedServices {
-			serviceNames = append(serviceNames, svc.Name)
-		}
-		namespacesToCleanup = st.GetNamespacesForServices(serviceNames)
-	} else {
-		// Uninstalling all services - clean up all namespaces (count will be 0 for all)
-		// Get namespaces from cluster state
-		namespacesToCleanup = st.GetAllNamespacesUsedForCleanup()
+	st.SetProject(cfg.Project)
+	checkProjectAccess(st, cfg, configured)
+	claimServices(st, cfg.Services)
 
-		// Also collect namespaces from the services we're actually uninstalling
-		// This handles cases where cluster state is missing namespace data (e.g., services
-		// installed before namespace tracking was implemented, or missing state)
-		for _, svc := range orderedServices {
-			ns := svc.GetNamespace()
-			if ns != "" {
-				// Set count to 0 since we're uninstalling everything
-				namespacesToCleanup[ns] = 0
-			}
-		}
-	}
+	// Collect namespace candidates BEFORE uninstalling, since uninstalling
+	// removes the services' entries from state
+	namespaceCandidates := collectNamespaceCandidates(st, orderedServices)
 
 	// Create progress manager
 	progress := ui.NewProgressManager(verbose, plain, len(orderedServices))
@@ -307,6 +308,16 @@ func runDown(cmd *cobra.Command, args []string) (retErr error) {
 
 	uninstalledCount := 0
 
+	// Removes orphans, and services that moved namespace or changed type since
+	// they were installed (the config no longer says where they are)
+	backend := providerOrphanBackend{opts: &providers.ProviderOptions{
+		ClusterName: cfg.Cluster.Name,
+		Project:     cfg.Project,
+		KubeConfig:  kubeconfig,
+		Verbose:     verbose,
+		Quiet:       !verbose,
+	}}
+
 	// Uninstall each service in reverse dependency order
 	for itr, svc := range orderedServices {
 		// Helm uninstalls ignore the context, so stop between services on Ctrl-C
@@ -319,9 +330,33 @@ func runDown(cmd *cobra.Command, args []string) (retErr error) {
 		progress.UpdateService(itr, svc.Name, ui.StatusUninstalling, fmt.Sprintf("(%s)", svc.Type))
 		progress.Verbose("Uninstalling '%s' (%s)...", svc.Name, svc.Type)
 
+		if meta, moved := movedInstall(st, svc); moved {
+			progress.UpdateService(itr, svc.Name, ui.StatusUninstalling, fmt.Sprintf("Removing from namespace '%s'", meta.Namespace))
+			start := time.Now()
+			removed, err := removeOrphan(ctx, meta, backend, progress.Verbose)
+			rec.RecordChange(svc.Name, history.ActionUninstall, time.Since(start), err)
+			if err != nil {
+				progress.UpdateService(itr, svc.Name, ui.StatusFailed, err.Error())
+				continue
+			}
+			st.MarkServiceUninstalled(svc.Name)
+			if err := st.Save(ctx, clientset); err != nil {
+				progress.Verbose("Warning: failed to save cluster state: %v", err)
+			}
+			if removed {
+				progress.UpdateService(itr, svc.Name, ui.StatusReady, "Removed")
+				uninstalledCount++
+			} else {
+				progress.UpdateService(itr, svc.Name, ui.StatusSkipped,
+					fmt.Sprintf("Forgotten; its objects are unknown (kubectl delete -n %s -l kraze.service=%s)", meta.Namespace, svc.Name))
+			}
+			continue
+		}
+
 		// Create provider options
 		providerOpts := &providers.ProviderOptions{
 			ClusterName: cfg.Cluster.Name,
+			Project:     cfg.Project,
 			KubeConfig:  kubeconfig,
 			Verbose:     verbose,
 			KeepCRDs:    downKeepCRDs,
@@ -379,108 +414,16 @@ func runDown(cmd *cobra.Command, args []string) (retErr error) {
 		return ctx.Err()
 	}
 
-	// Clean up namespaces
-	// For local dev environments, aggressively delete namespaces used by uninstalled services
-	// Only delete if no other services are using the namespace
-	if len(namespacesToCleanup) > 0 {
-		fmt.Printf("\nCleaning up namespaces...\n")
+	// Clean up namespaces kraze created that nothing else uses any more
+	cleanupNamespaces(ctx, clientset, kubeconfig, namespaceCandidates, downDeleteNamespaces, progress.Verbose)
 
-		// Collect namespaces to delete (filter out those still in use)
-		var namespacesToDelete []string
-		skippedNamespaces := 0
-
-		for ns, otherServicesCount := range namespacesToCleanup {
-			// Skip namespace if other services are still using it
-			if otherServicesCount > 0 {
-				progress.Verbose("Skipping namespace '%s' (still used by %d other service(s))", ns, otherServicesCount)
-				skippedNamespaces++
-				continue
-			}
-
-			// Check if namespace still exists
-			exists, err := providers.CheckNamespaceExists(ctx, kubeconfig, ns)
-			if err != nil {
-				fmt.Printf("%s Warning: failed to check if namespace '%s' exists: %v\n", color.Warning(), ns, err)
-				continue
-			}
-
-			if !exists {
-				progress.Verbose("Namespace '%s' already deleted", ns)
-				continue
-			}
-
-			namespacesToDelete = append(namespacesToDelete, ns)
+	orphans := st.Orphans(configured)
+	if downRemoveOrphans {
+		if err := removeOrphans(ctx, st, clientset, kubeconfig, orphans, nil, backend, downDeleteNamespaces, rec, progress.Verbose); err != nil {
+			return err
 		}
-
-		// Delete namespaces in parallel
-		if len(namespacesToDelete) > 0 {
-			var wg sync.WaitGroup
-			var mu sync.Mutex
-			deletedCount := 0
-			timeoutCount := 0
-			errorCount := 0
-
-			for _, ns := range namespacesToDelete {
-				wg.Add(1)
-				go func(namespace string) {
-					defer wg.Done()
-
-					progress.Verbose("Deleting namespace '%s' (including all remaining resources)...", namespace)
-
-					// Delete the namespace (cascades to all resources including secrets, configmaps, etc.)
-					if err := providers.DeleteNamespace(ctx, kubeconfig, namespace); err != nil {
-						fmt.Printf("%s Warning: failed to delete namespace '%s': %v\n", color.Warning(), namespace, err)
-						mu.Lock()
-						errorCount++
-						mu.Unlock()
-						return
-					}
-
-					// Wait for deletion (unless timeout is 0)
-					if downNamespaceDeletionTimeout > 0 {
-						if err := providers.WaitForNamespaceDeletion(ctx, kubeconfig, namespace, downNamespaceDeletionTimeout); err != nil {
-							fmt.Printf("%s Warning: namespace '%s' still terminating after %v\n", color.Warning(), namespace, downNamespaceDeletionTimeout)
-							mu.Lock()
-							timeoutCount++
-							mu.Unlock()
-						} else {
-							fmt.Printf("%s Deleted namespace '%s'\n", color.Checkmark(), namespace)
-							mu.Lock()
-							deletedCount++
-							mu.Unlock()
-						}
-					} else {
-						fmt.Printf("%s Namespace '%s' deletion initiated\n", color.Checkmark(), namespace)
-						mu.Lock()
-						deletedCount++
-						mu.Unlock()
-					}
-				}(ns)
-			}
-
-			// Wait for all deletions to complete
-			wg.Wait()
-
-			// Print summary
-			if deletedCount > 0 || timeoutCount > 0 {
-				if downNamespaceDeletionTimeout > 0 {
-					fmt.Printf("%s Deleted %d namespace(s)", color.Checkmark(), deletedCount)
-					if timeoutCount > 0 {
-						fmt.Printf(" (%d still terminating)", timeoutCount)
-					}
-				} else {
-					fmt.Printf("%s Initiated deletion of %d namespace(s)", color.Checkmark(), deletedCount)
-				}
-				if skippedNamespaces > 0 {
-					fmt.Printf(" (skipped %d still in use)", skippedNamespaces)
-				}
-				fmt.Printf("\n")
-			}
-		} else if skippedNamespaces > 0 {
-			fmt.Printf("No namespaces deleted (%d still in use by other services)\n", skippedNamespaces)
-		} else {
-			fmt.Printf("No namespaces to clean up\n")
-		}
+	} else if !specificServicesRequested && !downDisabledOnly {
+		printOrphanHint(orphans)
 	}
 
 	return nil
@@ -490,5 +433,213 @@ func init() {
 	downCmd.Flags().BoolVar(&downKeepCRDs, "keep-crds", false, "Keep CRDs when uninstalling Helm charts")
 	downCmd.Flags().StringSliceVarP(&downLabels, "label", "l", []string{}, "Filter services by label (format: key=value, can be specified multiple times)")
 	downCmd.Flags().DurationVar(&downNamespaceDeletionTimeout, "namespace-deletion-timeout", 30*time.Second, "How long to wait for each namespace to be deleted (0 = don't wait, e.g., 30s, 1m)")
+	downCmd.Flags().BoolVar(&downRemoveOrphans, "remove-orphans", false, "Also remove services this project installed that are no longer in its config")
+	downCmd.Flags().BoolVar(&downDeleteNamespaces, "delete-namespaces", false, "Also delete namespaces kraze didn't label as its own (e.g. created by older kraze versions), if no other service uses them and no workloads remain")
 	downCmd.Flags().BoolVar(&downDisabledOnly, "disabled", false, "Only uninstall services that are disabled in config (enabled: false) but still installed")
+}
+
+// namespaceCandidate is a namespace a `down` run may delete
+type namespaceCandidate struct {
+	otherServices  int  // installed services, in any project, that still use it
+	createdInState bool // some state entry records that kraze created it
+}
+
+// collectNamespaceCandidates gathers the namespaces of the services being
+// uninstalled, from state and from config (state may lack namespace data).
+// It must run before uninstalling, which removes the services from state.
+func collectNamespaceCandidates(st *state.ClusterState, services []*config.ServiceConfig) map[string]namespaceCandidate {
+	names := make([]string, 0, len(services))
+	for _, svc := range services {
+		names = append(names, svc.Name)
+	}
+
+	candidates := make(map[string]namespaceCandidate)
+	for ns, count := range st.GetNamespacesForServices(names) {
+		candidates[ns] = namespaceCandidate{otherServices: count, createdInState: st.NamespaceCreatedByKraze(ns)}
+	}
+	for _, svc := range services {
+		ns := svc.GetNamespace()
+		if _, seen := candidates[ns]; ns == "" || seen {
+			continue
+		}
+		candidates[ns] = namespaceCandidate{
+			otherServices:  st.CountOtherServicesInNamespace(ns, names),
+			createdInState: st.NamespaceCreatedByKraze(ns),
+		}
+	}
+	return candidates
+}
+
+// unmanagedNamespaceSettle is how long selectNamespacesToDelete waits for the
+// workloads of just-uninstalled services to go away before it decides that an
+// unmanaged namespace still holds someone else's workloads
+var unmanagedNamespaceSettle = 20 * time.Second
+
+// deleteNamespace deletes a namespace; a variable so tests can record calls
+var deleteNamespace = providers.DeleteNamespace
+
+// keptNamespace is a namespace `down` leaves in place, and why
+type keptNamespace struct {
+	name   string
+	reason string
+}
+
+// selectNamespacesToDelete returns the candidates to delete: those still
+// present, used by no other installed service, and created by kraze (labeled
+// as kraze-managed, or recorded as created in state). With deleteUnmanaged
+// (--delete-namespaces), a namespace kraze didn't create also qualifies if it
+// isn't a system namespace and no workloads remain in it. Existing namespaces
+// that don't qualify are returned as kept. skipped counts namespaces still in
+// use.
+func selectNamespacesToDelete(ctx context.Context, clientset kubernetes.Interface, candidates map[string]namespaceCandidate, deleteUnmanaged bool, verbosef func(string, ...interface{})) (toDelete []string, kept []keptNamespace, skipped int) {
+	names := make([]string, 0, len(candidates))
+	for ns := range candidates {
+		names = append(names, ns)
+	}
+	sort.Strings(names)
+
+	for _, ns := range names {
+		candidate := candidates[ns]
+		if candidate.otherServices > 0 {
+			verbosef("Skipping namespace '%s' (still used by %d other service(s))", ns, candidate.otherServices)
+			skipped++
+			continue
+		}
+
+		exists, managed, err := providers.NamespaceInfo(ctx, clientset, ns)
+		if err != nil {
+			fmt.Printf("%s Warning: %v\n", color.Warning(), err)
+			continue
+		}
+		if !exists {
+			verbosef("Namespace '%s' already deleted", ns)
+			continue
+		}
+		if managed || candidate.createdInState {
+			toDelete = append(toDelete, ns)
+			continue
+		}
+		if !deleteUnmanaged {
+			kept = append(kept, keptNamespace{ns, "not created by kraze; --delete-namespaces deletes it"})
+			continue
+		}
+		if providers.IsSystemNamespace(ns) {
+			kept = append(kept, keptNamespace{ns, "system namespace"})
+			continue
+		}
+		workloads, err := settledWorkloads(ctx, clientset, ns, verbosef)
+		if err != nil {
+			fmt.Printf("%s Warning: %v\n", color.Warning(), err)
+			continue
+		}
+		if len(workloads) > 0 {
+			kept = append(kept, keptNamespace{ns, "not created by kraze and still has " + strings.Join(workloads, ", ")})
+			continue
+		}
+		toDelete = append(toDelete, ns)
+	}
+	return toDelete, kept, skipped
+}
+
+// settledWorkloads returns the workloads left in a namespace, waiting up to
+// unmanagedNamespaceSettle for those of just-uninstalled services to go away
+func settledWorkloads(ctx context.Context, clientset kubernetes.Interface, ns string, verbosef func(string, ...interface{})) ([]string, error) {
+	deadline := time.Now().Add(unmanagedNamespaceSettle)
+	for waited := false; ; waited = true {
+		workloads, err := providers.NamespaceWorkloads(ctx, clientset, ns)
+		if err != nil || len(workloads) == 0 || time.Now().After(deadline) {
+			return workloads, err
+		}
+		if !waited {
+			verbosef("Waiting up to %v for workloads in namespace '%s' to go away (%s)...",
+				unmanagedNamespaceSettle, ns, strings.Join(workloads, ", "))
+		}
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(time.Second):
+		}
+	}
+}
+
+// cleanupNamespaces deletes the candidate namespaces that
+// selectNamespacesToDelete selects, in parallel, and reports the rest
+func cleanupNamespaces(ctx context.Context, clientset kubernetes.Interface, kubeconfig string, candidates map[string]namespaceCandidate, deleteUnmanaged bool, verbosef func(string, ...interface{})) {
+	if len(candidates) == 0 {
+		return
+	}
+	fmt.Printf("\nCleaning up namespaces...\n")
+
+	namespacesToDelete, keptNamespaces, skippedNamespaces := selectNamespacesToDelete(ctx, clientset, candidates, deleteUnmanaged, verbosef)
+	for _, kept := range keptNamespaces {
+		fmt.Printf("Kept namespace '%s' (%s)\n", kept.name, kept.reason)
+	}
+
+	if len(namespacesToDelete) == 0 {
+		if skippedNamespaces > 0 {
+			fmt.Printf("No namespaces deleted (%d still in use by other services)\n", skippedNamespaces)
+		} else if len(keptNamespaces) == 0 {
+			fmt.Printf("No namespaces to clean up\n")
+		}
+		return
+	}
+
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	deletedCount := 0
+	timeoutCount := 0
+
+	for _, ns := range namespacesToDelete {
+		wg.Add(1)
+		go func(namespace string) {
+			defer wg.Done()
+
+			verbosef("Deleting namespace '%s' (including all remaining resources)...", namespace)
+
+			// Delete the namespace (cascades to all resources including secrets, configmaps, etc.)
+			if err := deleteNamespace(ctx, kubeconfig, namespace); err != nil {
+				fmt.Printf("%s Warning: failed to delete namespace '%s': %v\n", color.Warning(), namespace, err)
+				return
+			}
+
+			// Wait for deletion (unless timeout is 0)
+			if downNamespaceDeletionTimeout > 0 {
+				if err := providers.WaitForNamespaceDeletion(ctx, kubeconfig, namespace, downNamespaceDeletionTimeout); err != nil {
+					fmt.Printf("%s Warning: namespace '%s' still terminating after %v\n", color.Warning(), namespace, downNamespaceDeletionTimeout)
+					mu.Lock()
+					timeoutCount++
+					mu.Unlock()
+				} else {
+					fmt.Printf("%s Deleted namespace '%s'\n", color.Checkmark(), namespace)
+					mu.Lock()
+					deletedCount++
+					mu.Unlock()
+				}
+			} else {
+				fmt.Printf("%s Namespace '%s' deletion initiated\n", color.Checkmark(), namespace)
+				mu.Lock()
+				deletedCount++
+				mu.Unlock()
+			}
+		}(ns)
+	}
+
+	// Wait for all deletions to complete
+	wg.Wait()
+
+	// Print summary
+	if deletedCount > 0 || timeoutCount > 0 {
+		if downNamespaceDeletionTimeout > 0 {
+			fmt.Printf("%s Deleted %d namespace(s)", color.Checkmark(), deletedCount)
+			if timeoutCount > 0 {
+				fmt.Printf(" (%d still terminating)", timeoutCount)
+			}
+		} else {
+			fmt.Printf("%s Initiated deletion of %d namespace(s)", color.Checkmark(), deletedCount)
+		}
+		if skippedNamespaces > 0 {
+			fmt.Printf(" (skipped %d still in use)", skippedNamespaces)
+		}
+		fmt.Printf("\n")
+	}
 }

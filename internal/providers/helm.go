@@ -1,11 +1,14 @@
 package providers
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
+	stderrors "errors"
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"time"
 
@@ -17,6 +20,7 @@ import (
 	"go.yaml.in/yaml/v3"
 	"helm.sh/helm/v4/pkg/action"
 	"helm.sh/helm/v4/pkg/chart/loader"
+	helmloader "helm.sh/helm/v4/pkg/chart/v2/loader"
 	"helm.sh/helm/v4/pkg/cli"
 	"helm.sh/helm/v4/pkg/getter"
 	"helm.sh/helm/v4/pkg/helmpath"
@@ -133,21 +137,7 @@ func (helm *HelmProvider) Install(ctx context.Context, service *config.ServiceCo
 
 	if releaseExists {
 		// Upgrade existing release
-		upgradeClient := action.NewUpgrade(actionConfig)
-		upgradeClient.Namespace = service.GetNamespace()
-		upgradeClient.WaitStrategy = kube.HookOnlyStrategy
-		upgradeClient.WaitForJobs = false
-
-		if helm.opts.Timeout != "" {
-			timeout, err := time.ParseDuration(helm.opts.Timeout)
-			if err == nil {
-				upgradeClient.Timeout = timeout
-			}
-		}
-
-		if service.Version != "" {
-			upgradeClient.Version = service.Version
-		}
+		upgradeClient := helm.newUpgradeClient(actionConfig, service)
 
 		if !helm.opts.Quiet {
 			fmt.Printf("Upgrading Helm chart '%s' in namespace '%s'...\n", service.Name, service.GetNamespace())
@@ -161,23 +151,7 @@ func (helm *HelmProvider) Install(ctx context.Context, service *config.ServiceCo
 		}
 	} else {
 		// Install new release
-		installClient := action.NewInstall(actionConfig)
-		installClient.ReleaseName = service.Name
-		installClient.Namespace = service.GetNamespace()
-		installClient.CreateNamespace = service.ShouldCreateNamespace()
-		installClient.WaitStrategy = kube.HookOnlyStrategy
-		installClient.WaitForJobs = false
-
-		if helm.opts.Timeout != "" {
-			timeout, err := time.ParseDuration(helm.opts.Timeout)
-			if err == nil {
-				installClient.Timeout = timeout
-			}
-		}
-
-		if service.Version != "" {
-			installClient.Version = service.Version
-		}
+		installClient := helm.newInstallClient(actionConfig, service)
 
 		if !helm.opts.Quiet {
 			fmt.Printf("Installing Helm chart '%s' in namespace '%s'...\n", service.Name, service.GetNamespace())
@@ -198,22 +172,6 @@ func (helm *HelmProvider) Install(ctx context.Context, service *config.ServiceCo
 		}
 	}
 
-	// Inject config checksums to force rollouts when ConfigMaps/Secrets change
-	if manifest != "" {
-		checksum, err := calculateConfigChecksum(manifest)
-		if err != nil {
-			if helm.opts.Verbose {
-				fmt.Printf("Warning: failed to calculate config checksum: %v\n", err)
-			}
-		} else if checksum != "" {
-			if err := helm.injectConfigChecksums(ctx, service.GetNamespace(), manifest, checksum); err != nil {
-				if helm.opts.Verbose {
-					fmt.Printf("Warning: failed to inject config checksums: %v\n", err)
-				}
-			}
-		}
-	}
-
 	// Wait for resources to be ready using our shared wait logic
 	if helm.opts.Wait && manifest != "" {
 		// Use WaitForManifestsInNamespace to apply the release namespace to resources
@@ -223,6 +181,76 @@ func (helm *HelmProvider) Install(ctx context.Context, service *config.ServiceCo
 	}
 
 	return nil
+}
+
+// newUpgradeClient configures a Helm upgrade of service's release.
+//
+// kraze makes the cluster match its config, so upgrades always apply
+// server-side and force conflicts (`helm upgrade --server-side=true
+// --force-conflicts`): kraze becomes the owner of every field its chart sets,
+// and changes made outside it (kubectl edit, another controller) to those
+// fields are overwritten.
+//
+// Helm names its field manager after the binary. Client-side upgrades by
+// kraze (every release from before kraze used Helm v4) own fields as manager
+// "kraze" with an Update operation, a different owner from kraze's
+// server-side applies. When such a release switched to server-side apply
+// through anything but kraze (the helm CLI, say), Helm didn't migrate them,
+// and every later upgrade changing one failed with "conflicts with "kraze"".
+// Forcing once isn't enough: it takes over only the fields that conflicted.
+//
+// Helm's default ("auto") would keep a client-side release client-side, and
+// Helm rejects forcing conflicts there. Always applying server-side moves
+// such a release over on its next upgrade; Helm migrates kraze's client-side
+// ownership as it does.
+func (helm *HelmProvider) newUpgradeClient(actionConfig *action.Configuration, service *config.ServiceConfig) *action.Upgrade {
+	upgradeClient := action.NewUpgrade(actionConfig)
+	upgradeClient.Namespace = service.GetNamespace()
+	upgradeClient.WaitStrategy = kube.HookOnlyStrategy
+	upgradeClient.WaitForJobs = false
+	upgradeClient.ServerSideApply = "true"
+	upgradeClient.ForceConflicts = true
+	upgradeClient.PostRenderer = configChecksumPostRenderer{}
+	upgradeClient.PostRenderStrategy = action.PostRenderStrategyNoHooks
+
+	if helm.opts.Timeout != "" {
+		timeout, err := time.ParseDuration(helm.opts.Timeout)
+		if err == nil {
+			upgradeClient.Timeout = timeout
+		}
+	}
+
+	if service.Version != "" {
+		upgradeClient.Version = service.Version
+	}
+	return upgradeClient
+}
+
+// newInstallClient configures a Helm install of service's release. An install
+// can adopt objects that already exist, so it forces conflicts for the same
+// reason upgrades do (see newUpgradeClient).
+func (helm *HelmProvider) newInstallClient(actionConfig *action.Configuration, service *config.ServiceConfig) *action.Install {
+	installClient := action.NewInstall(actionConfig)
+	installClient.ReleaseName = service.Name
+	installClient.Namespace = service.GetNamespace()
+	installClient.CreateNamespace = service.ShouldCreateNamespace()
+	installClient.WaitStrategy = kube.HookOnlyStrategy
+	installClient.WaitForJobs = false
+	installClient.ForceConflicts = true
+	installClient.PostRenderer = configChecksumPostRenderer{}
+	installClient.PostRenderStrategy = action.PostRenderStrategyNoHooks
+
+	if helm.opts.Timeout != "" {
+		timeout, err := time.ParseDuration(helm.opts.Timeout)
+		if err == nil {
+			installClient.Timeout = timeout
+		}
+	}
+
+	if service.Version != "" {
+		installClient.Version = service.Version
+	}
+	return installClient
 }
 
 // Uninstall removes a Helm release
@@ -517,15 +545,6 @@ func (helm *HelmProvider) pullHTTPChart(service *config.ServiceConfig) (string, 
 // `kraze up` self-sufficient. An exact version already present in the cache
 // needs no refresh, which avoids re-downloading large indexes on every run.
 func (helm *HelmProvider) addHTTPRepositoryForChart(repoURL, chartName, version string) (string, error) {
-	// Generate a unique repository name from the URL
-	repoName := generateRepoName(repoURL)
-
-	// Create repository entry
-	chartRepo := &repov1.Entry{
-		Name: repoName,
-		URL:  repoURL,
-	}
-
 	// Get the repository file path from settings
 	repoFile := helm.settings.RepositoryConfig
 
@@ -545,6 +564,12 @@ func (helm *HelmProvider) addHTTPRepositoryForChart(repoURL, chartName, version 
 		if err != nil {
 			return "", fmt.Errorf("failed to load repository file: %w", err)
 		}
+	}
+
+	repoName := repoNameFor(file, repoURL)
+	chartRepo := &repov1.Entry{
+		Name: repoName,
+		URL:  repoURL,
 	}
 
 	known := file.Has(repoName)
@@ -728,9 +753,10 @@ func generateRepoName(repoURL string) string {
 	// Remove protocol
 	name := strings.TrimPrefix(repoURL, "https://")
 	name = strings.TrimPrefix(name, "http://")
-	// Replace non-alphanumeric characters with hyphens
-	name = strings.ReplaceAll(name, "/", "-")
-	name = strings.ReplaceAll(name, ".", "-")
+	// Replace everything but letters, digits and hyphens: a name is used as
+	// the first part of "<name>/<chart>", where a ":" (a port) makes Helm
+	// read the reference as a URL ("invalid chart URL format")
+	name = repoNameInvalidChars.ReplaceAllString(name, "-")
 	// Trim trailing hyphens
 	name = strings.Trim(name, "-")
 
@@ -743,102 +769,65 @@ func generateRepoName(repoURL string) string {
 	return name
 }
 
-// mergeMaps performs a deep merge of two maps, with override values taking precedence
-func mergeMaps(base, override map[string]interface{}) map[string]interface{} {
-	result := make(map[string]interface{})
+var repoNameInvalidChars = regexp.MustCompile(`[^A-Za-z0-9-]`)
 
-	// Copy all values from base
-	for key, value := range base {
-		result[key] = value
+// repoNameFor returns the repositories.yaml name for repoURL: its generated
+// name, unless an entry by that name is for another URL (the name isn't
+// unique: http:// and https:// give the same one), whose repository would
+// otherwise serve this chart
+func repoNameFor(file *repov1.File, repoURL string) string {
+	name := generateRepoName(repoURL)
+	existing := file.Get(name)
+	if existing == nil || strings.TrimSuffix(existing.URL, "/") == strings.TrimSuffix(repoURL, "/") {
+		return name
 	}
-
-	// Merge override values
-	for key, overrideValue := range override {
-		if baseValue, exists := result[key]; exists {
-			// If both values are maps, merge them recursively
-			baseMap, baseIsMap := baseValue.(map[string]interface{})
-			overrideMap, overrideIsMap := overrideValue.(map[string]interface{})
-
-			if baseIsMap && overrideIsMap {
-				result[key] = mergeMaps(baseMap, overrideMap)
-				continue
-			}
-		}
-
-		// Otherwise, override the value
-		result[key] = overrideValue
-	}
-
-	return result
+	hash := sha256.Sum256([]byte(repoURL))
+	return fmt.Sprintf("%s-%x", name, hash[:4])
 }
 
-// loadValues loads values from the values file(s) or inline values
+// loadValues loads the service's values (see LoadHelmValues)
 func (helm *HelmProvider) loadValues(service *config.ServiceConfig) (map[string]interface{}, error) {
-	values := make(map[string]interface{})
-
-	// Priority 1: Inline values
-	if service.ValuesInline != "" {
-		if helm.opts.Verbose {
+	if helm.opts.Verbose {
+		switch files := service.Values.Files(); {
+		case service.ValuesInline != "":
 			fmt.Printf("Loading inline values...\n")
+		case len(files) == 1:
+			fmt.Printf("Loading values from: %s\n", files[0])
+		case len(files) > 1:
+			fmt.Printf("Loading and merging values from %d file(s): %s\n", len(files), strings.Join(files, ", "))
 		}
+	}
+	return LoadHelmValues(service)
+}
 
-		// Parse inline YAML
-		if err := yaml.Unmarshal([]byte(service.ValuesInline), &values); err != nil {
+// LoadHelmValues returns the values kraze passes to Helm for a service: its
+// values_inline, or else its values files merged in order (later files win,
+// maps merge key by key). Both are read with Helm's own loader and merged with
+// Helm's own merge, so they mean what `helm install -f` makes of them: a
+// YAML 1.1 parser (`enabled: no` is false, not the string "no", which a
+// template treats as true) whose dates stay strings (a time.Time made Helm
+// panic copying the values). Image detection uses it too, so it renders
+// charts with the same values as the install.
+func LoadHelmValues(service *config.ServiceConfig) (map[string]interface{}, error) {
+	if service.ValuesInline != "" {
+		values, err := helmloader.LoadValues(strings.NewReader(service.ValuesInline))
+		if err != nil {
 			return nil, fmt.Errorf("failed to parse inline values: %w", err)
 		}
-
-		if helm.opts.Verbose {
-			fmt.Printf("Loaded %d value(s) from inline values\n", len(values))
-		}
-
 		return values, nil
 	}
-
-	// Priority 2: Values file(s) - merge in order
-	if !service.Values.IsEmpty() {
-		files := service.Values.Files()
-
-		if helm.opts.Verbose {
-			if len(files) == 1 {
-				fmt.Printf("Loading values from: %s\n", files[0])
-			} else {
-				fmt.Printf("Loading and merging values from %d file(s)...\n", len(files))
-			}
+	values := make(map[string]interface{})
+	for _, valuesFile := range service.Values.Files() {
+		data, err := os.ReadFile(valuesFile)
+		if err != nil {
+			return nil, fmt.Errorf("failed to read values file %s: %w", valuesFile, err)
 		}
-
-		for i, valuesFile := range files {
-			if helm.opts.Verbose && len(files) > 1 {
-				fmt.Printf("  [%d/%d] %s\n", i+1, len(files), valuesFile)
-			}
-
-			// Read the values file
-			data, err := os.ReadFile(valuesFile)
-			if err != nil {
-				return nil, fmt.Errorf("failed to read values file %s: %w", valuesFile, err)
-			}
-
-			// Parse YAML
-			var fileValues map[string]interface{}
-			if err := yaml.Unmarshal(data, &fileValues); err != nil {
-				return nil, fmt.Errorf("failed to parse values file %s: %w", valuesFile, err)
-			}
-
-			// Merge into existing values (later files override earlier ones)
-			values = mergeMaps(values, fileValues)
+		fileValues, err := helmloader.LoadValues(bytes.NewReader(data))
+		if err != nil {
+			return nil, fmt.Errorf("failed to parse values file %s: %w", valuesFile, err)
 		}
-
-		if helm.opts.Verbose {
-			if len(files) == 1 {
-				fmt.Printf("Loaded %d value(s) from %s\n", len(values), files[0])
-			} else {
-				fmt.Printf("Loaded and merged %d total value(s) from %d file(s)\n", len(values), len(files))
-			}
-		}
-
-		return values, nil
+		values = helmloader.MergeMaps(values, fileValues)
 	}
-
-	// No values specified
 	return values, nil
 }
 
@@ -1011,128 +1000,186 @@ func calculateConfigChecksum(manifest string) (string, error) {
 		return "", nil
 	}
 
-	// Parse YAML documents
-	decoder := yaml.NewDecoder(strings.NewReader(manifest))
-
 	var configData []string
-
-	for {
-		var doc map[string]interface{}
-		if err := decoder.Decode(&doc); err != nil {
-			if err.Error() == "EOF" {
-				break
-			}
-			// Skip invalid documents
-			continue
-		}
-
-		if doc == nil {
-			continue
-		}
-
-		kind, _ := doc["kind"].(string)
-
-		// Only process ConfigMaps and Secrets
-		if kind != "ConfigMap" && kind != "Secret" {
-			continue
-		}
-
-		// Extract data field
-		data, hasData := doc["data"]
-		if hasData {
-			// Convert to YAML string for consistent hashing
-			dataBytes, err := yaml.Marshal(data)
-			if err == nil {
-				configData = append(configData, string(dataBytes))
-			}
-		}
-
-		// For Secrets, also check stringData
-		if kind == "Secret" {
-			stringData, hasStringData := doc["stringData"]
-			if hasStringData {
-				stringDataBytes, err := yaml.Marshal(stringData)
-				if err == nil {
-					configData = append(configData, string(stringDataBytes))
-				}
-			}
-		}
+	err := forEachManifestDocument(manifest, func(doc map[string]interface{}) {
+		configData = append(configData, configDataOf(doc)...)
+	})
+	if err != nil {
+		return "", err
 	}
-
-	// If no config found, return empty string
-	if len(configData) == 0 {
-		return "", nil
-	}
-
-	// Calculate SHA-256 hash of all config data combined
-	combined := strings.Join(configData, "\n")
-	hash := sha256.Sum256([]byte(combined))
-	return fmt.Sprintf("%x", hash), nil
+	return hashConfigData(configData), nil
 }
 
-// injectConfigChecksums patches Deployments, StatefulSets, and DaemonSets with config checksum annotations
-// This forces a rollout when ConfigMaps or Secrets change
-func (helm *HelmProvider) injectConfigChecksums(ctx context.Context, namespace string, manifest string, checksum string) error {
-	if manifest == "" || checksum == "" {
+// configDataOf returns the content of doc that the config checksum covers:
+// its configChecksumFields as YAML if it's a ConfigMap or Secret, else nothing
+func configDataOf(doc map[string]interface{}) []string {
+	kind, _ := doc["kind"].(string)
+	if kind != "ConfigMap" && kind != "Secret" {
 		return nil
 	}
 
-	// Create dynamic client
-	dynamicClient, err := dynamic.NewForConfig(helm.restConfig)
-	if err != nil {
-		return fmt.Errorf("failed to create dynamic client: %w", err)
+	var configData []string
+	for _, field := range configChecksumFields {
+		if value, ok := doc[field]; ok {
+			// Convert to YAML string for consistent hashing
+			if valueBytes, err := yaml.Marshal(value); err == nil {
+				configData = append(configData, string(valueBytes))
+			}
+		}
 	}
+	return configData
+}
 
-	// Create discovery client for REST mapper
-	discoveryClient, err := discovery.NewDiscoveryClientForConfig(helm.restConfig)
-	if err != nil {
-		return fmt.Errorf("failed to create discovery client: %w", err)
+// hashConfigData returns the SHA-256 of configData combined, or an empty
+// string when there is none
+func hashConfigData(configData []string) string {
+	if len(configData) == 0 {
+		return ""
 	}
+	hash := sha256.Sum256([]byte(strings.Join(configData, "\n")))
+	return fmt.Sprintf("%x", hash)
+}
 
-	mapper := restmapper.NewDeferredDiscoveryRESTMapper(memory.NewMemCacheClient(discoveryClient))
+// configChecksumPostRenderer sets the configChecksumAnnotation on the pod
+// template of every Deployment, StatefulSet and DaemonSet in a release, to a
+// checksum of the release's ConfigMaps and Secrets, so a config change rolls
+// them out. It runs as Helm renders, so the annotation is in what Helm
+// applies: patching it on after an install changed every pod template a
+// second time, and a single-replica hostNetwork Deployment (MetalLB's
+// frr-k8s status cleaner) deadlocked on a one-node cluster, its new pod
+// unschedulable while the old one held the host port.
+//
+// It is run with PostRenderStrategyNoHooks, so it sees the release manifest
+// without hooks: the same documents the checksum covered when it was patched
+// on, in the same order once Secrets are put ahead of ConfigMaps (Helm's
+// install order), so upgrading kraze doesn't roll out every release.
+type configChecksumPostRenderer struct{}
 
-	// Parse YAML documents
-	decoder := yaml.NewDecoder(strings.NewReader(manifest))
+// workloadKinds are the kinds whose pod template gets the config checksum
+var workloadKinds = map[string]bool{"Deployment": true, "StatefulSet": true, "DaemonSet": true}
 
+func (configChecksumPostRenderer) Run(rendered *bytes.Buffer) (*bytes.Buffer, error) {
+	var docs []*yaml.Node
+	decoder := yaml.NewDecoder(bytes.NewReader(rendered.Bytes()))
 	for {
-		var doc map[string]interface{}
-		if err := decoder.Decode(&doc); err != nil {
-			if err.Error() == "EOF" {
+		var doc yaml.Node
+		err := decoder.Decode(&doc)
+		if stderrors.Is(err, io.EOF) {
+			break
+		}
+		if err != nil {
+			return nil, fmt.Errorf("failed to parse manifest: %w", err)
+		}
+		docs = append(docs, &doc)
+	}
+
+	var secretData, configMapData []string
+	var workloads []*yaml.Node
+	for _, doc := range docs {
+		var fields map[string]interface{}
+		if doc.Decode(&fields) != nil || fields == nil {
+			continue
+		}
+		switch kind, _ := fields["kind"].(string); {
+		case kind == "Secret":
+			secretData = append(secretData, configDataOf(fields)...)
+		case kind == "ConfigMap":
+			configMapData = append(configMapData, configDataOf(fields)...)
+		case workloadKinds[kind]:
+			workloads = append(workloads, doc)
+		}
+	}
+
+	checksum := hashConfigData(append(secretData, configMapData...))
+	if checksum == "" || len(workloads) == 0 {
+		return rendered, nil
+	}
+	for _, doc := range workloads {
+		annotations := mappingAt(doc.Content[0], "spec", "template", "metadata", "annotations")
+		if annotations == nil {
+			return nil, fmt.Errorf("failed to set %s: a workload's pod template isn't a mapping", configChecksumAnnotation)
+		}
+		setMappingValue(annotations, configChecksumAnnotation, checksum)
+	}
+
+	var out bytes.Buffer
+	encoder := yaml.NewEncoder(&out)
+	encoder.SetIndent(2)
+	for _, doc := range docs {
+		if err := encoder.Encode(doc); err != nil {
+			return nil, fmt.Errorf("failed to write manifest: %w", err)
+		}
+	}
+	if err := encoder.Close(); err != nil {
+		return nil, fmt.Errorf("failed to write manifest: %w", err)
+	}
+	return &out, nil
+}
+
+// mappingAt returns the mapping at path under node, creating any part of it
+// that is missing or null, or nil if something along it isn't a mapping
+func mappingAt(node *yaml.Node, path ...string) *yaml.Node {
+	for _, key := range path {
+		if node.Kind != yaml.MappingNode {
+			return nil
+		}
+		var child *yaml.Node
+		for i := 0; i+1 < len(node.Content); i += 2 {
+			if node.Content[i].Value == key {
+				child = node.Content[i+1]
 				break
 			}
-			continue
 		}
-
-		if doc == nil {
-			continue
+		if child == nil {
+			child = &yaml.Node{}
+			node.Content = append(node.Content, &yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: key}, child)
 		}
-
-		kind, _ := doc["kind"].(string)
-
-		// Only process workload resources that have Pod templates
-		if kind != "Deployment" && kind != "StatefulSet" && kind != "DaemonSet" {
-			continue
+		if child.Kind == 0 || (child.Kind == yaml.ScalarNode && child.Tag == "!!null") {
+			*child = yaml.Node{Kind: yaml.MappingNode, Tag: "!!map"}
 		}
-
-		metadata, ok := doc["metadata"].(map[string]interface{})
-		if !ok {
-			continue
-		}
-
-		name, _ := metadata["name"].(string)
-		if name == "" {
-			continue
-		}
-
-		// Use the namespace from the document, or fall back to the release namespace
-		docNamespace, _ := metadata["namespace"].(string)
-		if docNamespace == "" {
-			docNamespace = namespace
-		}
-
-		// Use shared patching function
-		patchWorkloadWithConfigChecksum(ctx, dynamicClient, mapper, kind, name, docNamespace, checksum, helm.opts.Verbose)
+		node = child
 	}
+	if node.Kind != yaml.MappingNode {
+		return nil
+	}
+	return node
+}
 
-	return nil
+// setMappingValue sets key to the string value in mapping, replacing any
+// value it has
+func setMappingValue(mapping *yaml.Node, key, value string) {
+	// Quoted, so a checksum of all digits doesn't read back as a number
+	valueNode := &yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Style: yaml.DoubleQuotedStyle, Value: value}
+	for i := 0; i+1 < len(mapping.Content); i += 2 {
+		if mapping.Content[i].Value == key {
+			mapping.Content[i+1] = valueNode
+			return
+		}
+	}
+	mapping.Content = append(mapping.Content, &yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: key}, valueNode)
+}
+
+// forEachManifestDocument calls fn with each YAML document of a rendered
+// manifest that is a mapping. A document of another shape is skipped (the
+// decoder has moved past it). A syntax error stops with an error: the decoder
+// can't resume after one and would return it forever.
+func forEachManifestDocument(manifest string, fn func(doc map[string]interface{})) error {
+	decoder := yaml.NewDecoder(strings.NewReader(manifest))
+	for {
+		var doc map[string]interface{}
+		err := decoder.Decode(&doc)
+		if stderrors.Is(err, io.EOF) {
+			return nil
+		}
+		var typeErr *yaml.TypeError
+		if stderrors.As(err, &typeErr) {
+			continue
+		}
+		if err != nil {
+			return fmt.Errorf("failed to parse manifest: %w", err)
+		}
+		if doc != nil {
+			fn(doc)
+		}
+	}
 }

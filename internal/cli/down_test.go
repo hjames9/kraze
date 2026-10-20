@@ -11,6 +11,7 @@ import (
 )
 
 const downTestConfig = `
+project: test
 cluster:
   name: down-test-cluster
   external:
@@ -267,6 +268,7 @@ func TestRunDownDisabledFlagRejectsServiceNames(t *testing.T) {
 
 func TestRunDownDisabledFlagWithNoDisabledServices(t *testing.T) {
 	const cfgNoDisabled = `
+project: test
 cluster:
   name: down-test-cluster
   external:
@@ -303,5 +305,28 @@ services:
 	}
 	if strings.Contains(out, "alpha") {
 		t.Errorf("expected no mention of enabled service 'alpha', got output: %q", out)
+	}
+}
+
+func TestDownDeleteNamespacesDryRun(t *testing.T) {
+	writeDownTestConfig(t)
+	savedDelete, savedDryRun, savedLabels, savedDisabled := downDeleteNamespaces, dryRun, downLabels, downDisabledOnly
+	t.Cleanup(func() {
+		downDeleteNamespaces, dryRun, downLabels, downDisabledOnly = savedDelete, savedDryRun, savedLabels, savedDisabled
+	})
+	downDeleteNamespaces, dryRun, downLabels, downDisabledOnly = true, true, nil, false
+
+	var err error
+	out := captureStdout(t, func() { err = runDown(downCmd, nil) })
+	if err != nil {
+		t.Fatalf("down --delete-namespaces --dry-run: %v", err)
+	}
+	if !strings.Contains(out, "--delete-namespaces") {
+		t.Errorf("dry run should mention namespace deletion, got:\n%s", out)
+	}
+
+	downDeleteNamespaces = false
+	if out := captureStdout(t, func() { err = runDown(downCmd, nil) }); strings.Contains(out, "--delete-namespaces") {
+		t.Errorf("without the flag the dry run shouldn't mention it, got:\n%s", out)
 	}
 }

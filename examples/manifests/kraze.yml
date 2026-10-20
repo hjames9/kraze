@@ -12,6 +12,8 @@
 #   kraze status           # Check resource status
 #   kraze down             # Delete all resources
 
+project: manifests
+
 cluster:
   name: manifests-cluster
 

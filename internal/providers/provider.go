@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	stderrors "errors"
 	"fmt"
 	"io"
 	"strings"
@@ -11,12 +12,12 @@ import (
 
 	"github.com/hjames9/kraze/internal/color"
 	"github.com/hjames9/kraze/internal/config"
+	"github.com/hjames9/kraze/internal/state"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
-	"k8s.io/apimachinery/pkg/runtime/schema"
-	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/yaml"
 	"k8s.io/client-go/discovery"
 	"k8s.io/client-go/discovery/cached/memory"
@@ -78,6 +79,15 @@ type ProviderOptions struct {
 
 	// Quiet suppresses intermediate status messages (for clean progress UI)
 	Quiet bool
+
+	// Project is the kraze project acting on the cluster. Manifests services
+	// label the objects they apply with it, so other projects' services can
+	// tell the objects aren't theirs.
+	Project string
+
+	// Recorded is what the last `up` recorded for the service (status uses it
+	// to count a Job removed by its TTL after `up` saw it complete)
+	Recorded []state.ResourceRef
 }
 
 // NewProvider creates a provider based on the service type
@@ -144,144 +154,6 @@ func namespaceExists(ctx context.Context, restConfig *rest.Config, namespace str
 		return false, fmt.Errorf("failed to check namespace: %w", err)
 	}
 
-	return true, nil
-}
-
-// IsNamespaceEmpty checks if a namespace is empty (has no user-created resources)
-// Ignores auto-created Kubernetes resources like default ServiceAccount and kube-root-ca.crt
-func IsNamespaceEmpty(ctx context.Context, kubeconfig, namespace string) (bool, error) {
-	restConfig, err := getRESTConfigFromKubeconfig(kubeconfig)
-	if err != nil {
-		return false, err
-	}
-
-	clientset, err := kubernetes.NewForConfig(restConfig)
-	if err != nil {
-		return false, fmt.Errorf("failed to create clientset: %w", err)
-	}
-
-	// Check for pods (most common resource)
-	// Ignore pods that are terminating (have DeletionTimestamp set)
-	pods, err := clientset.CoreV1().Pods(namespace).List(ctx, metav1.ListOptions{})
-	if err != nil {
-		return false, fmt.Errorf("failed to list pods: %w", err)
-	}
-
-	// Count non-terminating pods
-	nonTerminatingPods := 0
-	for _, pod := range pods.Items {
-		if pod.DeletionTimestamp == nil {
-			nonTerminatingPods++
-		}
-	}
-
-	if nonTerminatingPods > 0 {
-		return false, nil
-	}
-
-	// Check for services
-	services, err := clientset.CoreV1().Services(namespace).List(ctx, metav1.ListOptions{})
-	if err != nil {
-		return false, fmt.Errorf("failed to list services: %w", err)
-	}
-	if len(services.Items) > 0 {
-		return false, nil
-	}
-
-	// Check for PVCs (important for data safety)
-	// Ignore PVCs that are being deleted (have DeletionTimestamp set)
-	pvcs, err := clientset.CoreV1().PersistentVolumeClaims(namespace).List(ctx, metav1.ListOptions{})
-	if err != nil {
-		return false, fmt.Errorf("failed to list PVCs: %w", err)
-	}
-
-	// Count non-deleting PVCs
-	nonDeletingPVCs := 0
-	for _, pvc := range pvcs.Items {
-		if pvc.DeletionTimestamp == nil {
-			nonDeletingPVCs++
-		}
-	}
-
-	if nonDeletingPVCs > 0 {
-		return false, nil
-	}
-
-	// Check for ConfigMaps (excluding auto-created ones)
-	configMaps, err := clientset.CoreV1().ConfigMaps(namespace).List(ctx, metav1.ListOptions{})
-	if err != nil {
-		return false, fmt.Errorf("failed to list ConfigMaps: %w", err)
-	}
-	userConfigMapCount := 0
-	for _, cm := range configMaps.Items {
-		// Ignore the auto-created kube-root-ca.crt ConfigMap
-		if cm.Name != "kube-root-ca.crt" {
-			userConfigMapCount++
-		}
-	}
-	if userConfigMapCount > 0 {
-		return false, nil
-	}
-
-	// Check for Secrets (excluding auto-created ones)
-	secrets, err := clientset.CoreV1().Secrets(namespace).List(ctx, metav1.ListOptions{})
-	if err != nil {
-		return false, fmt.Errorf("failed to list Secrets: %w", err)
-	}
-	userSecretCount := 0
-	for _, secret := range secrets.Items {
-		// Ignore auto-created service account tokens and Helm-managed secrets
-		// Helm often leaves behind webhook CA certificates when uninstalling
-		if secret.Type == "kubernetes.io/service-account-token" {
-			continue // Ignore service account tokens
-		}
-		// Ignore secrets managed by Helm that contain webhook CAs or TLS certs
-		if strings.Contains(strings.ToLower(secret.Name), "webhook") ||
-			strings.Contains(strings.ToLower(secret.Name), "-ca") ||
-			strings.Contains(strings.ToLower(secret.Name), "-tls") {
-			continue
-		}
-		userSecretCount++
-	}
-	if userSecretCount > 0 {
-		return false, nil
-	}
-
-	// Check for ServiceAccounts (excluding the default one)
-	serviceAccounts, err := clientset.CoreV1().ServiceAccounts(namespace).List(ctx, metav1.ListOptions{})
-	if err != nil {
-		return false, fmt.Errorf("failed to list ServiceAccounts: %w", err)
-	}
-	userServiceAccountCount := 0
-	for _, sa := range serviceAccounts.Items {
-		// Ignore the auto-created default ServiceAccount
-		if sa.Name != "default" {
-			userServiceAccountCount++
-		}
-	}
-	if userServiceAccountCount > 0 {
-		return false, nil
-	}
-
-	// Check for Deployments
-	deployments, err := clientset.AppsV1().Deployments(namespace).List(ctx, metav1.ListOptions{})
-	if err != nil {
-		return false, fmt.Errorf("failed to list Deployments: %w", err)
-	}
-	if len(deployments.Items) > 0 {
-		return false, nil
-	}
-
-	// Check for StatefulSets
-	statefulSets, err := clientset.AppsV1().StatefulSets(namespace).List(ctx, metav1.ListOptions{})
-	if err != nil {
-		return false, fmt.Errorf("failed to list StatefulSets: %w", err)
-	}
-	if len(statefulSets.Items) > 0 {
-		return false, nil
-	}
-
-	// Namespace is empty (only has auto-created Kubernetes resources)
 	return true, nil
 }
 
@@ -513,7 +385,10 @@ func parseManifestsYAML(manifestYAML string) ([]*unstructured.Unstructured, erro
 	var resources []*unstructured.Unstructured
 
 	// Split by document separator
-	docs := splitYAMLDocuments(manifestYAML)
+	docs, err := splitYAMLDocuments(manifestYAML)
+	if err != nil {
+		return nil, err
+	}
 
 	for _, doc := range docs {
 		doc = strings.TrimSpace(doc)
@@ -535,34 +410,25 @@ func parseManifestsYAML(manifestYAML string) ([]*unstructured.Unstructured, erro
 	return resources, nil
 }
 
-// splitYAMLDocuments splits multi-document YAML by --- separator
-func splitYAMLDocuments(content string) []string {
+// splitYAMLDocuments splits multi-document YAML into its documents, with the
+// reader kubectl uses: a separator is a "---" line at column 0 (so an indented
+// "---" inside a block scalar stays in its document), optionally followed by
+// a comment, and lines may be any length. Blank documents are dropped.
+func splitYAMLDocuments(content string) ([]string, error) {
+	reader := yaml.NewYAMLReader(bufio.NewReader(strings.NewReader(content)))
 	var docs []string
-	scanner := bufio.NewScanner(strings.NewReader(content))
-	var currentDoc strings.Builder
-
-	for scanner.Scan() {
-		line := scanner.Text()
-
-		// Check for document separator
-		if strings.TrimSpace(line) == "---" {
-			if currentDoc.Len() > 0 {
-				docs = append(docs, currentDoc.String())
-				currentDoc.Reset()
-			}
-			continue
+	for {
+		doc, err := reader.Read()
+		if stderrors.Is(err, io.EOF) {
+			return docs, nil
 		}
-
-		currentDoc.WriteString(line)
-		currentDoc.WriteString("\n")
+		if err != nil {
+			return nil, err
+		}
+		if len(bytes.TrimSpace(doc)) > 0 {
+			docs = append(docs, string(doc))
+		}
 	}
-
-	// Add last document
-	if currentDoc.Len() > 0 {
-		docs = append(docs, currentDoc.String())
-	}
-
-	return docs
 }
 
 // parseYAMLToUnstructured parses a single YAML document into an unstructured object
@@ -597,8 +463,16 @@ func shouldWaitForResource(kind string) bool {
 	return waitableKinds[kind]
 }
 
+// readinessPollInterval is how often a resource's readiness is polled; a
+// variable so tests run fast
+var readinessPollInterval = 2 * time.Second
+
+// errResourceFailed marks a readiness failure that waiting can't fix (a
+// failed Job, a Deployment past its progress deadline)
+var errResourceFailed = stderrors.New("resource failed")
+
 // waitForResourceReady waits for a specific resource to become ready
-func waitForResourceReady(ctx context.Context, dynamicClient dynamic.Interface, clientset *kubernetes.Clientset, mapper *restmapper.DeferredDiscoveryRESTMapper, obj *unstructured.Unstructured, verbose bool) error {
+func waitForResourceReady(ctx context.Context, dynamicClient dynamic.Interface, clientset kubernetes.Interface, mapper meta.RESTMapper, obj *unstructured.Unstructured, verbose bool) error {
 	gvk := obj.GroupVersionKind()
 	mapping, err := mapper.RESTMapping(gvk.GroupKind(), gvk.Version)
 	if err != nil {
@@ -624,7 +498,7 @@ func waitForResourceReady(ctx context.Context, dynamicClient dynamic.Interface, 
 	imagePullFailFirstSeen := make(map[string]time.Time)
 
 	// Poll until ready
-	ticker := time.NewTicker(2 * time.Second)
+	ticker := time.NewTicker(readinessPollInterval)
 	defer ticker.Stop()
 
 	for {
@@ -658,6 +532,9 @@ func waitForResourceReady(ctx context.Context, dynamicClient dynamic.Interface, 
 
 			// Check if ready based on kind
 			ready, err := isResourceReady(current, kind)
+			if stderrors.Is(err, errResourceFailed) {
+				return err
+			}
 			if err != nil {
 				if verbose {
 					fmt.Printf("    Warning: failed to check readiness: %v\n", err)
@@ -724,95 +601,94 @@ func isResourceReady(obj *unstructured.Unstructured, kind string) (bool, error) 
 	}
 }
 
-// isDeploymentReady checks if a Deployment is ready
+// statusInt reads an integer status field; the controllers omit zero counts,
+// so a missing field is 0
+func statusInt(status map[string]interface{}, field string) int64 {
+	value, _, _ := unstructured.NestedInt64(status, field)
+	return value
+}
+
+// specReplicas returns spec.replicas, which defaults to 1
+func specReplicas(obj *unstructured.Unstructured) int64 {
+	if replicas, found, _ := unstructured.NestedInt64(obj.Object, "spec", "replicas"); found {
+		return replicas
+	}
+	return 1
+}
+
+// statusIsCurrent reports whether the controller has acted on the latest
+// spec. Until it has, status describes the previous version, which may look
+// fully rolled out.
+func statusIsCurrent(obj *unstructured.Unstructured, status map[string]interface{}) bool {
+	observed, found, _ := unstructured.NestedInt64(status, "observedGeneration")
+	return found && observed >= obj.GetGeneration()
+}
+
+// isDeploymentReady reports whether a Deployment's rollout is complete, as
+// `kubectl rollout status` decides it: every replica updated and available,
+// and no old replicas left
 func isDeploymentReady(obj *unstructured.Unstructured, status map[string]interface{}) (bool, error) {
-	spec, _, err := unstructured.NestedMap(obj.Object, "spec")
-	if err != nil {
-		return false, err
-	}
-
-	desiredReplicas := int64(1) // default
-	if replicas, found, _ := unstructured.NestedInt64(spec, "replicas"); found {
-		desiredReplicas = replicas
-	}
-
-	availableReplicas, found, err := unstructured.NestedInt64(status, "availableReplicas")
-	if err != nil {
-		return false, err
-	}
-	if !found {
+	if !statusIsCurrent(obj, status) {
 		return false, nil
 	}
-
-	updatedReplicas, found, err := unstructured.NestedInt64(status, "updatedReplicas")
-	if err != nil {
-		return false, err
+	conditions, _, _ := unstructured.NestedSlice(status, "conditions")
+	for _, cond := range conditions {
+		condMap, ok := cond.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		if condMap["type"] == "Progressing" && condMap["reason"] == "ProgressDeadlineExceeded" {
+			return false, fmt.Errorf("%w: deployment exceeded its progress deadline", errResourceFailed)
+		}
 	}
-	if !found {
-		return false, nil
-	}
 
-	return availableReplicas >= desiredReplicas && updatedReplicas >= desiredReplicas, nil
+	updated := statusInt(status, "updatedReplicas")
+	return updated >= specReplicas(obj) &&
+		statusInt(status, "replicas") <= updated &&
+		statusInt(status, "availableReplicas") >= updated, nil
 }
 
-// isStatefulSetReady checks if a StatefulSet is ready
+// isStatefulSetReady reports whether a StatefulSet's rollout is complete, as
+// `kubectl rollout status` decides it: enough ready replicas and, for a
+// rolling update, every pod at or above the partition on the new revision
 func isStatefulSetReady(obj *unstructured.Unstructured, status map[string]interface{}) (bool, error) {
-	spec, _, err := unstructured.NestedMap(obj.Object, "spec")
-	if err != nil {
-		return false, err
+	if !statusIsCurrent(obj, status) {
+		return false, nil
 	}
-
-	desiredReplicas := int64(1) // default
-	if replicas, found, _ := unstructured.NestedInt64(spec, "replicas"); found {
-		desiredReplicas = replicas
-	}
-
-	readyReplicas, found, err := unstructured.NestedInt64(status, "readyReplicas")
-	if err != nil {
-		return false, err
-	}
-	if !found {
-		// No readyReplicas field yet - StatefulSet controller hasn't updated status
+	replicas := specReplicas(obj)
+	if statusInt(status, "readyReplicas") < replicas {
 		return false, nil
 	}
 
-	// Check if we have enough ready replicas
-	isReady := readyReplicas >= desiredReplicas
-
-	// Debug output for troubleshooting
-	if !isReady {
-		fmt.Printf("      StatefulSet not ready: readyReplicas=%d, desiredReplicas=%d\n", readyReplicas, desiredReplicas)
-	}
-
-	return isReady, nil
-}
-
-// isDaemonSetReady checks if a DaemonSet is ready
-func isDaemonSetReady(obj *unstructured.Unstructured, status map[string]interface{}) (bool, error) {
-	desiredScheduled, found, err := unstructured.NestedInt64(status, "desiredNumberScheduled")
-	if err != nil || !found {
-		return false, err
-	}
-
-	numberReady, found, err := unstructured.NestedInt64(status, "numberReady")
-	if err != nil || !found {
-		return false, err
-	}
-
-	// A DaemonSet with 0 desired pods (no matching nodes) is trivially ready
-	if desiredScheduled == 0 {
+	strategy, _, _ := unstructured.NestedString(obj.Object, "spec", "updateStrategy", "type")
+	if strategy == "OnDelete" {
+		// Pods only change revision when deleted by hand; nothing to wait for
 		return true, nil
 	}
-	return numberReady >= desiredScheduled, nil
+	if partition, found, _ := unstructured.NestedInt64(obj.Object, "spec", "updateStrategy", "rollingUpdate", "partition"); found && partition > 0 {
+		return statusInt(status, "updatedReplicas") >= replicas-partition, nil
+	}
+	current, _, _ := unstructured.NestedString(status, "currentRevision")
+	update, _, _ := unstructured.NestedString(status, "updateRevision")
+	return current == update, nil
 }
 
-// isJobReady checks if a Job has completed
-func isJobReady(obj *unstructured.Unstructured, status map[string]interface{}) (bool, error) {
-	succeeded, found, err := unstructured.NestedInt64(status, "succeeded")
-	if err != nil {
-		return false, err
+// isDaemonSetReady reports whether a DaemonSet's rollout is complete, as
+// `kubectl rollout status` decides it: every scheduled pod updated and
+// available
+func isDaemonSetReady(obj *unstructured.Unstructured, status map[string]interface{}) (bool, error) {
+	if !statusIsCurrent(obj, status) {
+		return false, nil
 	}
-	if found && succeeded > 0 {
+	desired := statusInt(status, "desiredNumberScheduled")
+	return statusInt(status, "updatedNumberScheduled") >= desired &&
+		statusInt(status, "numberAvailable") >= desired, nil
+}
+
+// isJobReady checks if a Job has completed. A failed Job is a terminal
+// failure.
+func isJobReady(obj *unstructured.Unstructured, status map[string]interface{}) (bool, error) {
+	if statusInt(status, "succeeded") > 0 {
 		return true, nil
 	}
 
@@ -834,7 +710,7 @@ func isJobReady(obj *unstructured.Unstructured, status map[string]interface{}) (
 			return true, nil
 		}
 		if condType == "Failed" && condStatus == "True" {
-			return false, fmt.Errorf("job failed")
+			return false, fmt.Errorf("%w: job failed", errResourceFailed)
 		}
 	}
 
@@ -898,7 +774,7 @@ func withinImagePullGracePeriod(podKey string, firstSeen map[string]time.Time) b
 // checkControlledPodsForFailures checks Pods controlled by a Deployment/StatefulSet/etc for failures.
 // imagePullFailFirstSeen tracks the first time each pod (namespace/name) was seen in an image-pull
 // failure state so that transient pull errors are tolerated for imagePullGracePeriod before failing.
-func checkControlledPodsForFailures(ctx context.Context, clientset *kubernetes.Clientset, obj *unstructured.Unstructured, kind string, imagePullFailFirstSeen map[string]time.Time) error {
+func checkControlledPodsForFailures(ctx context.Context, clientset kubernetes.Interface, obj *unstructured.Unstructured, kind string, imagePullFailFirstSeen map[string]time.Time) error {
 	namespace := obj.GetNamespace()
 
 	// Get the selector for finding Pods
@@ -1164,7 +1040,7 @@ func isEventRecent(event corev1.Event, cutoff time.Time) bool {
 	return ts.IsZero() || !ts.Before(cutoff)
 }
 
-func getPodEvents(ctx context.Context, clientset *kubernetes.Clientset, namespace, podName string, limit int) ([]string, error) {
+func getPodEvents(ctx context.Context, clientset kubernetes.Interface, namespace, podName string, limit int) ([]string, error) {
 	events, err := clientset.CoreV1().Events(namespace).List(ctx, metav1.ListOptions{
 		FieldSelector: fmt.Sprintf("involvedObject.name=%s,involvedObject.kind=Pod", podName),
 	})
@@ -1191,7 +1067,7 @@ func getPodEvents(ctx context.Context, clientset *kubernetes.Clientset, namespac
 }
 
 // getContainerLogs fetches recent logs from a container
-func getContainerLogs(ctx context.Context, clientset *kubernetes.Clientset, namespace, podName, containerName string, tailLines int) ([]string, error) {
+func getContainerLogs(ctx context.Context, clientset kubernetes.Interface, namespace, podName, containerName string, tailLines int) ([]string, error) {
 	tailLinesInt64 := int64(tailLines)
 	req := clientset.CoreV1().Pods(namespace).GetLogs(podName, &corev1.PodLogOptions{
 		Container: containerName,
@@ -1218,7 +1094,7 @@ func getContainerLogs(ctx context.Context, clientset *kubernetes.Clientset, name
 }
 
 // displayPodDiagnostics shows detailed diagnostics for a failed Pod
-func displayPodDiagnostics(ctx context.Context, clientset *kubernetes.Clientset, obj *unstructured.Unstructured, failureMsg string) {
+func displayPodDiagnostics(ctx context.Context, clientset kubernetes.Interface, obj *unstructured.Unstructured, failureMsg string) {
 	namespace := obj.GetNamespace()
 	podName := obj.GetName()
 
@@ -1306,54 +1182,10 @@ func hasReadyCondition(status map[string]interface{}) (bool, error) {
 	return false, nil
 }
 
-// patchWorkloadWithConfigChecksum patches a Deployment, StatefulSet, or DaemonSet
-// with a config checksum annotation to force a rollout when the checksum changes.
-// It is best-effort: the resource may not exist yet or may not support patching,
-// so failures are only reported in verbose mode.
-func patchWorkloadWithConfigChecksum(
-	ctx context.Context,
-	dynamicClient dynamic.Interface,
-	mapper *restmapper.DeferredDiscoveryRESTMapper,
-	kind, name, namespace, checksum string,
-	verbose bool,
-) {
-	// Get the GVR for this resource
-	gvk := schema.GroupVersionKind{
-		Group:   "apps",
-		Version: "v1",
-		Kind:    kind,
-	}
+// configChecksumAnnotation holds a checksum of a service's ConfigMaps and
+// Secrets on its workloads' pod templates, so a config change rolls them out
+const configChecksumAnnotation = "kraze.dev/config-hash"
 
-	gk := schema.GroupKind{
-		Group: gvk.Group,
-		Kind:  gvk.Kind,
-	}
-
-	mapping, err := mapper.RESTMapping(gk, gvk.Version)
-	if err != nil {
-		if verbose {
-			fmt.Printf("Warning: failed to get REST mapping for %s: %v\n", kind, err)
-		}
-		return
-	}
-
-	// Get the resource interface
-	resourceClient := dynamicClient.Resource(mapping.Resource).Namespace(namespace)
-
-	// Patch the resource with checksum annotation
-	// We use merge patch to add the annotation to spec.template.metadata.annotations
-	patch := fmt.Sprintf(`{"spec":{"template":{"metadata":{"annotations":{"kraze.dev/config-hash":"%s"}}}}}`, checksum)
-
-	_, err = resourceClient.Patch(ctx, name, types.MergePatchType, []byte(patch), metav1.PatchOptions{})
-	if err != nil {
-		// Log warning but don't fail - the resource might not exist yet or might not support patching
-		if verbose {
-			fmt.Printf("Warning: failed to patch %s/%s with config checksum: %v\n", kind, name, err)
-		}
-		return
-	}
-
-	if verbose {
-		fmt.Printf("Added config checksum annotation to %s/%s (hash: %s)\n", kind, name, checksum[:8])
-	}
-}
+// configChecksumFields are the ConfigMap and Secret fields whose content the
+// config checksum covers, hashed in this order
+var configChecksumFields = []string{"data", "stringData", "binaryData"}

@@ -19,6 +19,8 @@
 #   kraze status    # Check deployment status
 #   kraze down      # Remove all resources
 
+project: image-volumes
+
 cluster:
   name: image-volumes-cluster
 

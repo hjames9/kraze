@@ -1,6 +1,7 @@
 package config
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -20,6 +21,7 @@ func writeTemp(t *testing.T, dir, name, content string) string {
 func TestParseMultipleSingleFile(t *testing.T) {
 	dir := t.TempDir()
 	path := writeTemp(t, dir, "kraze.yml", `
+project: test
 cluster:
   name: dev
 services:
@@ -42,6 +44,7 @@ services:
 func TestParseMultipleMergesServices(t *testing.T) {
 	dir := t.TempDir()
 	a := writeTemp(t, dir, "a.yml", `
+project: test
 cluster:
   name: dev
 services:
@@ -50,6 +53,7 @@ services:
     path: .
 `)
 	b := writeTemp(t, dir, "b.yml", `
+project: test
 cluster:
   name: dev
 services:
@@ -75,6 +79,7 @@ services:
 func TestParseMultipleDuplicateServiceError(t *testing.T) {
 	dir := t.TempDir()
 	a := writeTemp(t, dir, "a.yml", `
+project: test
 cluster:
   name: dev
 services:
@@ -83,6 +88,7 @@ services:
     path: .
 `)
 	b := writeTemp(t, dir, "b.yml", `
+project: test
 cluster:
   name: dev
 services:
@@ -99,6 +105,7 @@ services:
 func TestParseMultipleCrossFileDependency(t *testing.T) {
 	dir := t.TempDir()
 	a := writeTemp(t, dir, "a.yml", `
+project: test
 cluster:
   name: dev
 services:
@@ -107,6 +114,7 @@ services:
     path: .
 `)
 	b := writeTemp(t, dir, "b.yml", `
+project: test
 cluster:
   name: dev
 services:
@@ -128,6 +136,7 @@ services:
 func TestParseMultipleClusterNameFirstFileWins(t *testing.T) {
 	dir := t.TempDir()
 	a := writeTemp(t, dir, "a.yml", `
+project: test
 cluster:
   name: primary
 services:
@@ -136,6 +145,7 @@ services:
     path: .
 `)
 	b := writeTemp(t, dir, "b.yml", `
+project: test
 cluster:
   name: secondary
 services:
@@ -155,6 +165,7 @@ services:
 func TestParseMultipleCACertificatesUnion(t *testing.T) {
 	dir := t.TempDir()
 	a := writeTemp(t, dir, "a.yml", `
+project: test
 cluster:
   name: dev
   ca_certificates:
@@ -166,6 +177,7 @@ services:
     path: .
 `)
 	b := writeTemp(t, dir, "b.yml", `
+project: test
 cluster:
   name: dev
   ca_certificates:
@@ -189,6 +201,7 @@ services:
 func TestParseMultipleGPUOrLogic(t *testing.T) {
 	dir := t.TempDir()
 	a := writeTemp(t, dir, "a.yml", `
+project: test
 cluster:
   name: dev
   gpu:
@@ -200,6 +213,7 @@ services:
     path: .
 `)
 	b := writeTemp(t, dir, "b.yml", `
+project: test
 cluster:
   name: dev
 services:
@@ -224,6 +238,7 @@ func TestParseMultipleProxyConflictError(t *testing.T) {
 	_ = boolFalse
 
 	a := writeTemp(t, dir, "a.yml", `
+project: test
 cluster:
   name: dev
   proxy:
@@ -235,6 +250,7 @@ services:
     path: .
 `)
 	b := writeTemp(t, dir, "b.yml", `
+project: test
 cluster:
   name: dev
   proxy:
@@ -253,6 +269,7 @@ services:
 func TestParseMultipleNoProxyUnion(t *testing.T) {
 	dir := t.TempDir()
 	a := writeTemp(t, dir, "a.yml", `
+project: test
 cluster:
   name: dev
   proxy:
@@ -264,6 +281,7 @@ services:
     path: .
 `)
 	b := writeTemp(t, dir, "b.yml", `
+project: test
 cluster:
   name: dev
   proxy:
@@ -294,6 +312,7 @@ services:
 func TestParseMultipleVersionConflictError(t *testing.T) {
 	dir := t.TempDir()
 	a := writeTemp(t, dir, "a.yml", `
+project: test
 cluster:
   name: dev
   version: "1.29"
@@ -303,6 +322,7 @@ services:
     path: .
 `)
 	b := writeTemp(t, dir, "b.yml", `
+project: test
 cluster:
   name: dev
   version: "1.30"
@@ -327,6 +347,7 @@ func TestParseMultipleEmptyPathsError(t *testing.T) {
 func TestParseMultipleKindNodePortMappingsUnion(t *testing.T) {
 	dir := t.TempDir()
 	a := writeTemp(t, dir, "a.yml", `
+project: test
 cluster:
   name: dev
   config:
@@ -340,6 +361,7 @@ services:
     path: .
 `)
 	b := writeTemp(t, dir, "b.yml", `
+project: test
 cluster:
   name: dev
   config:
@@ -367,6 +389,7 @@ services:
 func TestParseMultipleKindNodePortMappingsDeduplicated(t *testing.T) {
 	dir := t.TempDir()
 	a := writeTemp(t, dir, "a.yml", `
+project: test
 cluster:
   name: dev
   config:
@@ -380,6 +403,7 @@ services:
     path: .
 `)
 	b := writeTemp(t, dir, "b.yml", `
+project: test
 cluster:
   name: dev
   config:
@@ -404,6 +428,7 @@ services:
 func TestParseMultipleKindNodePortMappingsConflictError(t *testing.T) {
 	dir := t.TempDir()
 	a := writeTemp(t, dir, "a.yml", `
+project: test
 cluster:
   name: dev
   config:
@@ -417,6 +442,7 @@ services:
     path: .
 `)
 	b := writeTemp(t, dir, "b.yml", `
+project: test
 cluster:
   name: dev
   config:
@@ -438,6 +464,7 @@ services:
 func TestParseMultipleKindNodeMountsUnion(t *testing.T) {
 	dir := t.TempDir()
 	a := writeTemp(t, dir, "a.yml", `
+project: test
 cluster:
   name: dev
   config:
@@ -451,6 +478,7 @@ services:
     path: .
 `)
 	b := writeTemp(t, dir, "b.yml", `
+project: test
 cluster:
   name: dev
   config:
@@ -475,6 +503,7 @@ services:
 func TestParseMultipleKindNodeMountsConflictError(t *testing.T) {
 	dir := t.TempDir()
 	a := writeTemp(t, dir, "a.yml", `
+project: test
 cluster:
   name: dev
   config:
@@ -488,6 +517,7 @@ services:
     path: .
 `)
 	b := writeTemp(t, dir, "b.yml", `
+project: test
 cluster:
   name: dev
   config:
@@ -509,6 +539,7 @@ services:
 func TestParseMultipleKindNodeLabelsUnion(t *testing.T) {
 	dir := t.TempDir()
 	a := writeTemp(t, dir, "a.yml", `
+project: test
 cluster:
   name: dev
   config:
@@ -521,6 +552,7 @@ services:
     path: .
 `)
 	b := writeTemp(t, dir, "b.yml", `
+project: test
 cluster:
   name: dev
   config:
@@ -545,6 +577,7 @@ services:
 func TestParseMultipleKindNodeLabelsConflictError(t *testing.T) {
 	dir := t.TempDir()
 	a := writeTemp(t, dir, "a.yml", `
+project: test
 cluster:
   name: dev
   config:
@@ -557,6 +590,7 @@ services:
     path: .
 `)
 	b := writeTemp(t, dir, "b.yml", `
+project: test
 cluster:
   name: dev
   config:
@@ -577,6 +611,7 @@ services:
 func TestParseMultipleKindNodeDistinctRoles(t *testing.T) {
 	dir := t.TempDir()
 	a := writeTemp(t, dir, "a.yml", `
+project: test
 cluster:
   name: dev
   config:
@@ -590,6 +625,7 @@ services:
     path: .
 `)
 	b := writeTemp(t, dir, "b.yml", `
+project: test
 cluster:
   name: dev
   config:
@@ -625,4 +661,32 @@ func splitNoProxy(s string) []string {
 		}
 	}
 	return result
+}
+
+func TestParseMultipleProject(t *testing.T) {
+	dir := t.TempDir()
+	named := writeTemp(t, dir, "named.yml", "project: billing\ncluster:\n  name: c\n")
+	unnamed := writeTemp(t, dir, "unnamed.yml", "cluster:\n  name: c\n")
+	other := writeTemp(t, dir, "other.yml", "project: web\ncluster:\n  name: c\n")
+
+	cfg, err := ParseMultiple([]string{unnamed, named})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Project != "billing" {
+		t.Errorf("files without project inherit it, got %q", cfg.Project)
+	}
+
+	if _, err := ParseMultiple([]string{named, other}); err == nil || !strings.Contains(err.Error(), "project conflict") {
+		t.Errorf("expected a project conflict error, got %v", err)
+	}
+
+	unnamed2 := writeTemp(t, dir, "unnamed2.yml", "cluster:\n  name: c\n")
+	_, err = ParseMultiple([]string{unnamed, unnamed2})
+	if err == nil || !strings.Contains(err.Error(), "project name is required") {
+		t.Errorf("expected a missing project error when no file sets it, got %v", err)
+	}
+	if !errors.Is(err, ErrInvalid) || strings.Count(err.Error(), "validation failed") != 1 {
+		t.Errorf("a multi-file validation error should wrap ErrInvalid exactly once, got %v", err)
+	}
 }

@@ -197,6 +197,7 @@ func TestCollectLocalAssets_LocalHelmChart(t *testing.T) {
 	writeFile(t, filepath.Join(dir, "values-override.yaml"), "replicaCount: 2\n")
 
 	cfgContent := `
+project: test
 cluster:
   name: test
 services:
@@ -237,6 +238,7 @@ func TestCollectLocalAssets_ManifestFile(t *testing.T) {
 	writeFile(t, filepath.Join(dir, "manifests", "app.yaml"), "kind: Deployment\n")
 
 	cfgContent := `
+project: test
 cluster:
   name: test
 services:
@@ -268,6 +270,7 @@ func TestCollectLocalAssets_ManifestDirectory(t *testing.T) {
 	writeFile(t, filepath.Join(dir, "manifests", "svc.yaml"), "kind: Service\n")
 
 	cfgContent := `
+project: test
 cluster:
   name: test
 services:
@@ -302,6 +305,7 @@ func TestCollectLocalAssets_PathsArray(t *testing.T) {
 	writeFile(t, filepath.Join(dir, "k8s", "deploy.yaml"), "kind: Deployment\n")
 
 	cfgContent := `
+project: test
 cluster:
   name: test
 services:
@@ -337,6 +341,7 @@ func TestCollectLocalAssets_CACerts(t *testing.T) {
 	writeFile(t, filepath.Join(dir, "certs", "ca.crt"), "-----BEGIN CERTIFICATE-----\n")
 
 	cfgContent := `
+project: test
 cluster:
   name: test
   ca_certificates:
@@ -555,7 +560,7 @@ func TestMaybeExtract_NonArchive(t *testing.T) {
 }
 
 func TestMaybeExtract_Archive(t *testing.T) {
-	cfgContent := "cluster:\n  name: test\nservices: {}\n"
+	cfgContent := "project: test\ncluster:\n  name: test\nservices: {}\n"
 	pkg := buildMinimalPackage(t, cfgContent, nil)
 
 	resolved, cleanup, err := MaybeExtract([]string{pkg})
@@ -576,7 +581,7 @@ func TestMaybeExtract_Archive(t *testing.T) {
 }
 
 func TestMaybeExtract_TgzExtension(t *testing.T) {
-	cfgContent := "cluster:\n  name: test\nservices: {}\n"
+	cfgContent := "project: test\ncluster:\n  name: test\nservices: {}\n"
 	pkg := buildMinimalPackage(t, cfgContent, nil)
 
 	tgzPkg := strings.TrimSuffix(pkg, ".tar.gz") + ".tgz"
@@ -600,7 +605,7 @@ func TestMaybeExtract_MultipleConfigFiles(t *testing.T) {
 	meta := PackageMetadata{Version: "1", ConfigFiles: []string{"kraze.yml", "services/db.yml"}}
 	metaBytes, _ := json.Marshal(meta)
 	writeTarGz(t, outFile,
-		tarEntry{name: "kraze.yml", content: "cluster:\n  name: test\n"},
+		tarEntry{name: "kraze.yml", content: "project: test\ncluster:\n  name: test\n"},
 		tarEntry{name: "services/db.yml", content: "services:\n  postgres:\n    type: helm\n    path: ./.krazepack/charts/postgres.tgz\n"},
 		tarEntry{name: MetadataFile, content: string(metaBytes)},
 	)
@@ -623,7 +628,7 @@ func TestMaybeExtract_MultipleConfigFiles(t *testing.T) {
 }
 
 func TestMaybeExtract_MixedArchiveAndConfig(t *testing.T) {
-	pkg := buildMinimalPackage(t, "cluster:\n  name: test\n", nil)
+	pkg := buildMinimalPackage(t, "project: test\ncluster:\n  name: test\n", nil)
 
 	_, _, err := MaybeExtract([]string{pkg, "/some/other.yml"})
 	if err == nil {
@@ -633,7 +638,7 @@ func TestMaybeExtract_MixedArchiveAndConfig(t *testing.T) {
 
 func TestMaybeExtract_ExtractedAssetsAccessible(t *testing.T) {
 	assetContent := "kind: Deployment\napiVersion: apps/v1\n"
-	pkg := buildMinimalPackage(t, "cluster:\n  name: test\nservices: {}\n", map[string]string{
+	pkg := buildMinimalPackage(t, "project: test\ncluster:\n  name: test\nservices: {}\n", map[string]string{
 		"manifests/app.yaml": assetContent,
 	})
 
@@ -656,7 +661,7 @@ func TestMaybeExtract_ExtractedAssetsAccessible(t *testing.T) {
 func TestMaybeExtract_FallbackNoMetadata(t *testing.T) {
 	// Archive without kraze-package.json — should fall back to kraze.yml.
 	outFile := filepath.Join(t.TempDir(), "noMeta.tar.gz")
-	writeTarGz(t, outFile, tarEntry{name: "kraze.yml", content: "cluster:\n  name: test\nservices: {}\n"})
+	writeTarGz(t, outFile, tarEntry{name: "kraze.yml", content: "project: test\ncluster:\n  name: test\nservices: {}\n"})
 
 	resolved, cleanup, err := MaybeExtract([]string{outFile})
 	if err != nil {
@@ -768,7 +773,7 @@ func TestRewriteConfig_NestedConfigFile(t *testing.T) {
 func TestRewriteConfig_NoRemoteAssets_Unchanged(t *testing.T) {
 	dir := t.TempDir()
 	cfgPath := filepath.Join(dir, "kraze.yml")
-	original := "cluster:\n  name: test\nservices:\n  myapp:\n    type: helm\n    path: ./myapp\n"
+	original := "project: test\ncluster:\n  name: test\nservices:\n  myapp:\n    type: helm\n    path: ./myapp\n"
 	writeFile(t, cfgPath, original)
 
 	result, err := rewriteConfig(cfgPath, "kraze.yml", nil, nil, nil)
@@ -838,7 +843,7 @@ func TestRewriteConfig_ExternalLocalHelmChart(t *testing.T) {
 		t.Fatal(err)
 	}
 	cfgPath := filepath.Join(dir, "kraze.yml")
-	writeFile(t, cfgPath, "cluster:\n  name: test\nservices:\n  ruya:\n    type: helm\n    path: "+relPath+"\n")
+	writeFile(t, cfgPath, "project: test\ncluster:\n  name: test\nservices:\n  ruya:\n    type: helm\n    path: "+relPath+"\n")
 
 	// Simulate what CollectLocalAssets would produce for the external chart dir.
 	externalPaths := map[string]string{

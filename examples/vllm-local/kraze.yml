@@ -18,6 +18,8 @@
 #   kraze port-forward vllm 8000:8000
 #   curl http://localhost:8000/v1/models
 
+project: vllm-local
+
 cluster:
   name: vllm-local
 

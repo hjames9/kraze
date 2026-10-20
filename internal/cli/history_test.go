@@ -32,7 +32,7 @@ func TestSelectHistory(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := selectHistory(entries, tt.services, tt.limit)
+			got := selectHistory(entries, tt.services, "", true, tt.limit)
 			ids := make([]string, 0, len(got))
 			for _, e := range got {
 				ids = append(ids, e.ID)
@@ -41,6 +41,52 @@ func TestSelectHistory(t *testing.T) {
 				t.Errorf("Expected entries %v, got %v", tt.want, ids)
 			}
 		})
+	}
+}
+
+func TestSelectHistoryByProject(t *testing.T) {
+	entries := []history.Entry{
+		{ID: "1"},
+		{ID: "2", Project: "billing"},
+		{ID: "3", Project: "web"},
+		{ID: "4", Project: "billing"},
+	}
+
+	tests := []struct {
+		name        string
+		project     string
+		allProjects bool
+		want        string
+	}{
+		{name: "a project sees its own and pre-project entries", project: "billing", want: "4,2,1"},
+		{name: "all projects", project: "billing", allProjects: true, want: "4,3,2,1"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var ids []string
+			for _, e := range selectHistory(entries, nil, tt.project, tt.allProjects, 0) {
+				ids = append(ids, e.ID)
+			}
+			if got := strings.Join(ids, ","); got != tt.want {
+				t.Errorf("got %s, want %s", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestFormatHistoryProjectColumn(t *testing.T) {
+	entries := []history.Entry{
+		{Command: "up", Project: "billing", Result: history.ResultSucceeded},
+		{Command: "up", Result: history.ResultSucceeded},
+	}
+	out := formatHistory(entries, false, true)
+	for _, want := range []string{"PROJECT", "billing", "(no project)"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("expected %q in:\n%s", want, out)
+		}
+	}
+	if strings.Contains(formatHistory(entries, false, false), "PROJECT") {
+		t.Error("PROJECT column should only appear with --all-projects")
 	}
 }
 
@@ -75,7 +121,7 @@ func TestFormatHistory(t *testing.T) {
 		},
 	}}
 
-	out := formatHistory(entries, true)
+	out := formatHistory(entries, true, false)
 
 	for _, want := range []string{"dev@devbox", "up backend --no-deps", "incomplete", "✗backend", "1.5s", "error: timed out"} {
 		if !strings.Contains(out, want) {
@@ -86,7 +132,7 @@ func TestFormatHistory(t *testing.T) {
 		t.Errorf("Expected running entries to be shown as incomplete, got:\n%s", out)
 	}
 
-	if strings.Contains(formatHistory(entries, false), "error: timed out") {
+	if strings.Contains(formatHistory(entries, false, false), "error: timed out") {
 		t.Error("Expected per-change details only in verbose mode")
 	}
 }

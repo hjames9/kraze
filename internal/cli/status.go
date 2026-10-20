@@ -1,17 +1,20 @@
 package cli
 
 import (
+	"context"
 	"fmt"
 	"strings"
 
 	"github.com/hjames9/kraze/internal/cluster"
 	"github.com/hjames9/kraze/internal/config"
 	"github.com/hjames9/kraze/internal/providers"
+	"github.com/hjames9/kraze/internal/state"
 	"github.com/spf13/cobra"
 )
 
 var (
-	statusLabels []string
+	statusLabels      []string
+	statusAllProjects bool
 )
 
 var statusCmd = &cobra.Command{
@@ -99,11 +102,31 @@ func runStatus(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("failed to get kubeconfig: %w", err)
 	}
 
-	fmt.Printf("Cluster: %s\n\n", cfg.Cluster.Name)
+	if statusAllProjects {
+		return printAllProjectsStatus(ctx, cfg.Cluster.Name, kubeconfig)
+	}
+
+	fmt.Printf("Cluster: %s\n", cfg.Cluster.Name)
+	if cfg.Project != "" {
+		fmt.Printf("Project: %s\n", cfg.Project)
+	}
+	fmt.Println()
 
 	// Print header
 	fmt.Printf("%-20s %-12s %-10s %-10s %s\n", "SERVICE", "TYPE", "INSTALLED", "READY", "MESSAGE")
 	fmt.Println("--------------------------------------------------------------------------------")
+
+	// What `up` recorded (completed Jobs, see ManifestsProvider.Status).
+	// Without it, status still reports what exists.
+	var st *state.ClusterState
+	if clientset, err := providers.GetClientsetFromKubeconfigContent(kubeconfig, true); err != nil {
+		Verbose("Warning: failed to create Kubernetes client: %v", err)
+	} else if st, err = state.Load(ctx, clientset, cfg.Cluster.Name); err != nil {
+		Verbose("Warning: failed to load cluster state: %v", err)
+		st = nil
+	} else {
+		st.SetProject(cfg.Project)
+	}
 
 	// Track counts for summary
 	installedCount := 0
@@ -122,8 +145,14 @@ func runStatus(cmd *cobra.Command, args []string) error {
 		// Create provider options
 		providerOpts := &providers.ProviderOptions{
 			ClusterName: cfg.Cluster.Name,
+			Project:     cfg.Project,
 			KubeConfig:  kubeconfig,
 			Verbose:     verbose,
+		}
+		if st != nil {
+			if recorded, ok := st.GetService(name); ok {
+				providerOpts.Recorded = recorded.Resources
+			}
 		}
 
 		// Create provider
@@ -180,5 +209,38 @@ func runStatus(cmd *cobra.Command, args []string) error {
 }
 
 func init() {
+	statusCmd.Flags().BoolVar(&statusAllProjects, "all-projects", false, "List every project's services recorded on the cluster (from cluster state)")
 	statusCmd.Flags().StringSliceVarP(&statusLabels, "label", "l", []string{}, "Filter services by label (format: key=value, can be specified multiple times)")
+}
+
+// printAllProjectsStatus lists every service recorded in the cluster state,
+// across all projects sharing the cluster. It reads state only and doesn't
+// query each service's live status.
+func printAllProjectsStatus(ctx context.Context, clusterName, kubeconfig string) error {
+	clientset, err := providers.GetClientsetFromKubeconfigContent(kubeconfig, true)
+	if err != nil {
+		return fmt.Errorf("failed to create Kubernetes client: %w", err)
+	}
+	st, err := state.Load(ctx, clientset, clusterName)
+	if err != nil {
+		return fmt.Errorf("failed to load cluster state: %w", err)
+	}
+	printProjectsTable(clusterName, st)
+	return nil
+}
+
+// printProjectsTable prints every service in st, grouped by project
+func printProjectsTable(clusterName string, st *state.ClusterState) {
+	fmt.Printf("Cluster: %s\n\n", clusterName)
+	if st == nil || len(st.Services) == 0 {
+		fmt.Println("No services are recorded in the cluster state.")
+		return
+	}
+
+	fmt.Printf("%-20s %-20s %-20s %s\n", "PROJECT", "SERVICE", "NAMESPACE", "UPDATED")
+	fmt.Println("--------------------------------------------------------------------------------")
+	for _, svc := range st.AllServices() {
+		fmt.Printf("%-20s %-20s %-20s %s\n",
+			projectLabel(svc.Project), svc.Name, svc.Namespace, svc.UpdatedAt.Local().Format("2006-01-02 15:04:05"))
+	}
 }

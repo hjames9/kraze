@@ -6,10 +6,13 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"slices"
+	"sort"
 	"strings"
 	"syscall"
 
 	"github.com/hjames9/kraze/internal/cluster"
+	"github.com/hjames9/kraze/internal/config"
 	"github.com/hjames9/kraze/internal/pack"
 	"github.com/hjames9/kraze/internal/providers"
 	"github.com/hjames9/kraze/internal/state"
@@ -19,6 +22,7 @@ import (
 var (
 	// Global flags
 	configFiles []string
+	projectFlag string
 	verbose     bool
 	dryRun      bool
 	plain       bool
@@ -79,6 +83,7 @@ func interruptContext() (context.Context, func()) {
 func init() {
 	// Global flags
 	rootCmd.PersistentFlags().StringArrayVarP(&configFiles, "file", "f", []string{}, "Path to kraze configuration file (can be specified multiple times)")
+	rootCmd.PersistentFlags().StringVar(&projectFlag, "project", "", "Use the config stored in cluster state for this project (when no -f is given)")
 	rootCmd.PersistentFlags().BoolVarP(&verbose, "verbose", "v", false, "Verbose output")
 	rootCmd.PersistentFlags().BoolVar(&dryRun, "dry-run", false, "Show what would happen without executing")
 	rootCmd.PersistentFlags().BoolVar(&plain, "plain", false, "Use plain scrolling output instead of interactive mode")
@@ -100,13 +105,55 @@ func init() {
 	rootCmd.AddCommand(packCmd)
 }
 
+// discoveredCluster is a kind cluster and its kraze state (nil if the cluster
+// has none or it couldn't be read)
+type discoveredCluster struct {
+	name  string
+	state *state.ClusterState
+}
+
+// discoverClusterStates lists kind clusters and loads each one's kraze state,
+// or only the cluster named only when it is non-empty. It is a variable so
+// tests can substitute clusters without Docker.
+var discoverClusterStates = func(ctx context.Context, only string) []discoveredCluster {
+	kindMgr := cluster.NewKindManager()
+	clusters, err := kindMgr.ListClusters()
+	if err != nil {
+		return nil
+	}
+
+	discovered := make([]discoveredCluster, 0, len(clusters))
+	for _, clusterName := range clusters {
+		if only != "" && clusterName != only {
+			continue
+		}
+		dc := discoveredCluster{name: clusterName}
+		if kubeconfig, err := kindMgr.GetKubeConfig(clusterName, false); err == nil {
+			if clientset, err := providers.GetClientsetFromKubeconfigContent(kubeconfig, true); err == nil {
+				if st, err := state.Load(ctx, clientset, clusterName); err == nil {
+					dc.state = st
+				}
+			}
+		}
+		discovered = append(discovered, dc)
+	}
+	return discovered
+}
+
 // resolveConfigFiles returns the absolute paths to the config files to use.
 // Resolution order:
 //  1. If one or more -f flags were explicitly provided, use those paths.
-//  2. Enumerate kind clusters; if exactly one has stored ConfigPaths that exist
-//     on disk, use them and print an informational message.
-//  3. If kraze.yml exists in the current directory, use it.
+//  2. If kraze.yml exists in the current directory, use it. If its cluster's
+//     state records a multi-file config for its project that includes this
+//     file, use that whole set instead (`kraze up -f kraze.yml -f extra.yml`
+//     followed by a plain `kraze status`). Skipped when --project is given.
+//  3. Enumerate kind clusters and the projects stored in their state; if
+//     exactly one (cluster, project) has config paths that exist on disk, use
+//     them. --project limits this to that project.
 //  4. Fall back to []string{"kraze.yml"} (preserves the original error from ParseMultiple).
+//
+// The current directory's kraze.yml wins over cluster state because several
+// projects can share a cluster: the state may name another project's config.
 func resolveConfigFiles(cmd *cobra.Command) ([]string, error) {
 	// -f was explicitly provided
 	if len(configFiles) > 0 {
@@ -121,80 +168,122 @@ func resolveConfigFiles(cmd *cobra.Command) ([]string, error) {
 		return resolved, nil
 	}
 
-	// Attempt cluster discovery — cluster state is authoritative for which config
-	// files belong to this deployment, even if a kraze.yml exists in the cwd.
-	kindMgr := cluster.NewKindManager()
-	clusters, err := kindMgr.ListClusters()
-	if err == nil && len(clusters) > 0 {
-		type viableCluster struct {
-			clusterName string
-			configPaths []string
-		}
-		var viableClusters []viableCluster
-		krazeClusterFound := false
-
-		ctx := cmd.Context()
-		if ctx == nil {
-			ctx = context.Background() // not run via Execute (tests)
-		}
-		for _, clusterName := range clusters {
-			kubeconfig, err := kindMgr.GetKubeConfig(clusterName, false)
-			if err != nil {
-				continue
-			}
-			clientset, err := providers.GetClientsetFromKubeconfigContent(kubeconfig, true)
-			if err != nil {
-				continue
-			}
-			st, err := state.Load(ctx, clientset, clusterName)
-			if err != nil || st == nil {
-				continue
-			}
-			krazeClusterFound = true
-			if !st.HasConfigPaths() {
-				continue
-			}
-			var existingPaths []string
-			for _, p := range st.GetConfigPaths() {
-				if _, err := os.Stat(p); err == nil {
-					existingPaths = append(existingPaths, p)
-				} else {
-					fmt.Printf("Warning: stored config path '%s' (cluster: %s) does not exist on this machine\n", p, clusterName)
-				}
-			}
-			if len(existingPaths) > 0 {
-				viableClusters = append(viableClusters, viableCluster{clusterName: clusterName, configPaths: existingPaths})
-			}
-		}
-
-		switch len(viableClusters) {
-		case 0:
-			if krazeClusterFound {
-				return nil, fmt.Errorf("no valid config path found for the kraze cluster — use -f to specify the config file (e.g. kraze status -f kraze.yml or kraze status -f package.tgz)")
-			}
-		case 1:
-			v := viableClusters[0]
-			fmt.Printf("Using config from cluster state: %s\n", strings.Join(v.configPaths, ", "))
-			return v.configPaths, nil
-		default:
-			msg := "Multiple kraze clusters found with stored config paths. Use -f to specify which config to use:\n"
-			for _, v := range viableClusters {
-				msg += fmt.Sprintf("  %s (cluster: %s)\n", strings.Join(v.configPaths, ", "), v.clusterName)
-			}
-			return nil, fmt.Errorf("%s", msg)
-		}
+	ctx := cmd.Context()
+	if ctx == nil {
+		ctx = context.Background() // not run via Execute (tests)
 	}
 
 	// kraze.yml exists in cwd
-	if _, err := os.Stat("kraze.yml"); err == nil {
-		abs, err := filepath.Abs("kraze.yml")
-		if err != nil {
-			return nil, fmt.Errorf("failed to resolve config path: %w", err)
+	if projectFlag == "" {
+		if _, err := os.Stat("kraze.yml"); err == nil {
+			abs, err := filepath.Abs("kraze.yml")
+			if err != nil {
+				return nil, fmt.Errorf("failed to resolve config path: %w", err)
+			}
+			if stored := storedConfigSetFor(ctx, abs); stored != nil {
+				fmt.Printf("Using config from cluster state: %s\n", strings.Join(stored, ", "))
+				return stored, nil
+			}
+			return []string{abs}, nil
 		}
-		return []string{abs}, nil
+	}
+
+	// Attempt cluster discovery
+	type viableProject struct {
+		clusterName string
+		project     string
+		configPaths []string
+	}
+	var viable []viableProject
+	krazeClusterFound := false
+
+	for _, dc := range discoverClusterStates(ctx, "") {
+		if dc.state == nil {
+			continue
+		}
+		krazeClusterFound = true
+
+		projectPaths := dc.state.AllProjectConfigPaths()
+		projects := make([]string, 0, len(projectPaths))
+		for project := range projectPaths {
+			projects = append(projects, project)
+		}
+		sort.Strings(projects)
+
+		for _, project := range projects {
+			if projectFlag != "" && project != projectFlag {
+				continue
+			}
+			var existingPaths []string
+			for _, p := range projectPaths[project] {
+				if _, err := os.Stat(p); err == nil {
+					existingPaths = append(existingPaths, p)
+				} else {
+					fmt.Printf("Warning: stored config path '%s' (cluster: %s) does not exist on this machine\n", p, dc.name)
+				}
+			}
+			if len(existingPaths) > 0 {
+				viable = append(viable, viableProject{clusterName: dc.name, project: project, configPaths: existingPaths})
+			}
+		}
+	}
+
+	switch len(viable) {
+	case 0:
+		if projectFlag != "" {
+			return nil, fmt.Errorf("no stored config found for project '%s' — use -f to specify the config file", projectFlag)
+		}
+		if krazeClusterFound {
+			return nil, fmt.Errorf("no valid config path found for the kraze cluster — use -f to specify the config file (e.g. kraze status -f kraze.yml or kraze status -f package.tgz)")
+		}
+	case 1:
+		v := viable[0]
+		fmt.Printf("Using config from cluster state: %s\n", strings.Join(v.configPaths, ", "))
+		return v.configPaths, nil
+	default:
+		msg := "Multiple kraze projects found with stored config paths. Use -f or --project to specify which config to use:\n"
+		for _, v := range viable {
+			msg += fmt.Sprintf("  %s (cluster: %s, project: %s)\n", strings.Join(v.configPaths, ", "), v.clusterName, projectLabel(v.project))
+		}
+		return nil, fmt.Errorf("%s", msg)
 	}
 
 	return []string{"kraze.yml"}, nil
+}
+
+// storedConfigSetFor returns the config paths stored for configPath's project
+// on its kind cluster, if they include configPath and all still exist.
+// Otherwise it returns nil.
+func storedConfigSetFor(ctx context.Context, configPath string) []string {
+	identity, err := config.ParseIdentity(configPath)
+	if err != nil || identity.External || identity.Cluster == "" {
+		return nil
+	}
+
+	for _, dc := range discoverClusterStates(ctx, identity.Cluster) {
+		if dc.name != identity.Cluster || dc.state == nil {
+			continue
+		}
+		stored := dc.state.AllProjectConfigPaths()[identity.Project]
+		if len(stored) < 2 || !slices.Contains(stored, configPath) {
+			return nil
+		}
+		for _, p := range stored {
+			if _, err := os.Stat(p); err != nil {
+				return nil
+			}
+		}
+		return stored
+	}
+	return nil
+}
+
+// projectLabel names a project for display; the anonymous project has no name
+func projectLabel(project string) string {
+	if project == "" {
+		return "(no project)"
+	}
+	return project
 }
 
 // resolveAndExtractConfigFiles resolves config files and transparently extracts

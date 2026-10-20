@@ -5,6 +5,7 @@
 ## Table of Contents
 
 - [Description](#description)
+- [Breaking Changes (next release): `project:` required](#breaking-changes-next-release-project-required)
 - [Breaking Changes (v0.6.0)](#breaking-changes-v060)
 - [Demo](#demo)
 - [Installation](#installation)
@@ -30,6 +31,7 @@
     - [`kraze completion [bash|zsh|fish|powershell]`](#kraze-completion-bashzshfishpowershell)
   - [Configuration File Reference](#configuration-file-reference)
     - [Disabling Services](#disabling-services)
+  - [Projects and Shared Clusters](#projects-and-shared-clusters)
   - [Environment Variables](#environment-variables)
   - [Corporate Network Support](#corporate-network-support)
   - [GPU Support](#gpu-support)
@@ -54,6 +56,67 @@ kraze is a Kubernetes development environment manager that brings the familiar d
 - **Corporate Network Support** - Works behind proxies with TLS inspection and custom CAs
 - **GPU Support** - Run NVIDIA and AMD GPU workloads in kind clusters (v0.7.0+)
 - **Portable Packages** - Bundle your deployment into a `.tar.gz` to share with teammates or distribute to servers
+
+## Breaking Changes (next release): `project:` required
+
+Every kraze.yml must now name its project with a top-level `project:` key (a lowercase
+DNS label). It says which services on the cluster belong to this config, so several
+projects can share one cluster. kraze suggests a name from the config's directory:
+
+```yaml
+project: my-app
+
+cluster:
+  name: dev-cluster
+```
+
+Existing clusters keep working: on the next `kraze up` (or `down`/`plan`) the project
+claims its services in place, without reinstalling them. In a multi-file config, set it
+in at least one file; files that omit it inherit it.
+
+Helm services are now always installed and upgraded with server-side apply, forcing
+conflicts: kraze owns every field its charts set, so changes made outside kraze (for
+example with `kubectl edit`) to those fields are overwritten on the next `kraze up`.
+Releases installed by older kraze versions switch to server-side apply on their next
+upgrade. This fixes upgrades failing with `conflicts with "kraze"`.
+
+`kraze down` now deletes only namespaces kraze labeled as its own
+(`app.kubernetes.io/managed-by=kraze`). Namespaces created by older versions carry no
+label and are kept; run `kraze down --delete-namespaces` once to remove them.
+
+Other behaviour changes in this release:
+
+- `kraze up` now waits until a Deployment, StatefulSet or DaemonSet has finished rolling
+  out (the same test as `kubectl rollout status`). Before, an upgrade could be reported
+  ready while the old pods were still serving, and a workload with `replicas: 0` waited
+  until the timeout. Upgrades may take longer, because kraze now waits for the new pods.
+- `${VAR:-default}` now uses the default when `VAR` is set but empty, as in the shell.
+- Environment variables are expanded after the file is parsed, so a value containing
+  YAML syntax (`pass #1`, `a: b`, `!x`) arrives intact instead of being cut short or
+  breaking the file. A variable can no longer supply YAML structure (e.g. `{a: b}` for
+  a map); it is always a single value. See [Environment Variables](#environment-variables).
+- A manifests service with ConfigMaps or Secrets no longer restarts its workloads on
+  every `kraze up`; they roll out once when the config changes (including `binaryData`).
+- Helm values files and `values_inline` are read the way `helm install -f` reads them.
+  kraze used to read them with a different YAML parser: `enabled: no` (or `off`) reached
+  the chart as the string `"no"`, which templates treat as true, and an unquoted date
+  (`2024-01-01`) made `kraze up` crash. Check charts you configured with `yes`/`no`/`on`/`off`.
+- Local images used by a Helm chart are found by rendering the chart with the service's
+  values, as the install does, so a tag that defaults to the chart's `appVersion`, a
+  `values_inline` override, or a container switched on by a value is loaded into the
+  cluster. Remote charts are downloaded for this on every `kraze up`.
+- Charts from an HTTP(S) repository on a non-default port (e.g. ChartMuseum on `:8080`)
+  install; they failed with "invalid chart URL format".
+- `insecure_registries` works: it used to leave containerd unable to start, so the cluster
+  never became usable. Entries are validated, and may carry an `http://` or `https://` prefix.
+- A `proxy` set in kraze.yml now reaches containerd (it only took effect after a node
+  restart), including URL-encoded passwords, which systemd used to drop.
+- Image detection for manifests services reads the parsed YAML, so `image: x  # comment`,
+  flow style and JSON manifests are covered.
+- `kraze status` no longer counts comment-only documents in manifests (e.g. a license
+  header) as resources, and counts a Job removed by its `ttlSecondsAfterFinished` as
+  finished when `kraze up` saw it succeed (shown as `(1 job finished)`). After an
+  `up --no-wait` kraze hasn't seen it finish, so it is still reported missing.
 
 ## Breaking Changes (v0.6.0)
 
@@ -204,6 +267,8 @@ kraze completion powershell >> $PROFILE
 Create a `kraze.yml` file in your project:
 
 ```yaml
+project: my-app
+
 cluster:
   name: dev-cluster
   version: "1.34.0"
@@ -292,10 +357,16 @@ kraze up --wait --timeout 5m
 
 # See what would happen without executing
 kraze up --dry-run
+
+# Also remove services this project installed that are no longer in kraze.yml
+# (removed before installing, so renaming a service works), and the old
+# installation of a service that moved namespace or changed type
+kraze up --remove-orphans
 ```
 
 #### `kraze down [services...]`
-Uninstall services. Automatically cleans up namespaces and PVCs that were created.
+Uninstall services. Namespaces kraze created are deleted (with their PVCs) once no other
+service uses them; namespaces that existed before are kept.
 
 ```bash
 # Stop all services
@@ -306,6 +377,13 @@ kraze down myapp
 
 # Keep Custom Resource Definitions (CRDs)
 kraze down --keep-crds
+
+# Also remove services this project installed that are no longer in kraze.yml
+kraze down --remove-orphans
+
+# Also delete unlabeled namespaces (e.g. created by older kraze versions) that no
+# other service uses and that have no workloads left
+kraze down --delete-namespaces
 ```
 
 #### `kraze status`
@@ -407,6 +485,9 @@ kraze destroy
 
 # Use custom config
 kraze destroy -f kraze.yml
+
+# Delete a cluster other projects still use
+kraze destroy --force
 ```
 
 #### `kraze validate`
@@ -502,6 +583,9 @@ See [Shell Completion](#shell-completion) section for detailed installation inst
 The `kraze.yml` file defines your cluster and services:
 
 ```yaml
+# Project name (required): a lowercase DNS label naming this config's services
+project: my-app
+
 # Cluster configuration
 cluster:
   name: my-cluster                    # Name of the kind cluster
@@ -689,6 +773,41 @@ kraze status    # Shows redis as DISABLED
 kraze plan      # Shows "1 skipped" in summary
 ```
 
+### Projects and Shared Clusters
+
+Each kraze.yml is one project. Projects can each have their own cluster, or share one by
+using the same `cluster.name`; every command only acts on its own project's services.
+
+```bash
+cd billing && kraze up          # project: billing, cluster: shared
+cd ../web  && kraze up          # project: web, same cluster
+kraze status --all-projects     # everything on the cluster, by project
+kraze history --all-projects
+cd ../billing && kraze down     # removes billing's services only
+```
+
+- Two projects may use the same service name, but not in the same namespace (Helm
+  release names are the service name). `kraze plan` and `kraze up` report the conflict.
+- A manifests service won't overwrite an object another service or Helm release owns.
+  Its objects are labeled `kraze.service` and `kraze.project`.
+- Cluster settings only apply when the cluster is created. A project whose cluster
+  settings differ gets a warning.
+- `kraze destroy` refuses to delete a cluster other projects still use, unless
+  `--force` is given.
+- Services you remove from kraze.yml are left running and reported as orphans by
+  `kraze up` and `kraze plan`. `--remove-orphans` on `up` or `down` removes them.
+- **Renaming a service:** run `kraze up --remove-orphans`. It removes the old name
+  before installing the new one, whose objects would otherwise still belong to the
+  old name.
+- **Moving a service to another namespace, or switching it between `helm` and
+  `manifests`:** `kraze up` refuses, because installing it again would leave the old
+  installation behind. `kraze up --remove-orphans` removes the old installation first
+  (its data is lost); `kraze down` removes it from where it was installed.
+- **Renaming a project:** its services still belong to the old name. Set the old
+  `project:` back, run `kraze down`, then rename it and run `kraze up`.
+
+See [examples/shared-cluster](./examples/shared-cluster).
+
 ### Environment Variables
 
 You can use environment variable substitution in your configuration:
@@ -701,6 +820,21 @@ services:
     chart: ${APP_CHART:-redis}
     namespace: ${NAMESPACE:-default}
 ```
+
+- `${VAR}` is the variable's value, or empty if it isn't set.
+- `${VAR:-default}` is the default if `VAR` is unset or empty.
+- Names are uppercase letters, digits and `_`; `$VAR` without braces isn't expanded.
+
+Variables are expanded after the file is parsed, so a value is always just a value: a
+password containing `#`, `: ` or a leading `!` arrives intact, quoted or not. An unquoted
+reference takes the type its value would have if written out in the file
+(`replicas: ${N}` is a number, `wait: ${WAIT:-true}` a boolean, and an empty value, `~` or
+`null` is null); a quoted one (`"${VAR}"`) is always a string. A variable can't supply
+YAML structure (a list or a map), only a value.
+
+`values_inline` is expanded the same way, as YAML: `password: ${DB_PASSWORD}` inside it is
+one value whatever it contains. Inline text that is only valid YAML once expanded is
+expanded as text, as before.
 
 ### Corporate Network Support
 
@@ -746,6 +880,10 @@ cluster:
     no_proxy: localhost,127.0.0.1,.svc,.cluster.local
 ```
 
+kraze writes the proxy into containerd's settings in each node and restarts containerd, so
+image pulls use it; running containers are not affected. Passwords in proxy URLs may be
+URL-encoded (`p%40ss`), and kraze doesn't print them.
+
 To disable proxy even when environment variables are set:
 
 ```yaml
@@ -764,6 +902,11 @@ cluster:
     - ghcr.io
     - registry.corp.com
 ```
+
+Each entry is a registry host as images name it, optionally with a port (`registry.corp.com:5000`).
+kraze tries HTTPS without verifying the certificate first and plain HTTP second, as Docker does
+for insecure registries. Prefix `https://` or `http://` to use only that scheme. `docker.io`
+works too (useful behind a TLS-inspecting proxy).
 
 **Note:** Using CA certificates is more secure than insecure registries.
 
@@ -917,6 +1060,7 @@ kraze up --no-wait
 ### Global Flags
 
 - `-f, --file` - Path to configuration file; can be specified multiple times to merge configs (default: `kraze.yml`)
+- `--project` - Without `-f`, use the config stored on the cluster for this project
 - `-v, --verbose` - Enable verbose output
 - `--dry-run` - Show what would happen without executing
 

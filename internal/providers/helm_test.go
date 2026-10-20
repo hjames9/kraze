@@ -2,6 +2,10 @@ package providers
 
 import (
 	"testing"
+	"time"
+
+	"github.com/hjames9/kraze/internal/config"
+	"helm.sh/helm/v4/pkg/action"
 )
 
 func TestCalculateConfigChecksum(test *testing.T) {
@@ -182,5 +186,35 @@ data:
 
 	if baseHash == changedHash {
 		test.Error("Expected different checksums for different ConfigMap data, got the same")
+	}
+}
+
+func TestHelmClientsForceConflicts(test *testing.T) {
+	helm := &HelmProvider{opts: &ProviderOptions{Timeout: "5m"}}
+	service := &config.ServiceConfig{Name: "app", Namespace: "apps", Version: "1.2.3"}
+	actionConfig := &action.Configuration{}
+
+	upgrade := helm.newUpgradeClient(actionConfig, service)
+	if !upgrade.ForceConflicts {
+		test.Error("upgrades must force conflicts: fields earlier client-side upgrades left to manager \"kraze\" otherwise block every later change")
+	}
+	// Helm rejects ForceConflicts on a client-side upgrade, which its default
+	// ("auto") picks for releases that were installed client-side
+	if upgrade.ServerSideApply != "true" {
+		test.Errorf("upgrades must always apply server-side, got ServerSideApply %q", upgrade.ServerSideApply)
+	}
+	if upgrade.Namespace != "apps" || upgrade.Version != "1.2.3" || upgrade.Timeout != 5*time.Minute {
+		test.Errorf("upgrade client = namespace %q, version %q, timeout %v", upgrade.Namespace, upgrade.Version, upgrade.Timeout)
+	}
+
+	install := helm.newInstallClient(actionConfig, service)
+	if !install.ForceConflicts {
+		test.Error("installs must force conflicts too: they can adopt existing objects")
+	}
+	if !install.ServerSideApply {
+		test.Error("installs must apply server-side (Helm's default), or forcing conflicts is rejected")
+	}
+	if install.ReleaseName != "app" || install.Namespace != "apps" || install.Version != "1.2.3" || install.Timeout != 5*time.Minute {
+		test.Errorf("install client = release %q, namespace %q, version %q, timeout %v", install.ReleaseName, install.Namespace, install.Version, install.Timeout)
 	}
 }

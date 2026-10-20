@@ -1,12 +1,14 @@
 package config
 
 import (
+	"errors"
 	"fmt"
 	"time"
 )
 
 // Config represents the complete kraze.yml structure
 type Config struct {
+	Project  string                   `yaml:"project,omitempty"` // Owner of this config's services on the cluster (required; see requireProject)
 	Cluster  ClusterConfig            `yaml:"cluster"`
 	Services map[string]ServiceConfig `yaml:"services"`
 }
@@ -290,6 +292,11 @@ func (srv *ServiceConfig) Validate() error {
 
 	return nil
 }
+
+// ErrInvalid prefixes the errors Parse and ParseMultiple return when a config
+// parses but fails validation, so callers can tell them from read and YAML
+// errors without wrapping them in a second "validation failed"
+var ErrInvalid = errors.New("validation failed")
 
 // ValidationError represents a configuration validation error
 type ValidationError struct {

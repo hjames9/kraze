@@ -8,6 +8,8 @@
 #   kraze status
 #   kraze down
 
+project: minimal
+
 cluster:
   name: minimal-cluster
 

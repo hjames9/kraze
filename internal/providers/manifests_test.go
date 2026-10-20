@@ -421,11 +421,12 @@ metadata:
 		},
 	}
 
-	mp := &ManifestsProvider{}
-
 	for _, tt := range tests {
 		test.Run(tt.name, func(test *testing.T) {
-			result := mp.splitYAML(tt.input)
+			result, err := splitYAMLDocuments(tt.input)
+			if err != nil {
+				test.Fatal(err)
+			}
 
 			if len(result) != tt.expectCount {
 				test.Errorf("splitYAML(): got %d documents, want %d", len(result), tt.expectCount)

@@ -109,8 +109,8 @@ func TestSaveAndLoad(t *testing.T) {
 
 	// Create and save state
 	cs := New("test-cluster", false, false, 0, false, 0)
-	cs.MarkServiceInstalled("redis")
-	cs.MarkServiceInstalled("postgres")
+	cs.MarkServiceInstalledWithNamespace("redis", "", false)
+	cs.MarkServiceInstalledWithNamespace("postgres", "", false)
 
 	if err := cs.Save(ctx, clientset); err != nil {
 		t.Fatalf("Failed to save state: %v", err)
@@ -231,7 +231,7 @@ func TestDeleteNonexistent(t *testing.T) {
 func TestMarkServiceInstalled(t *testing.T) {
 	cs := New("test-cluster", false, false, 0, false, 0)
 
-	cs.MarkServiceInstalled("backend")
+	cs.MarkServiceInstalledWithNamespace("backend", "", false)
 
 	if !cs.IsServiceInstalled("backend") {
 		t.Error("Expected backend to be installed")
@@ -281,7 +281,8 @@ func TestMarkServiceInstalledWithNamespacePreservesImageHashes(t *testing.T) {
 	imageHashes := map[string]string{
 		"myapp:latest": "sha256:abc123",
 	}
-	cs.MarkServiceInstalledWithImages("backend", "default", true, imageHashes)
+	cs.MarkServiceInstalledWithNamespace("backend", "default", true)
+	cs.SetImageHashes("backend", imageHashes)
 
 	// Update without image hashes (should preserve)
 	cs.MarkServiceInstalledWithNamespace("backend", "default", false)
@@ -296,34 +297,10 @@ func TestMarkServiceInstalledWithNamespacePreservesImageHashes(t *testing.T) {
 	}
 }
 
-func TestMarkServiceInstalledWithImages(t *testing.T) {
-	cs := New("test-cluster", false, false, 0, false, 0)
-
-	imageHashes := map[string]string{
-		"myapp:latest": "sha256:abc123",
-		"postgres:15":  "sha256:def456",
-	}
-
-	cs.MarkServiceInstalledWithImages("backend", "default", true, imageHashes)
-
-	svc, exists := cs.Services["backend"]
-	if !exists {
-		t.Fatal("Expected backend service to exist")
-	}
-
-	if len(svc.ImageHashes) != 2 {
-		t.Errorf("Expected 2 image hashes, got %d", len(svc.ImageHashes))
-	}
-
-	if svc.ImageHashes["myapp:latest"] != "sha256:abc123" {
-		t.Error("Expected correct image hash for myapp:latest")
-	}
-}
-
 func TestMarkServiceUninstalled(t *testing.T) {
 	cs := New("test-cluster", false, false, 0, false, 0)
 
-	cs.MarkServiceInstalled("backend")
+	cs.MarkServiceInstalledWithNamespace("backend", "", false)
 	if !cs.IsServiceInstalled("backend") {
 		t.Fatal("Expected backend to be installed")
 	}
@@ -335,30 +312,6 @@ func TestMarkServiceUninstalled(t *testing.T) {
 
 	if _, exists := cs.Services["backend"]; exists {
 		t.Error("Expected backend service to be removed from map")
-	}
-}
-
-func TestGetInstalledServices(t *testing.T) {
-	cs := New("test-cluster", false, false, 0, false, 0)
-
-	cs.MarkServiceInstalled("redis")
-	cs.MarkServiceInstalled("postgres")
-	cs.MarkServiceInstalled("backend")
-
-	installed := cs.GetInstalledServices()
-
-	if len(installed) != 3 {
-		t.Errorf("Expected 3 installed services, got %d", len(installed))
-	}
-
-	// Check all services are present (order doesn't matter)
-	serviceMap := make(map[string]bool)
-	for _, name := range installed {
-		serviceMap[name] = true
-	}
-
-	if !serviceMap["redis"] || !serviceMap["postgres"] || !serviceMap["backend"] {
-		t.Error("Expected all services in installed list")
 	}
 }
 
@@ -391,50 +344,6 @@ func TestGetCreatedNamespaces(t *testing.T) {
 
 	if _, exists := namespaces["default"]; exists {
 		t.Error("Should not include 'default' namespace (not created by kraze)")
-	}
-}
-
-func TestGetAllNamespacesUsed(t *testing.T) {
-	cs := New("test-cluster", false, false, 0, false, 0)
-
-	cs.MarkServiceInstalledWithNamespace("backend", "app", true)
-	cs.MarkServiceInstalledWithNamespace("frontend", "app", false)
-	cs.MarkServiceInstalledWithNamespace("redis", "data", true)
-
-	namespaces := cs.GetAllNamespacesUsed()
-
-	if len(namespaces) != 2 {
-		t.Errorf("Expected 2 namespaces, got %d", len(namespaces))
-	}
-
-	if namespaces["app"] != 2 {
-		t.Errorf("Expected 2 services in 'app', got %d", namespaces["app"])
-	}
-
-	if namespaces["data"] != 1 {
-		t.Errorf("Expected 1 service in 'data', got %d", namespaces["data"])
-	}
-}
-
-func TestGetAllNamespacesUsedForCleanup(t *testing.T) {
-	cs := New("test-cluster", false, false, 0, false, 0)
-
-	cs.MarkServiceInstalledWithNamespace("backend", "app", true)
-	cs.MarkServiceInstalledWithNamespace("redis", "data", false)
-
-	namespaces := cs.GetAllNamespacesUsedForCleanup()
-
-	if len(namespaces) != 2 {
-		t.Errorf("Expected 2 namespaces, got %d", len(namespaces))
-	}
-
-	// All counts should be 0 for cleanup
-	if namespaces["app"] != 0 {
-		t.Errorf("Expected count 0 for 'app', got %d", namespaces["app"])
-	}
-
-	if namespaces["data"] != 0 {
-		t.Errorf("Expected count 0 for 'data', got %d", namespaces["data"])
 	}
 }
 
@@ -474,7 +383,8 @@ func TestGetImageHashes(t *testing.T) {
 		"postgres:15":  "sha256:def456",
 	}
 
-	cs.MarkServiceInstalledWithImages("backend", "default", false, imageHashes)
+	cs.MarkServiceInstalledWithNamespace("backend", "default", false)
+	cs.SetImageHashes("backend", imageHashes)
 
 	// Get hashes for existing service
 	hashes := cs.GetImageHashes("backend")
@@ -499,7 +409,8 @@ func TestHasImageHashChanged(t *testing.T) {
 	imageHashes := map[string]string{
 		"myapp:latest": "sha256:abc123",
 	}
-	cs.MarkServiceInstalledWithImages("backend", "default", false, imageHashes)
+	cs.MarkServiceInstalledWithNamespace("backend", "default", false)
+	cs.SetImageHashes("backend", imageHashes)
 
 	// Same hash - not changed
 	if cs.HasImageHashChanged("backend", "myapp:latest", "sha256:abc123") {
@@ -519,53 +430,6 @@ func TestHasImageHashChanged(t *testing.T) {
 	// Nonexistent service - changed
 	if !cs.HasImageHashChanged("nonexistent", "myapp:latest", "sha256:abc123") {
 		t.Error("Expected nonexistent service to be marked as changed")
-	}
-}
-
-func TestGetChangedImages(t *testing.T) {
-	cs := New("test-cluster", false, false, 0, false, 0)
-
-	storedHashes := map[string]string{
-		"myapp:latest": "sha256:abc123",
-		"postgres:15":  "sha256:def456",
-	}
-	cs.MarkServiceInstalledWithImages("backend", "default", false, storedHashes)
-
-	// Test with no changes
-	currentHashes := map[string]string{
-		"myapp:latest": "sha256:abc123",
-		"postgres:15":  "sha256:def456",
-	}
-	changed := cs.GetChangedImages("backend", currentHashes)
-	if len(changed) != 0 {
-		t.Errorf("Expected no changed images, got %d", len(changed))
-	}
-
-	// Test with one changed hash
-	currentHashes = map[string]string{
-		"myapp:latest": "sha256:xyz789", // Changed
-		"postgres:15":  "sha256:def456",
-	}
-	changed = cs.GetChangedImages("backend", currentHashes)
-	if len(changed) != 1 {
-		t.Errorf("Expected 1 changed image, got %d", len(changed))
-	}
-	if changed[0] != "myapp:latest" {
-		t.Errorf("Expected 'myapp:latest' to be changed, got '%s'", changed[0])
-	}
-
-	// Test with new image
-	currentHashes = map[string]string{
-		"myapp:latest": "sha256:abc123",
-		"postgres:15":  "sha256:def456",
-		"redis:7":      "sha256:newimage", // New
-	}
-	changed = cs.GetChangedImages("backend", currentHashes)
-	if len(changed) != 1 {
-		t.Errorf("Expected 1 changed image, got %d", len(changed))
-	}
-	if changed[0] != "redis:7" {
-		t.Errorf("Expected 'redis:7' to be new, got '%s'", changed[0])
 	}
 }
 
@@ -607,7 +471,8 @@ func TestStatePersistence(t *testing.T) {
 
 	// Create complex state
 	cs := New("test-cluster", true, false, 0, false, 0)
-	cs.MarkServiceInstalledWithImages("backend", "app", true, map[string]string{
+	cs.MarkServiceInstalledWithNamespace("backend", "app", true)
+	cs.SetImageHashes("backend", map[string]string{
 		"myapp:latest": "sha256:abc123",
 	})
 	cs.MarkServiceInstalledWithNamespace("redis", "data", false)
@@ -902,7 +767,7 @@ func TestUpdateExistingConfigMap(t *testing.T) {
 
 	// Create and save initial state
 	cs1 := New("test-cluster", false, false, 0, false, 0)
-	cs1.MarkServiceInstalled("redis")
+	cs1.MarkServiceInstalledWithNamespace("redis", "", false)
 
 	if err := cs1.Save(ctx, clientset); err != nil {
 		t.Fatalf("Failed to save initial state: %v", err)
@@ -910,8 +775,8 @@ func TestUpdateExistingConfigMap(t *testing.T) {
 
 	// Update state with new service
 	cs2 := New("test-cluster", false, false, 0, false, 0)
-	cs2.MarkServiceInstalled("redis")
-	cs2.MarkServiceInstalled("postgres")
+	cs2.MarkServiceInstalledWithNamespace("redis", "", false)
+	cs2.MarkServiceInstalledWithNamespace("postgres", "", false)
 
 	if err := cs2.Save(ctx, clientset); err != nil {
 		t.Fatalf("Failed to update state: %v", err)

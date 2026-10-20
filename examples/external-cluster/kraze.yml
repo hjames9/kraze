@@ -10,6 +10,8 @@
 #   kraze down             # Remove services (preserves cluster)
 #   kraze destroy          # Delete state only (preserves cluster)
 
+project: external-cluster
+
 cluster:
   name: docker-desktop    # Must match cluster name in kubeconfig
   external:

@@ -512,6 +512,10 @@ func rewriteConfig(
 		return rawBytes, nil
 	}
 
+	// The config's text may hold environment variable references, while the
+	// downloaded URLs and bundled paths come from the parsed (expanded)
+	// config, so raw values are expanded before they are looked up.
+
 	// Compute the relative path from this config's archive directory to .krazepack/.
 	// e.g., for config at "kraze.yml" → archConfigDir = "." → relBundle = ".krazepack"
 	//       for config at "services/db.yml" → archConfigDir = "services" → relBundle = "../.krazepack"
@@ -547,7 +551,7 @@ func rewriteConfig(
 
 			// Rewrite singular path: if it was a URL, replace with local path.
 			if pathVal, ok := svcMap["path"].(string); ok {
-				if local, replaced := urlToLocal[pathVal]; replaced {
+				if local, replaced := urlToLocal[config.ExpandEnvVars(pathVal)]; replaced {
 					svcMap["path"] = local
 					modified = true
 				}
@@ -557,7 +561,7 @@ func rewriteConfig(
 			if pathsVal, ok := svcMap["paths"].([]interface{}); ok {
 				for i, entry := range pathsVal {
 					if urlStr, ok := entry.(string); ok {
-						if local, replaced := urlToLocal[urlStr]; replaced {
+						if local, replaced := urlToLocal[config.ExpandEnvVars(urlStr)]; replaced {
 							pathsVal[i] = local
 							modified = true
 						}
@@ -574,6 +578,7 @@ func rewriteConfig(
 			// resolveRaw converts a raw YAML path value (possibly relative to the
 			// config file's on-disk directory) to an absolute path for map lookup.
 			resolveRaw := func(p string) string {
+				p = config.ExpandEnvVars(p)
 				if config.IsHTTPURL(p) {
 					return p
 				}

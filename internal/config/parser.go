@@ -4,9 +4,9 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
-	"io"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 
 	"go.yaml.in/yaml/v3"
@@ -14,13 +14,13 @@ import (
 
 // Parse reads and parses a kraze.yml configuration file
 func Parse(configPath string) (*Config, error) {
-	data, err := readAndExpand(configPath)
+	data, doc, err := readConfig(configPath)
 	if err != nil {
 		return nil, err
 	}
 
 	var config Config
-	if err := unmarshalConfig(data, &config); err != nil {
+	if err := unmarshalConfig(data, doc, &config); err != nil {
 		return nil, err
 	}
 
@@ -32,7 +32,10 @@ func Parse(configPath string) (*Config, error) {
 
 	// Validate configuration
 	if err := config.Validate(); err != nil {
-		return nil, fmt.Errorf("validation failed: %w", err)
+		return nil, fmt.Errorf("%w: %w", ErrInvalid, err)
+	}
+	if err := requireProject(config.Project, configPath); err != nil {
+		return nil, fmt.Errorf("%w: %w", ErrInvalid, err)
 	}
 
 	// Resolve relative paths
@@ -43,34 +46,68 @@ func Parse(configPath string) (*Config, error) {
 	return &config, nil
 }
 
-// readAndExpand reads a config file and expands environment variables.
-func readAndExpand(configPath string) ([]byte, error) {
+// readConfig reads and parses a config file, then expands environment
+// variables in its values (see expandEnvVarsInNode). It returns the file's
+// text too, for unmarshalConfig's unknown-key check.
+func readConfig(configPath string) ([]byte, *yaml.Node, error) {
 	data, err := os.ReadFile(configPath)
 	if err != nil {
-		return nil, fmt.Errorf("failed to read config file: %w", err)
+		return nil, nil, fmt.Errorf("failed to read config file: %w", err)
 	}
-	return ExpandEnvVarsInBytes(data), nil
+	var doc yaml.Node
+	if err := yaml.Unmarshal(data, &doc); err != nil {
+		return nil, nil, fmt.Errorf("failed to parse YAML: %w", err)
+	}
+	expandEnvVarsInNode(&doc)
+	return data, &doc, nil
 }
 
-// unmarshalConfig parses YAML bytes into a Config struct.
+// unmarshalConfig decodes a parsed, expanded config document (from
+// readConfig) into a Config struct.
 //
 // Decoding is strict: unknown keys are rejected rather than silently discarded.
 // A lenient decoder lets a typo ("extramounts", "depends_onn") or an unsupported
 // key parse cleanly and do nothing, so `kraze validate` would report success for
 // a config that does not mean what it says.
-func unmarshalConfig(data []byte, config *Config) error {
-	decoder := yaml.NewDecoder(bytes.NewReader(data))
-	decoder.KnownFields(true)
-
-	if err := decoder.Decode(config); err != nil {
-		// An empty (or comment-only) file decodes to EOF. Leave the zero-value
-		// Config in place and let Validate() report the missing required fields.
-		if errors.Is(err, io.EOF) {
-			return nil
-		}
+func unmarshalConfig(data []byte, doc *yaml.Node, config *Config) error {
+	// An empty (or comment-only) file has no document. Leave the zero-value
+	// Config in place and let Validate() report the missing required fields.
+	if doc.Kind == 0 {
+		return nil
+	}
+	if err := checkKnownFields(data); err != nil {
+		return fmt.Errorf("failed to parse YAML: %w", err)
+	}
+	if err := doc.Decode(config); err != nil {
 		return fmt.Errorf("failed to parse YAML: %w", friendlyYAMLError(err))
 	}
 	return nil
+}
+
+// checkKnownFields reports unknown keys. A yaml.Node can't be decoded
+// strictly, so the file's text is decoded strictly as well and only its
+// unknown-key errors are kept: before expansion a reference like
+// `replicas: ${N}` doesn't fit its field yet, which the decode of the expanded
+// document checks. Keys are expanded too, but a reference in a key of
+// kraze's own schema can't name a field anyway.
+func checkKnownFields(data []byte) error {
+	decoder := yaml.NewDecoder(bytes.NewReader(data))
+	decoder.KnownFields(true)
+	var probe Config
+	typeErr := &yaml.TypeError{}
+	if err := decoder.Decode(&probe); !errors.As(err, &typeErr) {
+		return nil
+	}
+	var unknown []string
+	for _, msg := range typeErr.Errors {
+		if strings.Contains(msg, " not found in type ") {
+			unknown = append(unknown, msg)
+		}
+	}
+	if len(unknown) == 0 {
+		return nil
+	}
+	return friendlyYAMLError(&yaml.TypeError{Errors: unknown})
 }
 
 // configSectionNames maps internal Go type names to the kraze.yml section a user
@@ -113,6 +150,16 @@ func (cfg *Config) Validate() error {
 	// Validate cluster config
 	if cfg.Cluster.Name == "" {
 		return &ValidationError{Field: "cluster.name", Message: "cluster name is required"}
+	}
+
+	if err := validateProjectName(cfg.Project); err != nil {
+		return err
+	}
+
+	for _, registry := range cfg.Cluster.InsecureRegistries {
+		if _, err := ParseInsecureRegistry(registry); err != nil {
+			return &ValidationError{Field: "cluster.insecure_registries", Message: err.Error()}
+		}
 	}
 
 	// Validate GPU config
@@ -343,4 +390,91 @@ func IsHTTPURL(path string) bool {
 // IsOCIURL checks if a path is an OCI URL
 func IsOCIURL(path string) bool {
 	return strings.HasPrefix(path, "oci://")
+}
+
+// projectNamePattern is a DNS label. Project names are joined to service names
+// with "/" to key cluster state, so they must never contain one.
+var projectNamePattern = regexp.MustCompile(`^[a-z0-9]([-a-z0-9]*[a-z0-9])?$`)
+
+// requireProject fails when a config sets no project. The error suggests a
+// name derived from the config file's directory.
+func requireProject(project, configPath string) error {
+	if project != "" {
+		return nil
+	}
+	return &ValidationError{
+		Field: "project",
+		Message: fmt.Sprintf("a project name is required; it names this config's services on the cluster (e.g. add `project: %s`)",
+			suggestProjectName(configPath)),
+	}
+}
+
+// suggestProjectName turns the name of a config file's directory into a
+// valid project name
+func suggestProjectName(configPath string) string {
+	dir := filepath.Dir(configPath)
+	if abs, err := filepath.Abs(dir); err == nil {
+		dir = abs
+	}
+	name := strings.ToLower(filepath.Base(dir))
+	name = invalidProjectChars.ReplaceAllString(name, "-")
+	if len(name) > 63 {
+		name = name[:63]
+	}
+	name = strings.Trim(name, "-")
+	if name == "" || !projectNamePattern.MatchString(name) {
+		return "my-project"
+	}
+	return name
+}
+
+var invalidProjectChars = regexp.MustCompile(`[^a-z0-9-]+`)
+
+// validateProjectName checks the format of the top-level project key. A
+// missing project is reported by requireProject.
+func validateProjectName(project string) error {
+	if project == "" {
+		return nil
+	}
+	if len(project) > 63 || !projectNamePattern.MatchString(project) {
+		return &ValidationError{
+			Field:   "project",
+			Message: fmt.Sprintf("'%s' must be a lowercase DNS label (a-z, 0-9 and '-', at most 63 characters, starting and ending with a letter or digit)", project),
+		}
+	}
+	return nil
+}
+
+// Identity is the part of a config file that says which cluster and project it
+// belongs to
+type Identity struct {
+	Project string
+	Cluster string
+	// External is true for an external (non-kind) cluster
+	External bool
+}
+
+// ParseIdentity reads only a config file's project and cluster name. Unlike
+// Parse it does no validation, so it works on one file of a multi-file config
+// whose services depend on services defined in the other files.
+func ParseIdentity(configPath string) (Identity, error) {
+	_, doc, err := readConfig(configPath)
+	if err != nil {
+		return Identity{}, err
+	}
+
+	var partial struct {
+		Project string `yaml:"project"`
+		Cluster struct {
+			Name     string                 `yaml:"name"`
+			External *ExternalClusterConfig `yaml:"external"`
+		} `yaml:"cluster"`
+	}
+	if doc.Kind != 0 {
+		if err := doc.Decode(&partial); err != nil {
+			return Identity{}, fmt.Errorf("failed to parse config: %w", err)
+		}
+	}
+	external := partial.Cluster.External != nil && partial.Cluster.External.Enabled
+	return Identity{Project: partial.Project, Cluster: partial.Cluster.Name, External: external}, nil
 }

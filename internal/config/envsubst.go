@@ -1,10 +1,12 @@
 package config
 
 import (
-	"fmt"
 	"os"
 	"regexp"
 	"strings"
+	"unicode"
+
+	"go.yaml.in/yaml/v3"
 )
 
 // envVarPattern matches ${VAR_NAME} or ${VAR_NAME:-default}
@@ -14,7 +16,7 @@ var envVarPattern = regexp.MustCompile(`\$\{([A-Z_][A-Z0-9_]*)(:-([^}]*))?\}`)
 // Supports formats:
 //
 //	${VAR_NAME} - expands to value of VAR_NAME or empty string if not set
-//	${VAR_NAME:-default} - expands to value of VAR_NAME or 'default' if not set
+//	${VAR_NAME:-default} - expands to value of VAR_NAME or 'default' if not set or empty
 func ExpandEnvVars(s string) string {
 	return envVarPattern.ReplaceAllStringFunc(s, func(match string) string {
 		// Extract variable name and default value
@@ -23,126 +25,104 @@ func ExpandEnvVars(s string) string {
 			return match // Should not happen, but return as-is if pattern doesn't match
 		}
 
-		varName := matches[1]
-		defaultValue := ""
-		if len(matches) >= 4 {
-			defaultValue = matches[3]
+		// As in sh, ${VAR:-default} takes the default when VAR is unset or
+		// empty, and ${VAR} is empty when VAR is unset
+		value := os.Getenv(matches[1])
+		if value == "" && len(matches) >= 4 {
+			return matches[3]
 		}
-
-		// Get environment variable value
-		value, exists := os.LookupEnv(varName)
-		if exists {
-			return value
-		}
-
-		return defaultValue
+		return value
 	})
 }
 
-// ExpandEnvVarsInBytes expands environment variables in byte slice
-// This is useful for expanding before YAML parsing
-func ExpandEnvVarsInBytes(data []byte) []byte {
-	return []byte(ExpandEnvVars(string(data)))
+// expandEnvVarsInNode expands environment variables in the scalars of a parsed
+// YAML document, keys included. Expanding after parsing means a value is only
+// ever a value: a password containing " #", ": " or a leading "!" arrives
+// intact instead of changing the document (as it did when the file's text was
+// expanded before parsing). A plain (unquoted) scalar is typed by its expanded
+// value, so `replicas: ${N}` is still a number and `wait: ${W:-true}` a bool;
+// a quoted one stays a string.
+func expandEnvVarsInNode(node *yaml.Node) {
+	expandEnvVarsInNodeTree(node, false, false)
 }
 
-// ValidateEnvVarFormat checks if the string has valid environment variable syntax
-func ValidateEnvVarFormat(str string) error {
-	// Find all matches
-	matches := envVarPattern.FindAllStringSubmatch(str, -1)
-	for _, match := range matches {
-		if len(match) < 2 {
+// expandEnvVarsInNodeTree expands node and its children. inServices is set
+// for the services mapping; forOutput for a document that will be written out
+// again (see expandScalar).
+func expandEnvVarsInNodeTree(node *yaml.Node, inServices, forOutput bool) {
+	switch node.Kind {
+	case yaml.DocumentNode, yaml.SequenceNode:
+		for _, child := range node.Content {
+			expandEnvVarsInNodeTree(child, false, forOutput)
+		}
+	case yaml.MappingNode:
+		for itr := 0; itr+1 < len(node.Content); itr += 2 {
+			key, value := node.Content[itr], node.Content[itr+1]
+			expandEnvVarsInNodeTree(key, false, forOutput)
+			switch {
+			case inServices && value.Kind == yaml.MappingNode:
+				expandServiceNode(value)
+			default:
+				expandEnvVarsInNodeTree(value, key.Value == "services" && !forOutput, forOutput)
+			}
+		}
+	case yaml.ScalarNode:
+		expandScalar(node, forOutput)
+	}
+	// Alias nodes share their anchor's node, which is expanded where it's defined
+}
+
+// expandServiceNode expands a service's mapping. Its values_inline is YAML
+// that Helm parses again later, so it is expanded the same way, as YAML
+func expandServiceNode(service *yaml.Node) {
+	for itr := 0; itr+1 < len(service.Content); itr += 2 {
+		key, value := service.Content[itr], service.Content[itr+1]
+		expandEnvVarsInNodeTree(key, false, false)
+		if key.Value == "values_inline" && value.Kind == yaml.ScalarNode {
+			value.Value = expandEnvVarsInYAMLText(value.Value)
 			continue
 		}
-		varName := match[1]
-
-		// Check variable name format
-		if !isValidEnvVarName(varName) {
-			return fmt.Errorf("invalid environment variable name: %s", varName)
-		}
-	}
-	return nil
-}
-
-// isValidEnvVarName checks if a string is a valid environment variable name
-func isValidEnvVarName(name string) bool {
-	if len(name) == 0 {
-		return false
-	}
-
-	// Must start with letter or underscore
-	if !isLetter(rune(name[0])) && name[0] != '_' {
-		return false
-	}
-
-	// Rest must be letters, digits, or underscores
-	for _, c := range name {
-		if !isLetter(c) && !isDigit(c) && c != '_' {
-			return false
-		}
-	}
-
-	return true
-}
-
-func isLetter(c rune) bool {
-	return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z')
-}
-
-func isDigit(c rune) bool {
-	return c >= '0' && c <= '9'
-}
-
-// ExpandEnvVarsInConfig expands environment variables in all string fields of the config
-func ExpandEnvVarsInConfig(cfg *Config) {
-	// Expand cluster config
-	cfg.Cluster.Name = ExpandEnvVars(cfg.Cluster.Name)
-	cfg.Cluster.Version = ExpandEnvVars(cfg.Cluster.Version)
-	cfg.Cluster.NodeImage = ExpandEnvVars(cfg.Cluster.NodeImage)
-
-	// Expand networking config
-	if cfg.Cluster.Networking != nil {
-		cfg.Cluster.Networking.PodSubnet = ExpandEnvVars(cfg.Cluster.Networking.PodSubnet)
-		cfg.Cluster.Networking.ServiceSubnet = ExpandEnvVars(cfg.Cluster.Networking.ServiceSubnet)
-	}
-
-	// Expand preload images
-	for itr := range cfg.Cluster.PreloadImages {
-		cfg.Cluster.PreloadImages[itr] = ExpandEnvVars(cfg.Cluster.PreloadImages[itr])
-	}
-
-	// Expand service configs
-	for name, svc := range cfg.Services {
-		svc.Namespace = ExpandEnvVars(svc.Namespace)
-		svc.Repo = ExpandEnvVars(svc.Repo)
-		svc.Chart = ExpandEnvVars(svc.Chart)
-		svc.Version = ExpandEnvVars(svc.Version)
-		svc.Path = ExpandEnvVars(svc.Path)
-		svc.PostReadyDelay = ExpandEnvVars(svc.PostReadyDelay)
-
-		// Expand values files
-		if !svc.Values.IsEmpty() {
-			expandedFiles := make([]string, 0, len(svc.Values.Files()))
-			for _, valuesFile := range svc.Values.Files() {
-				expandedFiles = append(expandedFiles, ExpandEnvVars(valuesFile))
-			}
-			svc.Values = ValuesField{files: expandedFiles}
-		}
-
-		// Expand paths array
-		for itr := range svc.Paths {
-			svc.Paths[itr] = ExpandEnvVars(svc.Paths[itr])
-		}
-
-		// Expand labels
-		for key, val := range svc.Labels {
-			svc.Labels[key] = ExpandEnvVars(val)
-		}
-
-		cfg.Services[name] = svc
+		expandEnvVarsInNodeTree(value, false, false)
 	}
 }
 
-// Helper function to check if a string contains environment variable references
-func ContainsEnvVars(str string) bool {
-	return strings.Contains(str, "${")
+// expandScalar expands a scalar node. forOutput double-quotes an expanded
+// value holding control characters: yaml.v3 writes some of them (a tab
+// before a newline) as a block scalar it can't read back, and a double-quoted
+// string can hold anything.
+func expandScalar(node *yaml.Node, forOutput bool) {
+	expanded := ExpandEnvVars(node.Value)
+	if expanded == node.Value {
+		return
+	}
+	node.Value = expanded
+	if node.Style&(yaml.DoubleQuotedStyle|yaml.SingleQuotedStyle|yaml.LiteralStyle|yaml.FoldedStyle) == 0 &&
+		node.Style&yaml.TaggedStyle == 0 {
+		// Resolve the type from the expanded value, as for a value written
+		// out in the file
+		node.Tag = ""
+	}
+	if forOutput && strings.ContainsFunc(expanded, unicode.IsControl) {
+		node.Style = yaml.DoubleQuotedStyle
+		node.Tag = "!!str"
+	}
+}
+
+// expandEnvVarsInYAMLText expands environment variables in the values of a
+// YAML document held as text. Text that isn't valid YAML until it is expanded
+// (a reference that supplies structure) is expanded as text, as it always was.
+func expandEnvVarsInYAMLText(text string) string {
+	if !envVarPattern.MatchString(text) {
+		return text
+	}
+	var doc yaml.Node
+	if err := yaml.Unmarshal([]byte(text), &doc); err != nil || doc.Kind == 0 {
+		return ExpandEnvVars(text)
+	}
+	expandEnvVarsInNodeTree(&doc, false, true)
+	out, err := yaml.Marshal(&doc)
+	if err != nil {
+		return ExpandEnvVars(text)
+	}
+	return string(out)
 }

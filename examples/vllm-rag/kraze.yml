@@ -19,6 +19,8 @@
 # In Open WebUI, enable RAG by clicking the paperclip icon in the chat input
 # to upload documents, or go to Workspace > Knowledge to manage document collections.
 
+project: vllm-rag
+
 cluster:
   name: rag-stack
 

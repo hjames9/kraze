@@ -11,6 +11,8 @@
 #   kubectl logs cuda-vectoradd    # should print "Test PASSED"
 #   kraze down
 
+project: cuda-vectoradd
+
 cluster:
   name: cuda-vectoradd
 

@@ -30,6 +30,7 @@ func TestParseRejectsUnknownFields(test *testing.T) {
 		{
 			name: "unknown top-level key",
 			config: `
+project: test
 cluster:
   name: dev
 clusters:
@@ -41,6 +42,7 @@ services: {}
 		{
 			name: "unknown cluster key",
 			config: `
+project: test
 cluster:
   name: dev
   node_imagee: kindest/node:v1.34.0
@@ -51,6 +53,7 @@ services: {}
 		{
 			name: "misspelled node key (wrong case)",
 			config: `
+project: test
 cluster:
   name: dev
   config:
@@ -65,6 +68,7 @@ services: {}
 		{
 			name: "unknown key inside extraMounts entry",
 			config: `
+project: test
 cluster:
   name: dev
   config:
@@ -80,6 +84,7 @@ services: {}
 		{
 			name: "unknown key inside extraPortMappings entry",
 			config: `
+project: test
 cluster:
   name: dev
   config:
@@ -94,6 +99,7 @@ services: {}
 		{
 			name: "misspelled kubeadmConfigPatches",
 			config: `
+project: test
 cluster:
   name: dev
   config:
@@ -108,6 +114,7 @@ services: {}
 		{
 			name: "unknown service key",
 			config: `
+project: test
 cluster:
   name: dev
 services:
@@ -122,6 +129,7 @@ services:
 		{
 			name: "unknown networking key",
 			config: `
+project: test
 cluster:
   name: dev
   networking:
@@ -133,6 +141,7 @@ services: {}
 		{
 			name: "unknown proxy key",
 			config: `
+project: test
 cluster:
   name: dev
   proxy:
@@ -144,6 +153,7 @@ services: {}
 		{
 			name: "unknown gpu vendor key",
 			config: `
+project: test
 cluster:
   name: dev
   gpu:
@@ -156,6 +166,7 @@ services: {}
 		{
 			name: "unknown external cluster key",
 			config: `
+project: test
 cluster:
   name: dev
   external:
@@ -188,6 +199,7 @@ services: {}
 // key at once rather than stopping at the first, so a user fixes one at a time.
 func TestParseReportsAllUnknownFields(test *testing.T) {
 	cfg := `
+project: test
 cluster:
   name: dev
   bogus_cluster_key: 1
@@ -216,6 +228,7 @@ services:
 // tests: strictness must not reject configuration that is actually supported.
 func TestParseAcceptsEveryDocumentedKey(test *testing.T) {
 	cfg := `
+project: test
 cluster:
   name: dev-cluster
   version: "1.34.0"
@@ -331,11 +344,11 @@ func TestParseMultipleRejectsUnknownFields(test *testing.T) {
 	dir := test.TempDir()
 
 	good := filepath.Join(dir, "a.yml")
-	if err := os.WriteFile(good, []byte("cluster:\n  name: dev\nservices:\n  a:\n    type: manifests\n    path: ./k8s\n"), 0644); err != nil {
+	if err := os.WriteFile(good, []byte("project: test\ncluster:\n  name: dev\nservices:\n  a:\n    type: manifests\n    path: ./k8s\n"), 0644); err != nil {
 		test.Fatal(err)
 	}
 	bad := filepath.Join(dir, "b.yml")
-	if err := os.WriteFile(bad, []byte("cluster:\n  name: dev\nservices:\n  b:\n    type: manifests\n    path: ./k8s\n    waitt: true\n"), 0644); err != nil {
+	if err := os.WriteFile(bad, []byte("project: test\ncluster:\n  name: dev\nservices:\n  b:\n    type: manifests\n    path: ./k8s\n    waitt: true\n"), 0644); err != nil {
 		test.Fatal(err)
 	}
 

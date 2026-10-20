@@ -11,6 +11,8 @@
 #   kraze status           # Check status
 #   kraze down             # Uninstall all
 
+project: charts
+
 cluster:
   name: charts-cluster
 

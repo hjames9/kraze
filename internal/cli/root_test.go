@@ -4,18 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
-
-	"github.com/hjames9/kraze/internal/cluster"
 )
-
-// kindClustersAvailable returns true if any kind clusters are currently running.
-// Used to skip fallback-path tests that are superseded by cluster state discovery.
-func kindClustersAvailable(t *testing.T) bool {
-	t.Helper()
-	mgr := cluster.NewKindManager()
-	clusters, err := mgr.ListClusters()
-	return err == nil && len(clusters) > 0
-}
 
 func TestVerbose(test *testing.T) {
 	// Save original state
@@ -248,83 +237,6 @@ func TestResolveConfigFileExplicitFlag(t *testing.T) {
 	want, _ := filepath.Abs(tmp.Name())
 	if len(got) != 1 || got[0] != want {
 		t.Errorf("Expected [%q], got %v", want, got)
-	}
-}
-
-func TestResolveConfigFileCwd(t *testing.T) {
-	// This test exercises the CWD fallback path, which is only reached when no
-	// kind clusters with stored ConfigPaths are available. Skip if clusters exist.
-	if kindClustersAvailable(t) {
-		t.Skip("kind clusters are running; cluster state takes precedence over CWD — skipping CWD fallback test")
-	}
-
-	// Create a temp directory with a kraze.yml file
-	dir := t.TempDir()
-
-	krazeYml := filepath.Join(dir, "kraze.yml")
-	if err := os.WriteFile(krazeYml, []byte("cluster:\n  name: test\n"), 0644); err != nil {
-		t.Fatalf("Failed to write kraze.yml: %v", err)
-	}
-
-	// Change to the temp directory
-	orig, err := os.Getwd()
-	if err != nil {
-		t.Fatalf("Failed to get cwd: %v", err)
-	}
-	defer os.Chdir(orig) //nolint:errcheck
-
-	if err := os.Chdir(dir); err != nil {
-		t.Fatalf("Failed to chdir: %v", err)
-	}
-
-	// Ensure -f is not set
-	origConfigFiles := configFiles
-	defer func() { configFiles = origConfigFiles }()
-	configFiles = []string{}
-
-	got, err := resolveConfigFiles(rootCmd)
-	if err != nil {
-		t.Fatalf("Expected no error, got: %v", err)
-	}
-
-	want, _ := filepath.Abs("kraze.yml")
-	if len(got) != 1 || got[0] != want {
-		t.Errorf("Expected [%q], got %v", want, got)
-	}
-}
-
-func TestResolveConfigFileFallback(t *testing.T) {
-	// When no -f flag is set, no kind clusters are reachable, and no kraze.yml
-	// exists in cwd, resolveConfigFiles should return ["kraze.yml"] so the
-	// downstream parser produces a useful "file not found" error.
-	// Skip if kind clusters are present since cluster state takes precedence.
-	if kindClustersAvailable(t) {
-		t.Skip("kind clusters are running; cluster state takes precedence — skipping last-resort fallback test")
-	}
-
-	dir := t.TempDir()
-
-	orig, err := os.Getwd()
-	if err != nil {
-		t.Fatalf("Failed to get cwd: %v", err)
-	}
-	defer os.Chdir(orig) //nolint:errcheck
-
-	if err := os.Chdir(dir); err != nil {
-		t.Fatalf("Failed to chdir: %v", err)
-	}
-
-	origConfigFiles := configFiles
-	defer func() { configFiles = origConfigFiles }()
-	configFiles = []string{}
-
-	got, err := resolveConfigFiles(rootCmd)
-	if err != nil {
-		t.Fatalf("Expected no error, got: %v", err)
-	}
-
-	if len(got) != 1 || got[0] != "kraze.yml" {
-		t.Errorf("Expected [\"kraze.yml\"], got %v", got)
 	}
 }
 

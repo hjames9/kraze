@@ -18,6 +18,8 @@
 #   kraze status           # Check all service status
 #   kraze down             # Uninstalls in reverse order
 
+project: dependencies
+
 cluster:
   name: deps-cluster
 

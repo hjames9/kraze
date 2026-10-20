@@ -1,6 +1,7 @@
 package providers
 
 import (
+	"strings"
 	"testing"
 	"time"
 
@@ -295,5 +296,18 @@ func TestIsEventRecent(t *testing.T) {
 				t.Errorf("isEventRecent() = %v, want %v", got, tt.want)
 			}
 		})
+	}
+}
+
+func TestNewManifestsProviderRequiresProject(t *testing.T) {
+	_, err := NewManifestsProvider(&ProviderOptions{KubeConfig: "not a kubeconfig"})
+	if err == nil || !strings.Contains(err.Error(), "needs a project") {
+		t.Errorf("expected an error for a missing project, got %v", err)
+	}
+
+	// With a project, it gets past the check (and fails on the kubeconfig)
+	_, err = NewManifestsProvider(&ProviderOptions{KubeConfig: "not a kubeconfig", Project: "web"})
+	if err == nil || strings.Contains(err.Error(), "needs a project") {
+		t.Errorf("expected a kubeconfig error once a project is set, got %v", err)
 	}
 }

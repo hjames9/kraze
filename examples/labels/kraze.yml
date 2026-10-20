@@ -10,6 +10,8 @@
 #   kraze down --label env=staging    # Remove only staging services
 #   kraze status --label team=platform  # Check status of platform team services
 
+project: labels
+
 cluster:
   name: labels-demo
 

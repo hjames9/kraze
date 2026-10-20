@@ -12,6 +12,8 @@
 #   kubectl logs amd-rocminfo    # should list your GPU(s) under "ROCk - Kernel Fusion Driver"
 #   kraze down
 
+project: amd-rocminfo
+
 cluster:
   name: amd-rocminfo
 

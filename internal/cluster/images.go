@@ -1,30 +1,22 @@
 package cluster
 
 import (
-	"bytes"
+	"bufio"
 	"context"
 	"encoding/json"
 	"fmt"
-	"io"
-	"log/slog"
 	"os"
 	osexec "os/exec"
 	"path/filepath"
-	"regexp"
 	"strings"
 
 	"github.com/hjames9/kraze/internal/config"
+	"github.com/hjames9/kraze/internal/providers"
 	"go.yaml.in/yaml/v3"
-	"helm.sh/helm/v4/pkg/action"
 	chartcommon "helm.sh/helm/v4/pkg/chart/common"
 	chartcommonutil "helm.sh/helm/v4/pkg/chart/common/util"
-	"helm.sh/helm/v4/pkg/chart/loader"
 	v2loader "helm.sh/helm/v4/pkg/chart/v2/loader"
-	"helm.sh/helm/v4/pkg/cli"
 	"helm.sh/helm/v4/pkg/engine"
-	"helm.sh/helm/v4/pkg/registry"
-	ri "helm.sh/helm/v4/pkg/release"
-	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	k8syaml "k8s.io/apimachinery/pkg/util/yaml"
 )
 
@@ -339,12 +331,13 @@ func (im *ImageManager) extractImagesRecursive(data interface{}, images *[]strin
 		// Check if this looks like an image definition
 		if repo, hasRepo := v["repository"].(string); hasRepo && repo != "" {
 			var tag string
-			if t, hasTag := v["tag"].(string); hasTag {
+			switch t := v["tag"].(type) {
+			case string:
 				tag = t
-			} else if t, hasTag := v["tag"].(float64); hasTag {
-				// YAML numbers are parsed as float64
+			case int, int64, uint64, float64:
+				// An unquoted numeric tag (tag: 20240101)
 				tag = fmt.Sprintf("%v", t)
-			} else {
+			default:
 				tag = "latest"
 			}
 
@@ -377,217 +370,56 @@ func (im *ImageManager) extractImagesRecursive(data interface{}, images *[]strin
 	}
 }
 
-// ExtractImagesFromHelmChart extracts images from a Helm chart using 'helm template'
-// This is more accurate than parsing values files as it renders the actual templates
-func (im *ImageManager) ExtractImagesFromHelmChart(ctx context.Context, svc *config.ServiceConfig, kubeconfig string) ([]string, error) {
-	settings := cli.New()
-
-	// Create action configuration
-	var logHandler slog.Handler
-	if im.verbose {
-		logHandler = slog.Default().Handler()
-	} else {
-		logHandler = slog.NewTextHandler(io.Discard, nil)
-	}
-	actionConfig := action.NewConfiguration(action.ConfigurationSetLogger(logHandler))
-
-	// Initialize with namespace
-	namespace := svc.GetNamespace()
-	if err := actionConfig.Init(settings.RESTClientGetter(), namespace, os.Getenv("HELM_DRIVER")); err != nil {
-		return nil, fmt.Errorf("failed to initialize helm config: %w", err)
-	}
-
-	// Initialize registry client for OCI support
-	registryClient, err := registry.NewClient(
-		registry.ClientOptDebug(im.verbose),
-		registry.ClientOptCredentialsFile(settings.RegistryConfig),
-	)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create registry client: %w", err)
-	}
-	actionConfig.RegistryClient = registryClient
-
-	// For local charts
-	if svc.IsLocalChart() {
-		return im.extractImagesFromLocalChart(svc)
-	}
-
-	// For remote charts, we need to render the template
-	client := action.NewInstall(actionConfig)
-	client.DryRunStrategy = action.DryRunClient
-	client.ReleaseName = svc.Name
-	client.Namespace = namespace
-	client.Replace = true
-
-	// Locate chart
+// renderedHelmImages renders the service's chart (local, or pulled from its
+// repository) with the values kraze installs it with, and returns the
+// container images in the result. This is what the chart actually runs:
+// values alone can't tell a tag defaulted from appVersion, a registry from
+// global.imageRegistry, or a container a value turns on.
+func (im *ImageManager) renderedHelmImages(ctx context.Context, svc *config.ServiceConfig) ([]string, error) {
 	chartPath := svc.Path
-	if chartPath == "" && svc.Chart != "" {
-		// For remote charts, we'd need to download first
-		// For now, return empty - we'll enhance this later
-		if im.verbose {
-			fmt.Printf("Warning: Cannot extract images from remote chart %s without downloading\n", svc.Chart)
+	if svc.IsRemoteChart() {
+		tmpDir, err := os.MkdirTemp("", "kraze-chart-*")
+		if err != nil {
+			return nil, fmt.Errorf("failed to create temp dir: %w", err)
 		}
-		return []string{}, nil
-	}
-
-	// Load the chart
-	chart, err := loader.Load(chartPath)
-	if err != nil {
-		return nil, fmt.Errorf("failed to load chart: %w", err)
-	}
-
-	// Load values if specified
-	vals := make(map[string]interface{})
-	if !svc.Values.IsEmpty() {
-		for _, valuesFile := range svc.Values.Files() {
-			valuesData, err := os.ReadFile(valuesFile)
-			if err != nil {
-				return nil, fmt.Errorf("failed to read values file %s: %w", valuesFile, err)
-			}
-			var fileVals map[string]interface{}
-			if err := yaml.Unmarshal(valuesData, &fileVals); err != nil {
-				return nil, fmt.Errorf("failed to parse values file %s: %w", valuesFile, err)
-			}
-			// Merge values (simple merge for now - could use helm's merge logic)
-			for k, v := range fileVals {
-				vals[k] = v
-			}
+		defer func() { _ = os.RemoveAll(tmpDir) }()
+		// The provider's pull handles OCI and HTTP(S) repositories the way
+		// install does (repository registration, cached index, credentials)
+		chartPath, err = providers.NewHelmProviderForPacking(im.verbose).PullChartToDir(svc, tmpDir)
+		if err != nil {
+			return nil, err
 		}
 	}
 
-	// Render the chart
-	relRaw, err := client.Run(chart, vals)
-	if err != nil {
-		return nil, fmt.Errorf("failed to render chart: %w", err)
-	}
-
-	// Extract images from the rendered manifest
-	var manifest string
-	if relRaw != nil {
-		if acc, accErr := ri.NewAccessor(relRaw); accErr == nil {
-			manifest = acc.Manifest()
-		}
-	}
-	return im.extractImagesFromManifest(manifest), nil
-}
-
-// extractImagesFromLocalChart extracts images from a local Helm chart
-// extractImagesFromRemoteChart downloads and templates a remote Helm chart to extract images
-func (im *ImageManager) extractImagesFromRemoteChart(ctx context.Context, svc *config.ServiceConfig) ([]string, error) {
-	// Create temp directory for chart download
-	tmpDir, err := os.MkdirTemp("", "kraze-chart-*")
-	if err != nil {
-		return nil, fmt.Errorf("failed to create temp dir: %w", err)
-	}
-	defer func() { _ = os.RemoveAll(tmpDir) }()
-
-	// Create Helm settings
-	settings := cli.New()
-
-	// Create action configuration (minimal, no K8s connection needed for pull/template)
-	actionConfig := action.NewConfiguration()
-
-	// Initialize registry client for OCI support
-	registryClient, err := registry.NewClient(
-		registry.ClientOptDebug(im.verbose),
-		registry.ClientOptCredentialsFile(settings.RegistryConfig),
-	)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create registry client: %w", err)
-	}
-	actionConfig.RegistryClient = registryClient
-
-	// Create pull action
-	pull := action.NewPull(action.WithConfig(actionConfig))
-	pull.Settings = settings
-	pull.DestDir = tmpDir
-	pull.Untar = true
-
-	if svc.Version != "" {
-		pull.Version = svc.Version
-	}
-
-	// Build chart reference
-	chartRef := fmt.Sprintf("%s/%s", svc.Repo, svc.Chart)
-
-	// Pull the chart using SDK
-	if im.verbose {
-		fmt.Printf("  Pulling chart %s...\n", chartRef)
-	}
-
-	_, err = pull.Run(chartRef)
-	if err != nil {
-		return nil, fmt.Errorf("failed to pull chart: %w", err)
-	}
-
-	// Find the downloaded chart directory
-	entries, err := os.ReadDir(tmpDir)
-	if err != nil {
-		return nil, fmt.Errorf("failed to read temp dir: %w", err)
-	}
-
-	var chartPath string
-	for _, entry := range entries {
-		if entry.IsDir() {
-			chartPath = filepath.Join(tmpDir, entry.Name())
-			break
-		}
-	}
-
-	if chartPath == "" {
-		return nil, fmt.Errorf("no chart found after pull")
-	}
-
-	// Load the chart using v2 loader to get concrete type with Values field
 	chart, err := v2loader.Load(chartPath)
 	if err != nil {
 		return nil, fmt.Errorf("failed to load chart: %w", err)
 	}
-
-	// Prepare values (use chart's default values)
-	values := make(map[string]interface{})
-	if chart.Values != nil {
-		values = chart.Values
+	values, err := providers.LoadHelmValues(svc)
+	if err != nil {
+		return nil, err
 	}
-
-	// Create release options for rendering
-	releaseOptions := chartcommon.ReleaseOptions{
-		Name:      "kraze-temp",
-		Namespace: svc.Namespace,
-		IsInstall: true,
-	}
-
-	// Compute values with built-in objects
-	valuesToRender, err := chartcommonutil.ToRenderValues(chart, values, releaseOptions, nil)
+	releaseOptions := chartcommon.ReleaseOptions{Name: svc.Name, Namespace: svc.GetNamespace(), IsInstall: true}
+	renderValues, err := chartcommonutil.ToRenderValues(chart, values, releaseOptions, nil)
 	if err != nil {
 		return nil, fmt.Errorf("failed to prepare values: %w", err)
 	}
-
-	// Render templates using Helm engine
-	eng := engine.Engine{
-		LintMode: false,
-	}
-
-	rendered, err := eng.RenderWithContext(ctx, chart, valuesToRender)
+	rendered, err := (&engine.Engine{}).RenderWithContext(ctx, chart, renderValues)
 	if err != nil {
 		return nil, fmt.Errorf("failed to render chart templates: %w", err)
 	}
 
-	// Combine all rendered manifests
-	var allManifests strings.Builder
-	for _, manifest := range rendered {
-		allManifests.WriteString(manifest)
-		allManifests.WriteString("\n---\n")
+	var images []string
+	for name, manifest := range rendered {
+		if strings.HasSuffix(name, "NOTES.txt") {
+			continue
+		}
+		images = append(images, im.extractImagesFromManifest(manifest)...)
 	}
-
-	// Extract images from rendered manifests
-	images := im.extractImagesFromManifest(allManifests.String())
-
 	if im.verbose {
-		fmt.Printf("  Extracted %d image(s) from chart templates\n", len(images))
+		fmt.Printf("  Extracted %d image(s) from rendered chart templates\n", len(images))
 	}
-
-	return images, nil
+	return DeduplicateImages(images), nil
 }
 
 // deepMergeValues merges override into base, recursing into nested maps.
@@ -723,75 +555,56 @@ func (im *ImageManager) ExtractImagesFromManifests(manifestPaths []string) ([]st
 	return allImages, nil
 }
 
-// extractImageVolumeRefsRecursive walks an unstructured Kubernetes object looking
-// for image volume nodes: map entries where key == "image" and the value is a map
-// containing a "reference" key. This matches the Kubernetes image volume spec:
-//
-//	volumes:
-//	  - name: foo
-//	    image:
-//	      reference: "registry/image:tag"
-//
-// Container image fields (where "image" maps to a string) are intentionally
-// excluded — those are already handled by the regex pass.
-func extractImageVolumeRefsRecursive(node interface{}, images *[]string) {
+// extractImagesFromManifest extracts image references from a Kubernetes YAML
+// (or JSON) manifest, multi-document or not: every string value of an
+// "image" key (containers, and custom resources that run an image) and every
+// image volume reference. The documents are parsed rather than matched line by
+// line, which missed `image: x  # comment`, flow style and JSON, and read a
+// folded scalar's ">-" as an image. A document that doesn't parse is skipped.
+func (im *ImageManager) extractImagesFromManifest(manifest string) []string {
+	images := make([]string, 0)
+	reader := k8syaml.NewYAMLReader(bufio.NewReader(strings.NewReader(manifest)))
+	for {
+		doc, err := reader.Read()
+		if err != nil {
+			break // EOF, or a document too malformed to delimit
+		}
+		var obj interface{}
+		if err := yaml.Unmarshal(doc, &obj); err != nil {
+			continue
+		}
+		extractImageFieldsRecursive(obj, &images)
+	}
+	return DeduplicateImages(images)
+}
+
+// extractImageFieldsRecursive collects the string values of "image" keys and
+// the references of image volumes (image: {reference: ...})
+func extractImageFieldsRecursive(node interface{}, images *[]string) {
 	switch v := node.(type) {
 	case map[string]interface{}:
 		for key, val := range v {
 			if key == "image" {
-				if imgMap, ok := val.(map[string]interface{}); ok {
-					if ref, ok := imgMap["reference"].(string); ok && ref != "" {
+				switch image := val.(type) {
+				case string:
+					if image = strings.TrimSpace(image); image != "" {
+						*images = append(*images, image)
+					}
+					continue
+				case map[string]interface{}:
+					if ref, ok := image["reference"].(string); ok && ref != "" {
 						*images = append(*images, ref)
-						continue // don't recurse further into this image map
+						continue
 					}
 				}
 			}
-			extractImageVolumeRefsRecursive(val, images)
+			extractImageFieldsRecursive(val, images)
 		}
 	case []interface{}:
 		for _, item := range v {
-			extractImageVolumeRefsRecursive(item, images)
+			extractImageFieldsRecursive(item, images)
 		}
 	}
-}
-
-// extractImagesFromManifest extracts image references from Kubernetes YAML manifest
-func (im *ImageManager) extractImagesFromManifest(manifest string) []string {
-	images := make([]string, 0)
-
-	// First pass: regex to find container image fields in YAML.
-	// Matches patterns like:
-	//   image: nginx:latest
-	//   image: "nginx:latest"
-	//   - image: nginx:latest
-	imageRegex := regexp.MustCompile(`(?m)^\s*-?\s*image:\s*["']?([^\s"']+)["']?\s*$`)
-
-	matches := imageRegex.FindAllStringSubmatch(manifest, -1)
-	for _, match := range matches {
-		if len(match) > 1 {
-			image := strings.TrimSpace(match[1])
-			if image != "" {
-				images = append(images, image)
-			}
-		}
-	}
-
-	// Second pass: structured parsing for Kubernetes image volumes
-	// (spec.volumes[].image.reference and deeper equivalents for Deployments,
-	// StatefulSets, CronJobs, etc.). The recursive walker handles any nesting depth.
-	decoder := k8syaml.NewYAMLOrJSONDecoder(bytes.NewReader([]byte(manifest)), 4096)
-	for {
-		obj := &unstructured.Unstructured{}
-		if err := decoder.Decode(obj); err != nil {
-			break // EOF or malformed — regex results are still returned
-		}
-		if obj.Object == nil {
-			continue
-		}
-		extractImageVolumeRefsRecursive(obj.Object, &images)
-	}
-
-	return DeduplicateImages(images)
 }
 
 // FilterLocalImages returns only images that exist in the local Docker daemon
@@ -832,9 +645,20 @@ func (im *ImageManager) GetImagesForService(ctx context.Context, svc *config.Ser
 	images := make([]string, 0)
 
 	if svc.IsHelm() {
-		// For Helm charts, try multiple extraction methods
+		// The rendered chart is authoritative
+		rendered, err := im.renderedHelmImages(ctx, svc)
+		if err != nil {
+			if im.verbose {
+				fmt.Printf("Warning: Failed to render chart for '%s' to find its images: %v\n", svc.Name, err)
+			}
+		} else {
+			images = append(images, rendered...)
+		}
 
-		// Method 1: Extract from inline values
+		// Images named in values are added too: a chart may hand one to
+		// something other than a pod spec (an operator's custom resource),
+		// and they are all there is when rendering fails. A guess that names
+		// no local image is skipped when images are loaded.
 		if svc.ValuesInline != "" {
 			inlineImages, err := im.ExtractImagesFromYAMLString(svc.ValuesInline)
 			if err != nil {
@@ -845,22 +669,16 @@ func (im *ImageManager) GetImagesForService(ctx context.Context, svc *config.Ser
 				images = append(images, inlineImages...)
 			}
 		}
-
-		// Method 2: Extract from values files
-		if !svc.Values.IsEmpty() {
-			for _, valuesFile := range svc.Values.Files() {
-				valuesImages, err := im.ExtractImagesFromValues(valuesFile)
-				if err != nil {
-					if im.verbose {
-						fmt.Printf("Warning: Failed to extract images from values file %s: %v\n", valuesFile, err)
-					}
-				} else {
-					images = append(images, valuesImages...)
+		for _, valuesFile := range svc.Values.Files() {
+			valuesImages, err := im.ExtractImagesFromValues(valuesFile)
+			if err != nil {
+				if im.verbose {
+					fmt.Printf("Warning: Failed to extract images from values file %s: %v\n", valuesFile, err)
 				}
+			} else {
+				images = append(images, valuesImages...)
 			}
 		}
-
-		// Method 3: For local charts, check default values
 		if svc.IsLocalChart() {
 			chartImages, err := im.extractImagesFromLocalChart(svc)
 			if err != nil {
@@ -869,22 +687,6 @@ func (im *ImageManager) GetImagesForService(ctx context.Context, svc *config.Ser
 				}
 			} else {
 				images = append(images, chartImages...)
-			}
-		}
-
-		// Method 4: For remote charts, use helm template to render and extract images
-		// This is the most accurate method but requires downloading the chart
-		if svc.IsRemoteChart() && len(images) == 0 {
-			if im.verbose {
-				fmt.Printf("No images detected from values, attempting helm template rendering...\n")
-			}
-			templateImages, err := im.extractImagesFromRemoteChart(ctx, svc)
-			if err != nil {
-				if im.verbose {
-					fmt.Printf("Warning: Failed to extract images from remote chart: %v\n", err)
-				}
-			} else {
-				images = append(images, templateImages...)
 			}
 		}
 

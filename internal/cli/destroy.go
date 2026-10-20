@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"context"
 	"fmt"
 	"strings"
 
@@ -11,7 +12,10 @@ import (
 	"github.com/hjames9/kraze/internal/providers"
 	"github.com/hjames9/kraze/internal/state"
 	"github.com/spf13/cobra"
+	"k8s.io/client-go/kubernetes"
 )
+
+var destroyForce bool
 
 var destroyCmd = &cobra.Command{
 	Use:   "destroy",
@@ -24,6 +28,10 @@ For kind clusters (default):
 
 For external clusters (cluster.external.enabled: true):
   - Only delete the state file (preserves the external cluster)
+
+On a cluster shared with other projects (see the top-level project key):
+  - kind clusters are not deleted unless --force is given
+  - external clusters keep the other projects' state; only this project's is removed
 
 WARNING: For kind clusters, this will permanently delete the cluster and all data.
 Services do not need to be uninstalled first - the entire cluster is removed.`,
@@ -73,16 +81,7 @@ Services do not need to be uninstalled first - the entire cluster is removed.`,
 				if err != nil {
 					fmt.Printf("Warning: failed to create Kubernetes client: %v\n", err)
 				} else {
-					if err := state.Delete(ctx, clientset); err != nil {
-						fmt.Printf("Warning: failed to delete cluster state: %v\n", err)
-					} else {
-						Verbose("Cluster state ConfigMap deleted from kube-system namespace")
-					}
-					if err := history.Delete(ctx, clientset); err != nil {
-						fmt.Printf("Warning: failed to delete cluster history: %v\n", err)
-					} else {
-						Verbose("Cluster history ConfigMap deleted from kube-system namespace")
-					}
+					removeExternalClusterState(ctx, clientset, cfg)
 				}
 			}
 		} else {
@@ -93,9 +92,13 @@ Services do not need to be uninstalled first - the entire cluster is removed.`,
 				return err
 			}
 
+			kindMgr := cluster.NewKindManager()
+			if err := checkDestroySharedCluster(ctx, kindMgr, cfg); err != nil {
+				return err
+			}
+
 			// Delete kind cluster
 			Verbose("Deleting kind cluster...")
-			kindMgr := cluster.NewKindManager()
 			if err := kindMgr.DeleteCluster(cfg.Cluster.Name); err != nil {
 				return fmt.Errorf("failed to delete cluster: %w", err)
 			}
@@ -111,4 +114,82 @@ Services do not need to be uninstalled first - the entire cluster is removed.`,
 		}
 		return nil
 	},
+}
+
+func init() {
+	destroyCmd.Flags().BoolVar(&destroyForce, "force", false, "Delete the cluster even if other projects have services in it")
+}
+
+// checkDestroySharedCluster refuses to delete a kind cluster that other
+// projects still use, unless --force is given. A state that can't be read
+// (cluster already gone or unreachable) doesn't block the destroy.
+func checkDestroySharedCluster(ctx context.Context, kindMgr *cluster.KindManager, cfg *config.Config) error {
+	if destroyForce {
+		return nil
+	}
+	exists, err := kindMgr.ClusterExists(cfg.Cluster.Name)
+	if err != nil || !exists {
+		return nil
+	}
+	kubeconfig, err := kindMgr.GetKubeConfig(cfg.Cluster.Name, false)
+	if err != nil {
+		return nil
+	}
+	clientset, err := providers.GetClientsetFromKubeconfigContent(kubeconfig, true)
+	if err != nil {
+		return nil
+	}
+	st, err := state.Load(ctx, clientset, cfg.Cluster.Name)
+	if err != nil {
+		return nil
+	}
+	return sharedClusterError(st, cfg, destroyForce)
+}
+
+// sharedClusterError refuses to delete a cluster whose state shows services
+// of other projects, unless force is set. A nil state (none recorded) passes.
+func sharedClusterError(st *state.ClusterState, cfg *config.Config, force bool) error {
+	if force || st == nil {
+		return nil
+	}
+	st.SetProject(cfg.Project)
+	if others := st.OtherProjects(); len(others) > 0 {
+		return fmt.Errorf("cluster '%s' is also used by project(s) %s; run `kraze down` in those projects first, or use --force to delete it anyway",
+			cfg.Cluster.Name, strings.Join(others, ", "))
+	}
+	return nil
+}
+
+// removeExternalClusterState deletes kraze's state and history from an
+// external cluster. If other projects still use the cluster, only this
+// project's entries are removed and both ConfigMaps are kept.
+func removeExternalClusterState(ctx context.Context, clientset kubernetes.Interface, cfg *config.Config) {
+	st, err := state.Load(ctx, clientset, cfg.Cluster.Name)
+	if err != nil {
+		fmt.Printf("Warning: failed to load cluster state: %v\n", err)
+		return
+	}
+	if st != nil {
+		st.SetProject(cfg.Project)
+		if others := st.OtherProjects(); len(others) > 0 {
+			st.RemoveProject()
+			if err := st.Save(ctx, clientset); err != nil {
+				fmt.Printf("Warning: failed to remove project state: %v\n", err)
+				return
+			}
+			fmt.Printf("Removed this project's state; kept state and history for project(s) %s\n", strings.Join(others, ", "))
+			return
+		}
+	}
+
+	if err := state.Delete(ctx, clientset); err != nil {
+		fmt.Printf("Warning: failed to delete cluster state: %v\n", err)
+	} else {
+		Verbose("Cluster state ConfigMap deleted from kube-system namespace")
+	}
+	if err := history.Delete(ctx, clientset); err != nil {
+		fmt.Printf("Warning: failed to delete cluster history: %v\n", err)
+	} else {
+		Verbose("Cluster history ConfigMap deleted from kube-system namespace")
+	}
 }

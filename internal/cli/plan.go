@@ -41,7 +41,7 @@ You can filter services by name or by labels:
 type ServicePlanInfo struct {
 	Name            string
 	Type            string
-	Action          string // "add", "change", "no-change"
+	Action          string // "add", "change", "no-change", "skipped", "conflict"
 	Version         string
 	Namespace       string
 	NamespaceAction string // one of the namespace* constants
@@ -139,6 +139,8 @@ func runPlan(cmd *cobra.Command, args []string) error {
 	if len(requestedServices) > 0 && len(planLabels) > 0 {
 		return fmt.Errorf("cannot specify both service names and labels, use one or the other")
 	}
+	configured := configuredServices(cfg)
+	fullPlan := len(requestedServices) == 0 && len(planLabels) == 0
 
 	if len(planLabels) > 0 {
 		// Filter by labels
@@ -248,6 +250,12 @@ func runPlan(cmd *cobra.Command, args []string) error {
 		}
 	}
 
+	// Act as this config's project, claiming unowned entries the way `up` would
+	// (in memory only; plan never saves)
+	st.SetProject(cfg.Project)
+	checkProjectAccess(st, cfg, configured)
+	claimServices(st, cfg.Services)
+
 	// Determine if cluster exists for display purposes
 	clusterExists := false
 	if isExternal {
@@ -274,6 +282,7 @@ func runPlan(cmd *cobra.Command, args []string) error {
 	toChange := 0
 	noChange := 0
 	skipped := 0
+	conflicts := 0
 
 	for name, svc := range cfg.Services {
 		svcCopy := svc
@@ -301,6 +310,8 @@ func runPlan(cmd *cobra.Command, args []string) error {
 			toChange++
 		case "no-change":
 			noChange++
+		case "conflict":
+			conflicts++
 		}
 	}
 
@@ -321,8 +332,15 @@ func runPlan(cmd *cobra.Command, args []string) error {
 		fmt.Println()
 	}
 
+	// Orphans only make sense against the whole config
+	orphans := 0
+	if fullPlan {
+		orphans = printOrphanPlan(st.Orphans(configured))
+	}
+	printMovedPlan(movedInstalls(st, cfg.Services), cfg.Services)
+
 	// Print summary
-	printPlanSummary(toAdd, toChange, noChange, skipped)
+	printPlanSummary(toAdd, toChange, noChange, skipped, conflicts, orphans)
 
 	return nil
 }
@@ -368,6 +386,16 @@ func analyzeService(svc *config.ServiceConfig, st *state.ClusterState, namespace
 	// Determine if service is installed
 	installed := st.IsServiceInstalled(svc.Name)
 
+	if owner, ok := st.ConflictingOwner(svc.Name, info.Namespace); ok {
+		// kraze up refuses to install over another project's release
+		if owner == "" {
+			owner = "(no project)"
+		}
+		info.Action = "conflict"
+		info.Details = fmt.Sprintf("already installed in namespace '%s' by project %s", info.Namespace, owner)
+		return info
+	}
+
 	if !installed {
 		info.Action = "add"
 	} else {
@@ -411,6 +439,8 @@ func printServicePlan(info *ServicePlanInfo) {
 		formattedSymbol = color.Yellow("~")
 	case "skipped":
 		formattedSymbol = color.Gray("-")
+	case "conflict":
+		formattedSymbol = color.Red("!")
 	}
 
 	// Print service line
@@ -420,8 +450,8 @@ func printServicePlan(info *ServicePlanInfo) {
 	}
 	fmt.Printf(" - %s\n", info.Details)
 
-	// Skip namespace and dependency info for skipped services
-	if info.Action == "skipped" {
+	// Skip namespace and dependency info for skipped and conflicting services
+	if info.Action == "skipped" || info.Action == "conflict" {
 		return
 	}
 
@@ -446,7 +476,39 @@ func printServicePlan(info *ServicePlanInfo) {
 	}
 }
 
-func printPlanSummary(toAdd, toChange, noChange, skipped int) {
+// printOrphanPlan lists services this project installed that are no longer in
+// its config, and returns how many there are
+func printOrphanPlan(orphans []state.ServiceMetadata) int {
+	if len(orphans) == 0 {
+		return 0
+	}
+	fmt.Printf("%s (no longer in config; removed by %s):\n", color.Bold("Orphans"), color.Bold("kraze up --remove-orphans"))
+	for _, o := range orphans {
+		serviceType := o.Type
+		if serviceType == "" {
+			serviceType = "type unknown, installed by an older kraze"
+		}
+		fmt.Printf("  %s %s (orphan) - %s in namespace '%s'\n", color.Yellow("-"), color.Bold(o.Name), serviceType, o.Namespace)
+	}
+	fmt.Println()
+	return len(orphans)
+}
+
+// printMovedPlan lists services that moved namespace or changed type since
+// they were installed, which `up` refuses without --remove-orphans
+func printMovedPlan(moved []state.ServiceMetadata, services map[string]config.ServiceConfig) {
+	if len(moved) == 0 {
+		return
+	}
+	fmt.Printf("%s (old installation removed first by %s; plain %s refuses):\n",
+		color.Bold("Moved"), color.Bold("kraze up --remove-orphans"), color.Bold("kraze up"))
+	for _, meta := range moved {
+		fmt.Printf("  %s %s\n", color.Yellow("~"), describeMove(meta, services[meta.Name]))
+	}
+	fmt.Println()
+}
+
+func printPlanSummary(toAdd, toChange, noChange, skipped, conflicts, orphans int) {
 	fmt.Printf("%s", color.Bold("Plan:"))
 
 	parts := []string{}
@@ -461,6 +523,12 @@ func printPlanSummary(toAdd, toChange, noChange, skipped int) {
 	}
 	if skipped > 0 {
 		parts = append(parts, color.Gray(fmt.Sprintf("%d skipped", skipped)))
+	}
+	if conflicts > 0 {
+		parts = append(parts, color.Red(fmt.Sprintf("%d conflicting with another project", conflicts)))
+	}
+	if orphans > 0 {
+		parts = append(parts, color.Yellow(fmt.Sprintf("%d orphaned", orphans)))
 	}
 
 	if len(parts) > 0 {

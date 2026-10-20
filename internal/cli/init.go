@@ -164,16 +164,28 @@ For external clusters (cluster.external.enabled: true):
 			return fmt.Errorf("failed to create Kubernetes client: %w", err)
 		}
 
-		rec := beginHistory(ctx, clientset, "init", !isExternal)
+		rec := beginHistory(ctx, clientset, cfg.Project, "init", !isExternal)
 		defer func() { finishHistory(rec, retErr) }()
 		for _, p := range preloaded {
 			rec.RecordChange(p.image, history.ActionLoadImage, p.duration, p.err)
 		}
 
-		// Create and save cluster state
-		nvidiaEnabled := cfg.Cluster.GPU.IsNvidiaEnabled()
-		amdEnabled := cfg.Cluster.GPU.IsAMDEnabled()
-		st := state.New(cfg.Cluster.Name, isExternal, nvidiaEnabled, 0, amdEnabled, 0)
+		// Load the cluster state, creating it if needed. An external cluster may
+		// already hold other projects' state, which must not be overwritten.
+		st, err := state.Load(ctx, clientset, cfg.Cluster.Name)
+		if err != nil {
+			return fmt.Errorf("failed to load cluster state: %w", err)
+		}
+		if st == nil {
+			nvidiaEnabled := cfg.Cluster.GPU.IsNvidiaEnabled()
+			amdEnabled := cfg.Cluster.GPU.IsAMDEnabled()
+			st = state.New(cfg.Cluster.Name, isExternal, nvidiaEnabled, 0, amdEnabled, 0)
+		}
+		st.SetProject(cfg.Project)
+		checkProjectAccess(st, cfg, configuredServices(cfg))
+		if !isExternal {
+			st.SetClusterConfig(clusterConfigHash(cfg.Cluster), cfg.Project)
+		}
 		st.SetConfigPaths(cfgPaths)
 		if err := st.Save(ctx, clientset); err != nil {
 			return fmt.Errorf("failed to save cluster state: %w", err)

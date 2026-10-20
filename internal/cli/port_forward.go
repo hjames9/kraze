@@ -152,6 +152,7 @@ func runPortForward(cmd *cobra.Command, args []string) error {
 	// Create provider options
 	providerOpts := &providers.ProviderOptions{
 		ClusterName: cfg.Cluster.Name,
+		Project:     cfg.Project,
 		KubeConfig:  kubeconfig,
 		Verbose:     verbose,
 	}

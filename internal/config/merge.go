@@ -31,6 +31,14 @@ func ParseMultiple(paths []string) (*Config, error) {
 
 	// Merge cluster configs (first file's name wins; other fields follow specific rules).
 	merged := &Config{}
+	project, err := mergeProjects(configs, paths)
+	if err != nil {
+		return nil, err
+	}
+	if err := requireProject(project, paths[0]); err != nil {
+		return nil, fmt.Errorf("%w: %w", ErrInvalid, err)
+	}
+	merged.Project = project
 	mergedCluster, err := mergeClusterConfigs(configs)
 	if err != nil {
 		return nil, err
@@ -50,7 +58,7 @@ func ParseMultiple(paths []string) (*Config, error) {
 
 	// Run cross-reference validation on the fully merged config.
 	if err := merged.validateCrossRefs(); err != nil {
-		return nil, fmt.Errorf("validation failed: %w", err)
+		return nil, fmt.Errorf("%w: %w", ErrInvalid, err)
 	}
 
 	return merged, nil
@@ -61,13 +69,13 @@ func ParseMultiple(paths []string) (*Config, error) {
 // enabled/disabled constraints). Used as the first pass in ParseMultiple so
 // that services in one file can legitimately reference services in another.
 func parseWithoutCrossRefValidation(configPath string) (*Config, error) {
-	data, err := readAndExpand(configPath)
+	data, doc, err := readConfig(configPath)
 	if err != nil {
 		return nil, err
 	}
 
 	var cfg Config
-	if err := unmarshalConfig(data, &cfg); err != nil {
+	if err := unmarshalConfig(data, doc, &cfg); err != nil {
 		return nil, err
 	}
 
@@ -75,6 +83,10 @@ func parseWithoutCrossRefValidation(configPath string) (*Config, error) {
 	for name, svc := range cfg.Services {
 		svc.Name = name
 		cfg.Services[name] = svc
+	}
+
+	if err := validateProjectName(cfg.Project); err != nil {
+		return nil, err
 	}
 
 	// Validate GPU config if present (can be done per-file).
@@ -98,6 +110,24 @@ func parseWithoutCrossRefValidation(configPath string) (*Config, error) {
 	}
 
 	return &cfg, nil
+}
+
+// mergeProjects returns the project shared by all files. Files that omit
+// project inherit it; files that set different projects are an error, since one
+// invocation acts as exactly one project.
+func mergeProjects(configs []*Config, paths []string) (string, error) {
+	project, from := "", ""
+	for i, cfg := range configs {
+		if cfg.Project == "" {
+			continue
+		}
+		if project == "" {
+			project, from = cfg.Project, paths[i]
+		} else if cfg.Project != project {
+			return "", fmt.Errorf("project conflict: '%s' sets project '%s' but '%s' sets '%s'", from, project, paths[i], cfg.Project)
+		}
+	}
+	return project, nil
 }
 
 // mergeClusterConfigs merges cluster configurations from multiple files.

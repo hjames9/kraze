@@ -19,8 +19,9 @@ import (
 )
 
 var (
-	historyLimit  int
-	historyOutput string
+	historyLimit       int
+	historyOutput      string
+	historyAllProjects bool
 )
 
 var historyCmd = &cobra.Command{
@@ -31,14 +32,16 @@ when, and which services were installed, upgraded or removed.
 
 History is stored in the cluster (ConfigMap kraze-history in kube-system), so it
 is shared by everyone using the cluster and removed by 'kraze destroy'. It keeps
-the most recent 200 commands.
+the most recent 200 commands. On a cluster shared by several projects, only
+this config's project is shown unless --all-projects is given.
 
 Examples:
   kraze history                 # Show the 20 most recent commands
   kraze history backend         # Show only commands that changed backend
   kraze history --limit 0       # Show all recorded commands
   kraze history -v              # Include per-service durations and errors
-  kraze history -o json         # Machine-readable output`,
+  kraze history -o json         # Machine-readable output
+  kraze history --all-projects  # Include every project sharing the cluster`,
 	ValidArgsFunction: getServiceNames,
 	RunE:              runHistory,
 }
@@ -76,7 +79,7 @@ func runHistory(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return err
 	}
-	entries = selectHistory(entries, args, historyLimit)
+	entries = selectHistory(entries, args, cfg.Project, historyAllProjects, historyLimit)
 
 	if historyOutput == "json" {
 		data, err := json.MarshalIndent(entries, "", "  ")
@@ -91,8 +94,12 @@ func runHistory(cmd *cobra.Command, args []string) error {
 		fmt.Printf("No history recorded for cluster '%s'\n", cfg.Cluster.Name)
 		return nil
 	}
-	fmt.Printf("Cluster: %s\n\n", cfg.Cluster.Name)
-	fmt.Print(formatHistory(entries, verbose))
+	fmt.Printf("Cluster: %s\n", cfg.Cluster.Name)
+	if cfg.Project != "" && !historyAllProjects {
+		fmt.Printf("Project: %s\n", cfg.Project)
+	}
+	fmt.Println()
+	fmt.Print(formatHistory(entries, verbose, historyAllProjects))
 	return nil
 }
 
@@ -133,11 +140,15 @@ func historyClient(ctx context.Context, clusterCfg *config.ClusterConfig) (kuber
 	return clientset, nil
 }
 
-// selectHistory returns entries newest first, keeping only those that changed
-// one of services (if any are given), up to limit entries (0 for all)
-func selectHistory(entries []history.Entry, services []string, limit int) []history.Entry {
+// selectHistory returns entries newest first, keeping only those run by project
+// or recorded before projects existed (unless allProjects) that changed one of
+// services (if any are given), up to limit entries (0 for all)
+func selectHistory(entries []history.Entry, services []string, project string, allProjects bool, limit int) []history.Entry {
 	selected := make([]history.Entry, 0, len(entries))
 	for _, e := range slices.Backward(entries) {
+		if !allProjects && e.Project != project && e.Project != "" {
+			continue
+		}
 		if len(services) > 0 && !slices.ContainsFunc(e.Changes, func(c history.Change) bool {
 			return slices.Contains(services, c.Name)
 		}) {
@@ -151,10 +162,15 @@ func selectHistory(entries []history.Entry, services []string, limit int) []hist
 	return selected
 }
 
-func formatHistory(entries []history.Entry, verbose bool) string {
+func formatHistory(entries []history.Entry, verbose, showProject bool) string {
 	var b strings.Builder
-	fmt.Fprintf(&b, "%-19s  %-20s  %-30s  %-11s  %s\n", "TIME", "USER", "COMMAND", "RESULT", "CHANGES")
-	b.WriteString(strings.Repeat("-", 100) + "\n")
+	if showProject {
+		fmt.Fprintf(&b, "%-19s  %-15s  %-20s  %-30s  %-11s  %s\n", "TIME", "PROJECT", "USER", "COMMAND", "RESULT", "CHANGES")
+		b.WriteString(strings.Repeat("-", 117) + "\n")
+	} else {
+		fmt.Fprintf(&b, "%-19s  %-20s  %-30s  %-11s  %s\n", "TIME", "USER", "COMMAND", "RESULT", "CHANGES")
+		b.WriteString(strings.Repeat("-", 100) + "\n")
+	}
 
 	for _, e := range entries {
 		command := e.Args
@@ -164,8 +180,11 @@ func formatHistory(entries []history.Entry, verbose bool) string {
 		// Pad before coloring so ANSI codes don't break column alignment
 		result := colorResult(e.Result, fmt.Sprintf("%-11s", displayResult(e.Result)))
 
-		fmt.Fprintf(&b, "%-19s  %-20s  %-30s  %s  %s\n",
-			e.StartedAt.Local().Format(time.DateTime),
+		fmt.Fprintf(&b, "%-19s  ", e.StartedAt.Local().Format(time.DateTime))
+		if showProject {
+			fmt.Fprintf(&b, "%-15s  ", truncate(projectLabel(e.Project), 15))
+		}
+		fmt.Fprintf(&b, "%-20s  %-30s  %s  %s\n",
 			truncate(e.User, 20),
 			truncate(command, 30),
 			result,
@@ -248,8 +267,9 @@ func truncate(s string, n int) string {
 
 // beginHistory starts recording a cluster-changing command. History is
 // best-effort: a failed write is reported in verbose mode and never fails the command.
-func beginHistory(ctx context.Context, clientset kubernetes.Interface, command string, clusterCreated bool) *history.Recorder {
+func beginHistory(ctx context.Context, clientset kubernetes.Interface, project, command string, clusterCreated bool) *history.Recorder {
 	rec, err := history.Begin(ctx, clientset, history.Entry{
+		Project:        project,
 		Command:        command,
 		Args:           strings.Join(os.Args[1:], " "),
 		KrazeVersion:   version,
@@ -270,5 +290,6 @@ func finishHistory(rec *history.Recorder, err error) {
 
 func init() {
 	historyCmd.Flags().IntVar(&historyLimit, "limit", 20, "Maximum number of commands to show (0 for all)")
+	historyCmd.Flags().BoolVar(&historyAllProjects, "all-projects", false, "Show commands run by every project sharing the cluster")
 	historyCmd.Flags().StringVarP(&historyOutput, "output", "o", "table", "Output format: table or json")
 }

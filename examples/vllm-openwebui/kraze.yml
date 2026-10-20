@@ -11,6 +11,8 @@
 #   kraze port-forward open-webui 8080:8080
 #   open http://localhost:8080
 
+project: vllm-openwebui
+
 cluster:
   name: vllm-openwebui
 

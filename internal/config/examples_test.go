@@ -272,6 +272,38 @@ func TestManifestsExample(test *testing.T) {
 	}
 }
 
+// TestSharedClusterExample validates the shared-cluster example: two projects,
+// each with its own kraze.yml, on one cluster. It has no top-level kraze.yml,
+// so TestAllExamples doesn't cover it.
+func TestSharedClusterExample(test *testing.T) {
+	projects := map[string]string{}
+	for _, project := range []string{"billing", "web"} {
+		path := filepath.Join("..", "..", "examples", "shared-cluster", project, "kraze.yml")
+		cfg, err := Parse(path)
+		if err != nil {
+			test.Fatalf("Failed to parse shared-cluster/%s: %v", project, err)
+		}
+		assertReferencedPathsExist(test, "Example 'shared-cluster/"+project+"'", cfg)
+
+		if cfg.Project != project {
+			test.Errorf("shared-cluster/%s: expected project '%s', got '%s'", project, project, cfg.Project)
+		}
+		if cfg.Cluster.Name != "shared-cluster" {
+			test.Errorf("shared-cluster/%s: expected cluster 'shared-cluster', got '%s'", project, cfg.Cluster.Name)
+		}
+		postgres, ok := cfg.Services["postgres"]
+		if !ok {
+			test.Fatalf("shared-cluster/%s: expected a postgres service", project)
+		}
+		projects[project] = postgres.GetNamespace()
+	}
+
+	// The example shows that both projects can use the same service name
+	if projects["billing"] == projects["web"] {
+		test.Errorf("both postgres services are in namespace '%s'; they must differ", projects["web"])
+	}
+}
+
 // TestMultiConfigExample validates the multi-config example using ParseMultiple
 func TestMultiConfigExample(test *testing.T) {
 	appPath := filepath.Join("..", "..", "examples", "multi-config", "app", "kraze.yml")

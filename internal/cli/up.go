@@ -2,6 +2,7 @@ package cli
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"sync"
@@ -27,6 +28,8 @@ var (
 	upNoWait  bool
 	upNoDeps  bool
 	upLabels  []string
+
+	upRemoveOrphans bool
 )
 
 var upCmd = &cobra.Command{
@@ -41,7 +44,11 @@ You can filter services by name or by labels:
   kraze up service1 service2      # Install specific services (with dependencies)
   kraze up service1 --no-deps     # Install service1 only, skip dependencies
   kraze up --label env=dev        # Install services with label env=dev
-  kraze up --label tier=backend   # Install services with label tier=backend`,
+  kraze up --label tier=backend   # Install services with label tier=backend
+
+Services this project installed earlier that are no longer in its config
+(orphans) are left running. --remove-orphans removes them after a full up:
+  kraze up --remove-orphans`,
 	ValidArgsFunction: getServiceNames,
 	RunE:              runUp,
 }
@@ -88,6 +95,13 @@ func runUp(cmd *cobra.Command, args []string) (retErr error) {
 	if len(requestedServices) > 0 && len(upLabels) > 0 {
 		return fmt.Errorf("cannot specify both service names and labels, use one or the other")
 	}
+
+	// Orphans are services not in the config, so only a full up can tell
+	if upRemoveOrphans && (len(requestedServices) > 0 || len(upLabels) > 0) {
+		return fmt.Errorf("--remove-orphans can't be combined with service names or --label")
+	}
+	configured := configuredServices(cfg)
+	configuredNS := configuredNamespaces(cfg)
 
 	// Validate --no-deps flag usage
 	if upNoDeps {
@@ -254,7 +268,7 @@ func runUp(cmd *cobra.Command, args []string) (retErr error) {
 		return fmt.Errorf("failed to create Kubernetes client: %w", err)
 	}
 
-	rec := beginHistory(ctx, clientset, "up", clusterCreated)
+	rec := beginHistory(ctx, clientset, cfg.Project, "up", clusterCreated)
 	defer func() { finishHistory(rec, retErr) }()
 
 	// Load or create cluster state
@@ -268,19 +282,21 @@ func runUp(cmd *cobra.Command, args []string) (retErr error) {
 		st = state.New(cfg.Cluster.Name, cfg.Cluster.IsExternal(), nvidiaEnabled, 0, amdEnabled, 0)
 	} else if !cfg.Cluster.IsExternal() {
 		// GPU config mismatch check (GPU requires cluster recreation)
-		nvidiaEnabled := cfg.Cluster.GPU.IsNvidiaEnabled()
-		amdEnabled := cfg.Cluster.GPU.IsAMDEnabled()
-		if st.NvidiaGPUEnabled != nvidiaEnabled || st.AMDGPUEnabled != amdEnabled {
-			return fmt.Errorf(
-				"GPU configuration has changed since cluster '%s' was created.\n"+
-					"Was:  nvidia(enabled=%v) amd(enabled=%v)\n"+
-					"Now:  nvidia(enabled=%v) amd(enabled=%v)\n"+
-					"GPU support requires cluster recreation. Run: kraze destroy && kraze up",
-				cfg.Cluster.Name,
-				st.NvidiaGPUEnabled, st.AMDGPUEnabled,
-				nvidiaEnabled, amdEnabled,
-			)
+		if err := checkGPUCompatibility(st, cfg); err != nil {
+			return err
 		}
+	}
+	st.SetProject(cfg.Project)
+	checkProjectAccess(st, cfg, configured)
+	claimServices(st, cfg.Services)
+	if err := checkServiceConflicts(st, cfg.Services, cfg.Project, originalCfgPaths); err != nil {
+		return err
+	}
+
+	if clusterCreated {
+		st.SetClusterConfig(clusterConfigHash(cfg.Cluster), cfg.Project)
+	} else if !cfg.Cluster.IsExternal() {
+		warnClusterConfigDrift(st, cfg)
 	}
 
 	// Store the original config paths (before pack extraction) so future commands
@@ -288,6 +304,33 @@ func runUp(cmd *cobra.Command, args []string) (retErr error) {
 	st.SetConfigPaths(originalCfgPaths)
 	if saveErr := st.Save(ctx, clientset); saveErr != nil {
 		Verbose("Warning: failed to store config paths in cluster state: %v", saveErr)
+	}
+
+	// Orphans go before installs: a renamed service's objects (or a chart's
+	// fixed-name ones) still belong to its old name, so installing the new name
+	// first fails on ownership and the orphan would never be reached
+	// A service that moved namespace or changed type would be installed
+	// afresh, leaving its old installation behind and no longer tracked
+	moved := movedInstalls(st, cfg.Services)
+	if len(moved) > 0 && !upRemoveOrphans {
+		return movedServicesError(moved, cfg.Services)
+	}
+	if upRemoveOrphans {
+		backend := providerOrphanBackend{opts: &providers.ProviderOptions{
+			ClusterName: cfg.Cluster.Name,
+			Project:     cfg.Project,
+			KubeConfig:  kubeconfig,
+			Verbose:     verbose,
+			Quiet:       !verbose,
+		}}
+		old := append(st.Orphans(configured), moved...)
+		if err := removeOrphans(ctx, st, clientset, kubeconfig, old, configuredNS, backend, false, rec, Verbose); err != nil {
+			return err
+		}
+	} else if len(requestedServices) == 0 && len(upLabels) == 0 {
+		// Before installing: a renamed service's install fails until its old
+		// name is removed, and this explains why
+		printOrphanHint(st.Orphans(configured))
 	}
 
 	// Determine global wait behavior from CLI flags
@@ -455,6 +498,7 @@ func installService(
 	// Create provider options
 	providerOpts := &providers.ProviderOptions{
 		ClusterName: cfg.Cluster.Name,
+		Project:     cfg.Project,
 		KubeConfig:  kubeconfig,
 		Wait:        serviceWait,
 		Timeout:     serviceTimeout,
@@ -611,9 +655,7 @@ func installService(
 			defer func(serviceName string, hashes map[string]string) {
 				stateMutex.Lock()
 				defer stateMutex.Unlock()
-				if svcMeta, exists := st.Services[serviceName]; exists {
-					svcMeta.ImageHashes = hashes
-					st.Services[serviceName] = svcMeta
+				if st.SetImageHashes(serviceName, hashes) {
 					if err := st.Save(ctx, clientset); err != nil {
 						progress.Verbose("Warning: failed to save cluster state (image hashes): %v", err)
 					}
@@ -622,18 +664,23 @@ func installService(
 		}
 	}
 
-	// Check if namespace exists before installing (to track if we'll create it)
+	// Create the namespace ourselves, labeled as kraze-managed, rather than
+	// leaving it to the provider, so `kraze down` knows it may delete it. An
+	// existing namespace that carries the label was also created by kraze.
 	namespace := svc.GetNamespace()
-	namespaceExists, err := providers.CheckNamespaceExists(ctx, kubeconfig, namespace)
+	namespaceExists, namespaceManaged, err := providers.NamespaceInfo(ctx, clientset, namespace)
 	if err != nil {
-		progress.Verbose("Warning: failed to check if namespace '%s' exists: %v", namespace, err)
-		namespaceExists = false
+		progress.Verbose("Warning: %v", err)
 	}
-
-	// We will create the namespace if:
-	// 1. It doesn't exist AND
-	// 2. create_namespace is true (which is now the default)
-	willCreateNamespace := !namespaceExists && svc.ShouldCreateNamespace()
+	createdNamespace := namespaceManaged
+	if err == nil && !namespaceExists && svc.ShouldCreateNamespace() {
+		created, err := providers.EnsureNamespace(ctx, clientset, namespace)
+		if err != nil {
+			progress.UpdateService(serviceIndex, svc.Name, ui.StatusFailed, err.Error())
+			return fmt.Errorf("failed to install '%s': %w", svc.Name, err)
+		}
+		createdNamespace = created
+	}
 
 	// Check if context was cancelled before installing
 	if ctx.Err() != nil {
@@ -644,19 +691,41 @@ func installService(
 	// Update status to show we're applying resources
 	progress.UpdateService(serviceIndex, svc.Name, ui.StatusInstalling, "Applying resources")
 
+	// Record what was applied, so the service can be removed once it is no
+	// longer in the config (--remove-orphans)
+	record := func() {
+		var resources []state.ResourceRef
+		if mp, ok := provider.(*providers.ManifestsProvider); ok {
+			var err error
+			if resources, err = mp.ResourceRefs(svc); err != nil {
+				progress.Verbose("Warning: failed to record resources of '%s': %v", svc.Name, err)
+			}
+		}
+
+		// Update cluster state with namespace tracking (protected by mutex)
+		stateMutex.Lock()
+		defer stateMutex.Unlock()
+		st.MarkServiceInstalledWithNamespace(svc.Name, namespace, createdNamespace)
+		st.SetServiceSource(svc.Name, svc.Type, resources)
+		if err := st.Save(ctx, clientset); err != nil {
+			progress.Verbose("Warning: failed to save cluster state: %v", err)
+		}
+	}
+
 	// Install the service
 	if err := provider.Install(ctx, svc); err != nil {
 		progress.UpdateService(serviceIndex, svc.Name, ui.StatusFailed, err.Error())
+		// A failed install can still leave objects (or a failed Helm release)
+		// behind. Record it, or it couldn't be removed once dropped from the
+		// config. An ownership conflict applied nothing.
+		if !errors.Is(err, providers.ErrOwnershipConflict) {
+			if installed, checkErr := provider.IsInstalled(context.WithoutCancel(ctx), svc); checkErr == nil && installed {
+				record()
+			}
+		}
 		return fmt.Errorf("failed to install '%s': %w", svc.Name, err)
 	}
-
-	// Update cluster state with namespace tracking (protected by mutex)
-	stateMutex.Lock()
-	st.MarkServiceInstalledWithNamespace(svc.Name, namespace, willCreateNamespace)
-	if err := st.Save(ctx, clientset); err != nil {
-		progress.Verbose("Warning: failed to save cluster state: %v", err)
-	}
-	stateMutex.Unlock()
+	record()
 
 	// Mark service as ready
 	progress.UpdateService(serviceIndex, svc.Name, ui.StatusReady, "Deployed")
@@ -734,5 +803,6 @@ func init() {
 	upCmd.Flags().BoolVar(&upNoWait, "no-wait", false, "Don't wait for services to be ready")
 	upCmd.Flags().StringVar(&upTimeout, "timeout", "10m", "Timeout for wait operations")
 	upCmd.Flags().BoolVar(&upNoDeps, "no-deps", false, "Don't install dependencies (only install specified services)")
+	upCmd.Flags().BoolVar(&upRemoveOrphans, "remove-orphans", false, "Remove services this project installed that are no longer in its config")
 	upCmd.Flags().StringSliceVarP(&upLabels, "label", "l", []string{}, "Filter services by label (format: key=value, can be specified multiple times)")
 }

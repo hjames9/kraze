@@ -89,7 +89,7 @@ func runLoadImage(cmd *cobra.Command, args []string) (retErr error) {
 	} else if clientset, err = providers.GetClientsetFromKubeconfigContent(kubeconfig, true); err != nil {
 		Verbose("Warning: failed to create Kubernetes client, history will not be recorded: %v", err)
 	}
-	rec := beginHistory(ctx, clientset, "load-image", false)
+	rec := beginHistory(ctx, clientset, cfg.Project, "load-image", false)
 	defer func() { finishHistory(rec, retErr) }()
 
 	// Load each image

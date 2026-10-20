@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"errors"
 	"fmt"
 	"strings"
 
@@ -25,6 +26,9 @@ var validateCmd = &cobra.Command{
 		// Parse configuration file
 		cfg, err := config.ParseMultiple(cfgPaths)
 		if err != nil {
+			if errors.Is(err, config.ErrInvalid) {
+				return err // already says "validation failed"
+			}
 			return fmt.Errorf("validation failed: %w", err)
 		}
 

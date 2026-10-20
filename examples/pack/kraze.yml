@@ -13,6 +13,8 @@
 #   kraze validate -f myapp.tar.gz     # Recipient validates without internet
 #   kraze up -f myapp.tar.gz           # Recipient deploys
 
+project: pack
+
 cluster:
   name: pack-example
 

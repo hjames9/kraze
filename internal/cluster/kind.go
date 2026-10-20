@@ -333,7 +333,7 @@ func (kind *KindManager) patchKubeconfigWithContainerIP(clusterName, kubeconfig 
 
 	for _, network := range networksToTry {
 		cmd := osexec.Command("docker", "inspect", containerName,
-			"-f", fmt.Sprintf("{{.NetworkSettings.Networks.%s.IPAddress}}", network))
+			"-f", networkIPTemplate(network))
 
 		output, err := cmd.Output()
 		if err == nil {
@@ -830,56 +830,24 @@ func (kind *KindManager) configureInsecureRegistries(clusterName string, registr
 	for _, node := range nodes {
 		containerName := node.String()
 
-		// First, update containerd config to use config_path for v2 registry format
-		// This must be done before creating the hosts.toml files
-		configPatch := `[plugins."io.containerd.grpc.v1.cri".registry]
-  config_path = "/etc/containerd/certs.d"`
-
-		patchCmd := osexec.Command("docker", "exec", containerName, "sh", "-c",
-			fmt.Sprintf("cat >> /etc/containerd/config.toml << 'EOF'\n%sEOF", configPatch))
-		if output, err := patchCmd.CombinedOutput(); err != nil {
-			return fmt.Errorf("failed to patch containerd config in node %s: %w\nOutput: %s",
-				containerName, err, string(output))
+		// Point containerd at certs.d (v2 registry format) before writing the
+		// hosts.toml files
+		if err := runInNode(containerName, appendRegistryConfigScript, containerdConfigPath, containerdRegistryConfigPatch); err != nil {
+			return fmt.Errorf("failed to patch containerd config in node %s: %w", containerName, err)
 		}
 
-		// For each registry, create a hosts.toml file
 		for _, registry := range registries {
-			// Determine the protocol (http or https)
-			// If registry starts with localhost or contains a port, use http, otherwise https
-			protocol := "https"
-			if strings.HasPrefix(registry, "localhost") || strings.Contains(registry, ":") && !strings.HasPrefix(registry, "https://") {
-				protocol = "http"
+			dir, hostsTOML, err := registryHostsConfig(registry)
+			if err != nil {
+				return err
 			}
-			server := fmt.Sprintf("%s://%s", protocol, registry)
-
-			// Create the certs.d directory for this registry
-			mkdirCmd := osexec.Command("docker", "exec", containerName, "mkdir", "-p", fmt.Sprintf("/etc/containerd/certs.d/%s", registry))
-			if output, err := mkdirCmd.CombinedOutput(); err != nil {
-				return fmt.Errorf("failed to create certs.d directory for %s in node %s: %w\nOutput: %s",
-					registry, containerName, err, string(output))
-			}
-
-			// Create hosts.toml content
-			hostsToml := fmt.Sprintf(`server = "%s"
-
-[host."%s"]
-  skip_verify = true
-`, server, server)
-
-			// Write hosts.toml file
-			writeCmd := osexec.Command("docker", "exec", containerName, "sh", "-c",
-				fmt.Sprintf("cat > /etc/containerd/certs.d/%s/hosts.toml << 'EOF'\n%sEOF", registry, hostsToml))
-			if output, err := writeCmd.CombinedOutput(); err != nil {
-				return fmt.Errorf("failed to write hosts.toml for %s in node %s: %w\nOutput: %s",
-					registry, containerName, err, string(output))
+			if err := writeNodeFile(containerName, dir+"/hosts.toml", hostsTOML); err != nil {
+				return fmt.Errorf("failed to write hosts.toml for %s in node %s: %w", registry, containerName, err)
 			}
 		}
 
-		// Reload containerd to pick up the new configuration
-		killCmd := osexec.Command("docker", "exec", containerName, "pkill", "-HUP", "containerd")
-		if output, err := killCmd.CombinedOutput(); err != nil {
-			return fmt.Errorf("failed to reload containerd configuration in node %s: %w\nOutput: %s",
-				containerName, err, string(output))
+		if err := restartContainerd(containerName); err != nil {
+			return err
 		}
 	}
 
@@ -892,9 +860,9 @@ func (kind *KindManager) configureInsecureRegistries(clusterName string, registr
 func (kind *KindManager) configureProxy(clusterName, httpProxy, httpsProxy, noProxy string) error {
 	fmt.Printf("Configuring proxy settings in cluster nodes...\n")
 
-	// Inform user about proxy configuration source
-	fmt.Printf("  HTTP_PROXY=%s\n", httpProxy)
-	fmt.Printf("  HTTPS_PROXY=%s\n", httpsProxy)
+	// Inform user about proxy configuration source (without passwords)
+	fmt.Printf("  HTTP_PROXY=%s\n", redactProxyURL(httpProxy))
+	fmt.Printf("  HTTPS_PROXY=%s\n", redactProxyURL(httpsProxy))
 	fmt.Printf("  NO_PROXY=%s\n", noProxy)
 
 	// Get cluster nodes
@@ -907,40 +875,19 @@ func (kind *KindManager) configureProxy(clusterName, httpProxy, httpsProxy, noPr
 	for _, node := range nodes {
 		containerName := node.String()
 
-		// Create systemd drop-in directory for containerd
-		mkdirCmd := osexec.Command("docker", "exec", containerName, "mkdir", "-p", "/etc/systemd/system/containerd.service.d")
-		if output, err := mkdirCmd.CombinedOutput(); err != nil {
-			return fmt.Errorf("failed to create systemd drop-in directory in node %s: %w\nOutput: %s",
-				containerName, err, string(output))
+		if err := writeNodeFile(containerName, containerdProxyConf, containerdProxyDropIn(httpProxy, httpsProxy, noProxy)); err != nil {
+			return fmt.Errorf("failed to write proxy config in node %s: %w", containerName, err)
 		}
 
-		// Create http-proxy.conf file with environment variables
-		var proxyConf strings.Builder
-		proxyConf.WriteString("[Service]\n")
-		proxyConf.WriteString("Environment=\"HTTP_PROXY=" + httpProxy + "\"\n")
-		proxyConf.WriteString("Environment=\"HTTPS_PROXY=" + httpsProxy + "\"\n")
-		proxyConf.WriteString("Environment=\"NO_PROXY=" + noProxy + "\"\n")
-
-		// Write the proxy configuration file
-		writeCmd := osexec.Command("docker", "exec", containerName, "sh", "-c",
-			fmt.Sprintf("cat > /etc/systemd/system/containerd.service.d/http-proxy.conf << 'EOF'\n%sEOF", proxyConf.String()))
-		if output, err := writeCmd.CombinedOutput(); err != nil {
-			return fmt.Errorf("failed to write proxy config in node %s: %w\nOutput: %s",
-				containerName, err, string(output))
+		// A unit's Environment= applies when the process starts, so containerd
+		// (which pulls images) must restart. Running containers are kept: their
+		// shims don't depend on the containerd process.
+		if err := runInNode(containerName, "systemctl daemon-reload", "", ""); err != nil {
+			return fmt.Errorf("failed to reload systemd in node %s: %w", containerName, err)
 		}
-
-		// Reload systemd daemon to pick up the new drop-in file
-		reloadCmd := osexec.Command("docker", "exec", containerName, "systemctl", "daemon-reload")
-		if output, err := reloadCmd.CombinedOutput(); err != nil {
-			return fmt.Errorf("failed to reload systemd daemon in node %s: %w\nOutput: %s",
-				containerName, err, string(output))
+		if err := restartContainerd(containerName); err != nil {
+			return err
 		}
-
-		// Note: We do NOT restart containerd here because it would kill all running containers
-		// (including the Kubernetes API server and other critical components).
-		// The proxy environment variables will be available to containerd's child processes
-		// (like image pulls) without requiring a restart.
-		// If a full restart is needed, the user can destroy and recreate the cluster.
 	}
 
 	fmt.Printf("%s Proxy configured successfully\n", color.Checkmark())

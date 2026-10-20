@@ -1,0 +1,27 @@
+# Shared Cluster Example - "web" project
+#
+# Shares the "shared-cluster" kind cluster with ../billing. See
+# ../billing/kraze.yml for how projects share a cluster.
+
+project: web
+
+cluster:
+  name: shared-cluster
+
+services:
+  # Same service name as billing's, in a different namespace
+  postgres:
+    type: helm
+    chart: postgresql
+    repo: oci://registry-1.docker.io/bitnamicharts
+    version: 16.2.4
+    namespace: web
+
+  redis:
+    type: helm
+    chart: redis
+    repo: oci://registry-1.docker.io/bitnamicharts
+    version: 20.2.1
+    namespace: web
+    depends_on:
+      - postgres

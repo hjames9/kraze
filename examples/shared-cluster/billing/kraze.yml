@@ -1,0 +1,34 @@
+# Shared Cluster Example - "billing" project
+#
+# Two projects, each with its own kraze.yml, share one kind cluster by using the
+# same cluster.name. The top-level `project` key records which project owns each
+# service, so the projects can't touch each other's services:
+#   - `kraze down` here only uninstalls billing's services and namespaces
+#   - both projects can have a service called `postgres`, as long as they are in
+#     different namespaces
+#   - `kraze destroy` refuses while another project still has services in the
+#     cluster (use --force to delete it anyway)
+#
+# The first project to run `kraze up` creates the cluster, so cluster settings
+# (port mappings, mounts, proxy, ...) come from its config. Later projects get a
+# warning if theirs differ.
+#
+# Usage:
+#   cd examples/shared-cluster/billing && kraze up
+#   cd ../web && kraze up
+#   kraze status --all-projects     # Every project's services on the cluster
+#   kraze history --all-projects    # Every project's commands
+#   cd ../billing && kraze down     # web keeps running
+
+project: billing
+
+cluster:
+  name: shared-cluster
+
+services:
+  postgres:
+    type: helm
+    chart: postgresql
+    repo: oci://registry-1.docker.io/bitnamicharts
+    version: 16.2.4
+    namespace: billing

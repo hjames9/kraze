@@ -10,6 +10,8 @@
 #   nvidia-ctk --version
 #   docker run --rm --gpus all nvidia/cuda:12.0-base nvidia-smi
 
+project: nvidia-gpu
+
 cluster:
   name: gpu-cluster
 

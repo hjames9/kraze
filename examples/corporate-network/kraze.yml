@@ -1,3 +1,5 @@
+project: corporate-network
+
 cluster:
   name: corporate-cluster
   version: "1.29.0"
@@ -10,9 +12,12 @@ cluster:
 
   # Insecure Registries - Skip TLS verification for specific registries
   # Use this as a quick workaround (not recommended for production)
+  # A host, optionally with a port; HTTPS is tried first, then HTTP. Prefix
+  # https:// or http:// to use only that scheme.
   insecure_registries:
     - ghcr.io
-    # - registry.corp.com
+    # - registry.corp.com:5000
+    # - http://kind-registry:5000
 
   # HTTP/HTTPS Proxy Configuration
   # These settings are passed to kubelet and control plane components

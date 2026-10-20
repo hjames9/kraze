@@ -121,6 +121,7 @@ test: ## Run all tests
 
 test-coverage: ## Run tests with coverage report
 	@echo "Running tests with coverage..."
+	@mkdir -p $(BUILD_DIR)
 	$(GOTEST) -v -coverprofile=$(BUILD_DIR)/coverage.out ./...
 	$(GOCMD) tool cover -html=$(BUILD_DIR)/coverage.out -o $(BUILD_DIR)/coverage.html
 	@echo "Coverage report generated: $(BUILD_DIR)/coverage.html"
@@ -212,6 +213,10 @@ validate-examples: build ## Validate all example configurations
 	./$(BUILD_DIR)/$(BINARY_NAME) validate \
 		--file examples/multi-config/app/kraze.yml \
 		--file examples/multi-config/ml-stack/kraze.yml || exit 1
+	@for f in examples/shared-cluster/*/kraze.yml; do \
+		echo "Validating $$f"; \
+		./$(BUILD_DIR)/$(BINARY_NAME) validate --file "$$f" || exit 1; \
+	done
 	@echo "All examples validated successfully"
 
 help: ## Show this help message

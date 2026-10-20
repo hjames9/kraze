@@ -68,6 +68,7 @@ type Entry struct {
 	StartedAt      time.Time  `json:"started_at"`
 	FinishedAt     *time.Time `json:"finished_at,omitempty"`
 	User           string     `json:"user"`
+	Project        string     `json:"project,omitempty"` // kraze.yml project key; empty for anonymous configs
 	KrazeVersion   string     `json:"kraze_version,omitempty"`
 	Command        string     `json:"command"`        // up, down, init, load-image
 	Args           string     `json:"args,omitempty"` // full command line, e.g. "up backend --no-deps"
