@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	osexec "os/exec"
 	"path/filepath"
 	"regexp"
 	"strings"
@@ -17,26 +16,32 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
-	"k8s.io/client-go/dynamic"
-	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/clientcmd"
 	"sigs.k8s.io/kind/pkg/apis/config/defaults"
 	"sigs.k8s.io/kind/pkg/apis/config/v1alpha4"
 	"sigs.k8s.io/kind/pkg/cluster"
-	"sigs.k8s.io/kind/pkg/cluster/images"
 	kindexec "sigs.k8s.io/kind/pkg/exec"
 )
 
 // KindManager manages kind cluster operations
 type KindManager struct {
-	provider      *cluster.Provider
+	provider      kindProvider
 	customNetwork string // Custom Docker network name (set during cluster creation)
+
+	run        commandRunner
+	host       hostEnv
+	clients    clusterClients
+	loadImages loadImagesFunc
 }
 
 // NewKindManager creates a new kind cluster manager
 func NewKindManager() *KindManager {
 	return &KindManager{
-		provider: cluster.NewProvider(),
+		provider:   cluster.NewProvider(),
+		run:        execRunner{},
+		host:       realHost(),
+		clients:    realClusterClients(),
+		loadImages: layerAwareLoad,
 	}
 }
 
@@ -92,7 +97,7 @@ func (kind *KindManager) CreateCluster(ctx context.Context, cfg *config.ClusterC
 
 	// Wait for container to exist, then apply cgroup workaround
 	// This prevents Kubernetes 1.34.0+ kubelet failures on cgroup v1 systems
-	time.Sleep(10 * time.Second) // Give kind time to create the container
+	kind.host.sleep(10 * time.Second) // Give kind time to create the container
 
 	if err := kind.ensureKubeletCgroupDirectories(cfg.Name); err != nil {
 		// Log but don't fail - cluster might still work without this
@@ -116,7 +121,7 @@ func (kind *KindManager) CreateCluster(ctx context.Context, cfg *config.ClusterC
 	// kind's CreateWithWaitForReady already waits, but connecting to a new network
 	// might need a moment for routing to stabilize
 	fmt.Printf("Waiting for cluster to fully stabilize...\n")
-	time.Sleep(5 * time.Second)
+	kind.host.sleep(5 * time.Second)
 
 	// Update CA certificates if custom CAs were mounted
 	// This is done after cluster init to avoid interfering with kubeadm init
@@ -125,9 +130,9 @@ func (kind *KindManager) CreateCluster(ctx context.Context, cfg *config.ClusterC
 		// Give a bit more time for all systemd services to be fully up
 		// This ensures update-ca-certificates has all dependencies ready
 		fmt.Printf("Preparing to update CA certificates...\n")
-		time.Sleep(3 * time.Second)
+		kind.host.sleep(3 * time.Second)
 
-		if err := kind.updateCACertificates(cfg.Name); err != nil {
+		if err := kind.updateCACertificates(ctx, cfg.Name); err != nil {
 			// This is a critical error - without CA certificates, application images won't pull
 			return fmt.Errorf("failed to update CA certificates: %w", err)
 		}
@@ -256,7 +261,7 @@ func (kind *KindManager) GetKubeConfigQuiet(clusterName string, internal bool, q
 func (kind *KindManager) shouldPatchKubeconfig() bool {
 	// Check if we're running inside a Docker container
 	// The /.dockerenv file exists in Docker containers
-	if _, err := os.Stat("/.dockerenv"); err == nil {
+	if kind.host.fileExists("/.dockerenv") {
 		return true
 	}
 
@@ -281,8 +286,7 @@ func (kind *KindManager) patchKubeconfigForNativeHost(clusterName, kubeconfig st
 
 	// Get the Docker port mapping for the API server (port 6443)
 	// Docker shows something like: 127.0.0.1:53549->6443/tcp
-	cmd := osexec.Command("docker", "port", containerName, "6443")
-	output, err := cmd.Output()
+	output, err := kind.run.Output(context.Background(), "docker", "port", containerName, "6443")
 	if err != nil {
 		return "", fmt.Errorf("failed to get port mapping for container %s: %w", containerName, err)
 	}
@@ -332,10 +336,8 @@ func (kind *KindManager) patchKubeconfigWithContainerIP(clusterName, kubeconfig 
 	}
 
 	for _, network := range networksToTry {
-		cmd := osexec.Command("docker", "inspect", containerName,
+		output, err := kind.run.Output(context.Background(), "docker", "inspect", containerName,
 			"-f", networkIPTemplate(network))
-
-		output, err := cmd.Output()
 		if err == nil {
 			containerIP := strings.Trim(strings.TrimSpace(string(output)), "\"")
 			if containerIP != "" && containerIP != "<no value>" {
@@ -358,10 +360,8 @@ func (kind *KindManager) patchKubeconfigWithContainerIP(clusterName, kubeconfig 
 	}
 
 	// Fallback: get any available IP
-	cmd := osexec.Command("docker", "inspect", containerName,
+	output, err := kind.run.Output(context.Background(), "docker", "inspect", containerName,
 		"-f", "{{range .NetworkSettings.Networks}}{{.IPAddress}} {{end}}")
-
-	output, err := cmd.Output()
 	if err != nil {
 		return "", fmt.Errorf("failed to get container IP: %w", err)
 	}
@@ -407,11 +407,10 @@ func (kind *KindManager) UpdateKubeconfigFile(clusterName string) error {
 	}
 
 	// Get path to user's kubeconfig
-	kubeconfigPath := clientcmd.RecommendedHomeFile
+	kubeconfigPath := kind.host.kubeconfigPath
 
 	// Load existing kubeconfig or create new one
-	pathOptions := clientcmd.NewDefaultPathOptions()
-	existingConfig, err := pathOptions.GetStartingConfig()
+	existingConfig, err := kind.host.loadKubeconfig()
 	if err != nil {
 		// If no existing config, use the new one
 		existingConfig = config
@@ -438,46 +437,6 @@ func (kind *KindManager) UpdateKubeconfigFile(clusterName string) error {
 	}
 
 	return nil
-}
-
-// WaitForClusterReady waits for the cluster API server to be ready
-func (kind *KindManager) WaitForClusterReady(ctx context.Context, clusterName string, timeout time.Duration) error {
-	fmt.Printf("Waiting for cluster API server to be ready...\n")
-
-	// Get internal kubeconfig (connects directly to container IP)
-	kubeconfigStr, err := kind.GetKubeConfig(clusterName, true)
-	if err != nil {
-		return fmt.Errorf("failed to get kubeconfig: %w", err)
-	}
-
-	// Create clientset
-	config, err := clientcmd.RESTConfigFromKubeConfig([]byte(kubeconfigStr))
-	if err != nil {
-		return fmt.Errorf("failed to create REST config: %w", err)
-	}
-
-	clientset, err := kubernetes.NewForConfig(config)
-	if err != nil {
-		return fmt.Errorf("failed to create clientset: %w", err)
-	}
-
-	// Try to connect with retries
-	deadline := time.Now().Add(timeout)
-	retryInterval := 2 * time.Second
-
-	for time.Now().Before(deadline) {
-		// Try to get server version as a health check
-		_, err := clientset.Discovery().ServerVersion()
-		if err == nil {
-			fmt.Printf("%s Cluster API server is ready\n", color.Checkmark())
-			return nil
-		}
-
-		// Wait before retrying
-		time.Sleep(retryInterval)
-	}
-
-	return fmt.Errorf("cluster API server not ready after %v", timeout)
 }
 
 // parseK8sVersion returns a human-readable Kubernetes version string for display.
@@ -617,22 +576,6 @@ func (kind *KindManager) buildKindConfig(cfg *config.ClusterConfig) (*v1alpha4.C
 	return kindCfg, nil
 }
 
-// PullImage pulls a Docker image from a remote registry
-func (kind *KindManager) PullImage(ctx context.Context, imageName string) error {
-	// Use docker pull command
-	cmd := osexec.CommandContext(ctx, "docker", "pull", imageName)
-
-	// Suppress output unless there's an error
-	var stderr strings.Builder
-	cmd.Stderr = &stderr
-
-	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("failed to pull image: %w\n%s", err, stderr.String())
-	}
-
-	return nil
-}
-
 // LoadImage loads a Docker image into the kind cluster
 func (kind *KindManager) LoadImage(ctx context.Context, clusterName, imageName string) error {
 	// Get cluster nodes
@@ -664,11 +607,9 @@ func (kind *KindManager) LoadImage(ctx context.Context, clusterName, imageName s
 			repoTag := parts[0]
 
 			// Check if this reference exists locally
-			inspectCmd := osexec.Command("docker", "inspect", imageName)
-			if err := inspectCmd.Run(); err == nil {
+			if _, err := kind.run.Output(ctx, "docker", "inspect", imageName); err == nil {
 				// Image exists, tag it with the repo:tag format
-				tagCmd := osexec.Command("docker", "tag", imageName, repoTag)
-				if err := tagCmd.Run(); err == nil {
+				if _, err := kind.run.Output(ctx, "docker", "tag", imageName, repoTag); err == nil {
 					saveImageRef = repoTag
 				}
 			}
@@ -676,13 +617,12 @@ func (kind *KindManager) LoadImage(ctx context.Context, clusterName, imageName s
 	}
 
 	// Use docker save to export the image
-	saveCmd := osexec.Command("docker", "save", "-o", imageTar, saveImageRef)
-	if err := saveCmd.Run(); err != nil {
+	if _, err := kind.run.Output(ctx, "docker", "save", "-o", imageTar, saveImageRef); err != nil {
 		return fmt.Errorf("failed to save image '%s': %w (make sure the image exists locally)", imageName, err)
 	}
 
 	// Load the image onto all nodes using layer-aware transfer
-	results, err := images.LoadImageLayerAware(imageTar, nodes, nil)
+	results, err := kind.loadImages(imageTar, nodes)
 	if err != nil {
 		return fmt.Errorf("failed to load image '%s': %w", imageName, err)
 	}
@@ -718,9 +658,8 @@ func (kind *KindManager) UntagImage(ctx context.Context, clusterName, imageName 
 	// Use ctr (containerd CLI) to remove the tag reference
 	// This removes the tag but leaves the actual image data if it's in use
 	// Using ctr instead of crictl because ctr has more granular control
-	cmd := osexec.CommandContext(ctx, "docker", "exec", containerName,
+	output, err := kind.run.CombinedOutput(ctx, "", "docker", "exec", containerName,
 		"ctr", "-n", "k8s.io", "images", "rm", clusterImageName)
-	output, err := cmd.CombinedOutput()
 
 	if err != nil {
 		outputStr := string(output)
@@ -749,24 +688,21 @@ func (kind *KindManager) ensureKubeletCgroupDirectories(clusterName string) erro
 
 		// First check if we're using cgroup v1 or v2
 		// Only cgroup v1 needs this workaround
-		checkCmd := osexec.Command("docker", "exec", containerName, "test", "-d", "/sys/fs/cgroup/systemd")
-		if err := checkCmd.Run(); err != nil {
+		if _, err := kind.run.Output(context.Background(), "docker", "exec", containerName, "test", "-d", "/sys/fs/cgroup/systemd"); err != nil {
 			// Not cgroup v1 (likely v2), skip this workaround
 			continue
 		}
 
 		// Check if the directory already exists
 		cgroupPath := "/sys/fs/cgroup/systemd/kubelet.slice/kubelet-kubepods.slice"
-		testCmd := osexec.Command("docker", "exec", containerName, "test", "-d", cgroupPath)
-		if err := testCmd.Run(); err == nil {
+		if _, err := kind.run.Output(context.Background(), "docker", "exec", containerName, "test", "-d", cgroupPath); err == nil {
 			// Directory already exists, no need to create it
 			continue
 		}
 
 		// Create the kubelet cgroup directory structure
 		// This prevents: "Failed to start ContainerManager: cgroup [...] has some missing paths"
-		mkdirCmd := osexec.Command("docker", "exec", containerName, "mkdir", "-p", cgroupPath)
-		if output, err := mkdirCmd.CombinedOutput(); err != nil {
+		if output, err := kind.run.CombinedOutput(context.Background(), "", "docker", "exec", containerName, "mkdir", "-p", cgroupPath); err != nil {
 			// This is a workaround, so we return error but don't fail hard
 			return fmt.Errorf("failed to create kubelet cgroup directory %s in node %s: %w\nOutput: %s",
 				cgroupPath, containerName, err, string(output))
@@ -776,10 +712,14 @@ func (kind *KindManager) ensureKubeletCgroupDirectories(clusterName string) erro
 	return nil
 }
 
+// caUpdateTimeout bounds update-ca-certificates in a node, which takes well
+// under a second; a variable so tests run fast
+var caUpdateTimeout = 30 * time.Second
+
 // updateCACertificates runs update-ca-certificates in all nodes
 // This updates the system CA trust store with custom certificates mounted via extraMounts
 // Note: We don't reload containerd - CAs will be automatically used on next image pull
-func (kind *KindManager) updateCACertificates(clusterName string) error {
+func (kind *KindManager) updateCACertificates(ctx context.Context, clusterName string) error {
 	fmt.Printf("Updating CA certificates in cluster nodes...\n")
 
 	// Get cluster nodes
@@ -792,16 +732,17 @@ func (kind *KindManager) updateCACertificates(clusterName string) error {
 	for _, node := range nodes {
 		containerName := node.String()
 
-		// Use timeout to prevent hanging - update-ca-certificates should complete in seconds
-		// We use 30 seconds to be safe, but it typically completes in <1 second
-		cmd := osexec.Command("timeout", "30", "docker", "exec", containerName, "update-ca-certificates")
-		output, err := cmd.CombinedOutput()
+		// A timeout prevents hanging: update-ca-certificates completes in seconds.
+		// (The timeout(1) command this used isn't on macOS.)
+		nodeCtx, cancel := context.WithTimeout(ctx, caUpdateTimeout)
+		output, err := kind.run.CombinedOutput(nodeCtx, "", "docker", "exec", containerName, "update-ca-certificates")
+		timedOut := nodeCtx.Err() == context.DeadlineExceeded
+		cancel()
 
 		if err != nil {
-			// Check if it was a timeout
-			if exitErr, ok := err.(*osexec.ExitError); ok && exitErr.ExitCode() == 124 {
-				return fmt.Errorf("update-ca-certificates timed out after 30 seconds in node %s\nOutput: %s",
-					containerName, string(output))
+			if timedOut {
+				return fmt.Errorf("update-ca-certificates timed out after %v in node %s\nOutput: %s",
+					caUpdateTimeout, containerName, string(output))
 			}
 			return fmt.Errorf("failed to update CA certificates in node %s: %w\nOutput: %s",
 				containerName, err, string(output))
@@ -832,7 +773,7 @@ func (kind *KindManager) configureInsecureRegistries(clusterName string, registr
 
 		// Point containerd at certs.d (v2 registry format) before writing the
 		// hosts.toml files
-		if err := runInNode(containerName, appendRegistryConfigScript, containerdConfigPath, containerdRegistryConfigPatch); err != nil {
+		if err := kind.runInNode(containerName, appendRegistryConfigScript, containerdConfigPath, containerdRegistryConfigPatch); err != nil {
 			return fmt.Errorf("failed to patch containerd config in node %s: %w", containerName, err)
 		}
 
@@ -841,12 +782,12 @@ func (kind *KindManager) configureInsecureRegistries(clusterName string, registr
 			if err != nil {
 				return err
 			}
-			if err := writeNodeFile(containerName, dir+"/hosts.toml", hostsTOML); err != nil {
+			if err := kind.writeNodeFile(containerName, dir+"/hosts.toml", hostsTOML); err != nil {
 				return fmt.Errorf("failed to write hosts.toml for %s in node %s: %w", registry, containerName, err)
 			}
 		}
 
-		if err := restartContainerd(containerName); err != nil {
+		if err := kind.restartContainerd(containerName); err != nil {
 			return err
 		}
 	}
@@ -875,17 +816,17 @@ func (kind *KindManager) configureProxy(clusterName, httpProxy, httpsProxy, noPr
 	for _, node := range nodes {
 		containerName := node.String()
 
-		if err := writeNodeFile(containerName, containerdProxyConf, containerdProxyDropIn(httpProxy, httpsProxy, noProxy)); err != nil {
+		if err := kind.writeNodeFile(containerName, containerdProxyConf, containerdProxyDropIn(httpProxy, httpsProxy, noProxy)); err != nil {
 			return fmt.Errorf("failed to write proxy config in node %s: %w", containerName, err)
 		}
 
 		// A unit's Environment= applies when the process starts, so containerd
 		// (which pulls images) must restart. Running containers are kept: their
 		// shims don't depend on the containerd process.
-		if err := runInNode(containerName, "systemctl daemon-reload", "", ""); err != nil {
+		if err := kind.runInNode(containerName, "systemctl daemon-reload", "", ""); err != nil {
 			return fmt.Errorf("failed to reload systemd in node %s: %w", containerName, err)
 		}
-		if err := restartContainerd(containerName); err != nil {
+		if err := kind.restartContainerd(containerName); err != nil {
 			return err
 		}
 	}
@@ -934,7 +875,7 @@ func (kind *KindManager) buildNvidiaGPUMounts(cfg *config.ClusterConfig) []v1alp
 	}
 	var mounts []v1alpha4.Mount
 	for _, bin := range []string{"nvidia-container-runtime", "nvidia-ctk"} {
-		binPath, err := osexec.LookPath(bin)
+		binPath, err := kind.host.lookPath(bin)
 		if err == nil && binPath != "" {
 			mounts = append(mounts, v1alpha4.Mount{
 				HostPath:      binPath,
@@ -966,7 +907,7 @@ func (kind *KindManager) buildAMDGPUMounts(cfg *config.ClusterConfig) []v1alpha4
 	}}
 	for i := 0; ; i++ {
 		device := fmt.Sprintf("/dev/dri/renderD%d", 128+i)
-		if _, err := os.Stat(device); err != nil {
+		if !kind.host.fileExists(device) {
 			break
 		}
 		mounts = append(mounts, v1alpha4.Mount{
@@ -986,7 +927,7 @@ func (kind *KindManager) buildAMDGPUMounts(cfg *config.ClusterConfig) []v1alpha4
 // - Registry certificates with non-standard serial numbers
 func (kind *KindManager) buildGODEBUGMount(clusterName string) (v1alpha4.Mount, error) {
 	// Create a cluster-specific directory in ~/.kraze/clusters/<cluster-name>/
-	homeDir, err := os.UserHomeDir()
+	homeDir, err := kind.host.homeDir()
 	if err != nil {
 		return v1alpha4.Mount{}, fmt.Errorf("failed to get user home directory: %w", err)
 	}
@@ -1075,7 +1016,7 @@ func (kind *KindManager) validateNvidiaGPUPrerequisites() error {
 	// containerd's nvidia OCI runtime handler; nvidia-ctk is called by it as an OCI
 	// hook to inject GPU devices and libraries into containers.
 	for _, bin := range []string{"nvidia-container-runtime", "nvidia-ctk"} {
-		if _, err := osexec.LookPath(bin); err != nil {
+		if _, err := kind.host.lookPath(bin); err != nil {
 			return fmt.Errorf(
 				"%s not found in PATH — is nvidia-container-toolkit installed?\n"+
 					"Install from: https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/install-guide.html",
@@ -1098,14 +1039,14 @@ Ensure the ROCm stack and AMDGPU kernel driver are installed on the host:
 After installation, verify:
   ls -la /dev/kfd /dev/dri/renderD128`
 
-	if _, err := os.Stat("/dev/kfd"); err != nil {
+	if _, err := kind.host.stat("/dev/kfd"); err != nil {
 		if os.IsNotExist(err) {
 			return fmt.Errorf("/dev/kfd not found — is the ROCm/AMDGPU driver loaded?%s", prereqHelp)
 		}
 		return fmt.Errorf("failed to stat /dev/kfd: %w", err)
 	}
 
-	if _, err := os.Stat("/dev/dri/renderD128"); err != nil {
+	if _, err := kind.host.stat("/dev/dri/renderD128"); err != nil {
 		if os.IsNotExist(err) {
 			return fmt.Errorf("/dev/dri/renderD128 not found — no AMD GPUs detected%s", prereqHelp)
 		}
@@ -1131,7 +1072,7 @@ func (kind *KindManager) registerNvidiaRuntimeClass(ctx context.Context, cluster
 	restConfig.Insecure = true
 	restConfig.CAData = nil
 
-	dynClient, err := dynamic.NewForConfig(restConfig)
+	dynClient, err := kind.clients.dynamic(restConfig)
 	if err != nil {
 		return fmt.Errorf("failed to create dynamic client: %w", err)
 	}
@@ -1190,7 +1131,7 @@ func (kind *KindManager) buildContainerdConfigPatches(cfg *config.ClusterConfig)
 	if cfg.GPU.IsNvidiaEnabled() {
 		// nvidia-container-runtime is validated and mounted into the kind node by
 		// buildNvidiaGPUMounts(). Use LookPath result directly — no fallback needed.
-		nvidiaRuntimePath, _ := osexec.LookPath("nvidia-container-runtime")
+		nvidiaRuntimePath, _ := kind.host.lookPath("nvidia-container-runtime")
 		patches = append(patches, fmt.Sprintf(`[plugins."io.containerd.grpc.v1.cri".containerd.runtimes.nvidia]
   runtime_type = "io.containerd.runc.v2"
   [plugins."io.containerd.grpc.v1.cri".containerd.runtimes.nvidia.options]
@@ -1353,22 +1294,18 @@ func (kind *KindManager) connectToHostNetwork(clusterName string, networkName st
 
 	for _, network := range networksToTry {
 		// Check if network exists
-		checkCmd := osexec.Command("docker", "network", "inspect", network)
-		if err := checkCmd.Run(); err != nil {
+		if _, err := kind.run.Output(context.Background(), "docker", "network", "inspect", network); err != nil {
 			continue
 		}
 
-		// Try to connect to this network
-		var connectCmd *osexec.Cmd
+		// Try to connect to this network, with the static IP if one is set
+		connectArgs := []string{"network", "connect"}
 		if ipv4Address != "" {
-			// Connect with static IP
-			connectCmd = osexec.Command("docker", "network", "connect", "--ip", ipv4Address, network, containerName)
-		} else {
-			// Connect with dynamic IP
-			connectCmd = osexec.Command("docker", "network", "connect", network, containerName)
+			connectArgs = append(connectArgs, "--ip", ipv4Address)
 		}
+		connectArgs = append(connectArgs, network, containerName)
 
-		if err := connectCmd.Run(); err != nil {
+		if _, err := kind.run.Output(context.Background(), "docker", connectArgs...); err != nil {
 			// Might already be connected or other error, try next network
 			continue
 		}
@@ -1400,8 +1337,8 @@ func (kind *KindManager) connectToHostNetwork(clusterName string, networkName st
 // rather than through the kind-internal network, which may have no NAT.
 func (kind *KindManager) fixDefaultRouteForCluster(clusterName, networkName string) error {
 	// Get the gateway IP for this network
-	out, err := osexec.Command("docker", "network", "inspect", networkName,
-		"--format", "{{range .IPAM.Config}}{{.Gateway}}{{end}}").Output()
+	out, err := kind.run.Output(context.Background(), "docker", "network", "inspect", networkName,
+		"--format", "{{range .IPAM.Config}}{{.Gateway}}{{end}}")
 	if err != nil {
 		return fmt.Errorf("inspect network %s: %w", networkName, err)
 	}
@@ -1411,7 +1348,7 @@ func (kind *KindManager) fixDefaultRouteForCluster(clusterName, networkName stri
 	}
 
 	// Get all nodes in this cluster
-	nodesOut, err := osexec.Command("kind", "get", "nodes", "--name", clusterName).Output()
+	nodesOut, err := kind.run.Output(context.Background(), "kind", "get", "nodes", "--name", clusterName)
 	if err != nil {
 		// Fall back to just the control-plane
 		nodesOut = []byte(clusterName + "-control-plane")
@@ -1419,8 +1356,8 @@ func (kind *KindManager) fixDefaultRouteForCluster(clusterName, networkName stri
 	nodes := strings.Fields(string(nodesOut))
 
 	for _, node := range nodes {
-		routeOut, err := osexec.Command("docker", "exec", node,
-			"ip", "route", "replace", "default", "via", gateway).CombinedOutput()
+		routeOut, err := kind.run.CombinedOutput(context.Background(), "", "docker", "exec", node,
+			"ip", "route", "replace", "default", "via", gateway)
 		if err != nil {
 			fmt.Printf("Warning: Could not update default route in node '%s': %v: %s\n", node, err, routeOut)
 		} else {
@@ -1433,8 +1370,7 @@ func (kind *KindManager) fixDefaultRouteForCluster(clusterName, networkName stri
 
 func (kind *KindManager) ensureNetworkExists(networkName string, subnet string) error {
 	// Check if network already exists
-	checkCmd := osexec.Command("docker", "network", "inspect", networkName)
-	if err := checkCmd.Run(); err == nil {
+	if _, err := kind.run.Output(context.Background(), "docker", "network", "inspect", networkName); err == nil {
 		// Network exists
 		return nil
 	}
@@ -1448,12 +1384,10 @@ func (kind *KindManager) ensureNetworkExists(networkName string, subnet string) 
 	fmt.Printf("Creating Docker network '%s' with subnet %s...\n", networkName, subnet)
 
 	// Create the network with subnet
-	createCmd := osexec.Command("docker", "network", "create",
+	if output, err := kind.run.CombinedOutput(context.Background(), "", "docker", "network", "create",
 		"--driver", "bridge",
 		"--subnet", subnet,
-		networkName)
-
-	if output, err := createCmd.CombinedOutput(); err != nil {
+		networkName); err != nil {
 		return fmt.Errorf("failed to create network: %w\nOutput: %s", err, string(output))
 	}
 
@@ -1483,12 +1417,12 @@ func (kind *KindManager) detectNetworks() []string {
 // isRunningInContainer checks if we're running inside a Docker container
 func (kind *KindManager) isRunningInContainer() bool {
 	// Method 1: Check for /.dockerenv file
-	if _, err := os.Stat("/.dockerenv"); err == nil {
+	if kind.host.fileExists("/.dockerenv") {
 		return true
 	}
 
 	// Method 2: Check /proc/self/cgroup for docker/containerd
-	data, err := os.ReadFile("/proc/self/cgroup")
+	data, err := kind.host.readFile("/proc/self/cgroup")
 	if err == nil {
 		content := string(data)
 		if strings.Contains(content, "/docker/") ||
@@ -1504,16 +1438,14 @@ func (kind *KindManager) isRunningInContainer() bool {
 // getCurrentContainerNetworks returns the networks of the current container
 func (kind *KindManager) getCurrentContainerNetworks() []string {
 	// Get the hostname (often the container ID or name)
-	hostname, err := os.Hostname()
+	hostname, err := kind.host.hostname()
 	if err != nil {
 		return nil
 	}
 
 	// Try to inspect this container by hostname
-	cmd := osexec.Command("docker", "inspect", hostname,
+	output, err := kind.run.Output(context.Background(), "docker", "inspect", hostname,
 		"-f", "{{range $net, $config := .NetworkSettings.Networks}}{{$net}} {{end}}")
-
-	output, err := cmd.Output()
 	if err != nil {
 		return nil
 	}
@@ -1561,7 +1493,7 @@ func (kind *KindManager) GetKubeconfigForExternalCluster(cfg *config.ClusterConf
 	kubeconfigPath := cfg.External.Kubeconfig
 	if kubeconfigPath == "" {
 		// Use default kubeconfig location
-		home, err := os.UserHomeDir()
+		home, err := kind.host.homeDir()
 		if err != nil {
 			return "", fmt.Errorf("failed to get user home directory: %w", err)
 		}
@@ -1569,7 +1501,7 @@ func (kind *KindManager) GetKubeconfigForExternalCluster(cfg *config.ClusterConf
 	} else {
 		// Expand ~ if present
 		if strings.HasPrefix(kubeconfigPath, "~/") {
-			home, err := os.UserHomeDir()
+			home, err := kind.host.homeDir()
 			if err != nil {
 				return "", fmt.Errorf("failed to get user home directory: %w", err)
 			}
@@ -1578,12 +1510,12 @@ func (kind *KindManager) GetKubeconfigForExternalCluster(cfg *config.ClusterConf
 	}
 
 	// Verify kubeconfig file exists
-	if _, err := os.Stat(kubeconfigPath); err != nil {
+	if _, err := kind.host.stat(kubeconfigPath); err != nil {
 		return "", fmt.Errorf("kubeconfig file not found: %s", kubeconfigPath)
 	}
 
 	// Read the kubeconfig file content
-	content, err := os.ReadFile(kubeconfigPath)
+	content, err := kind.host.readFile(kubeconfigPath)
 	if err != nil {
 		return "", fmt.Errorf("failed to read kubeconfig file: %w", err)
 	}
@@ -1606,7 +1538,7 @@ func (kind *KindManager) VerifyClusterAccess(ctx context.Context, kubeconfigCont
 	}
 
 	// Create Kubernetes client
-	clientset, err := kubernetes.NewForConfig(restConfig)
+	clientset, err := kind.clients.clientset(restConfig)
 	if err != nil {
 		return fmt.Errorf("failed to create Kubernetes client: %w", err)
 	}

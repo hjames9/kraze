@@ -39,11 +39,26 @@ jobs:
       - name: Vet
         run: go vet ./...
 
+      # Built with this job's Go, at the version the Makefile pins: a linter
+      # built against an older x/tools can't read the toolchain's export data
+      - name: Lint
+        run: |
+          make lint-install
+          make lint
+
       - name: Build
         run: go build ./...
 
+      # The race detector covers up's parallel installs; it needs cgo, which
+      # only the test binaries use (release builds stay CGO_ENABLED=0)
       - name: Test
-        run: go test ./...
+        run: go test -race -covermode=atomic -coverprofile=coverage.out ./...
+
+      # Per-package coverage is in the test output above
+      - name: Coverage
+        run: |
+          echo "Total coverage: $(go tool cover -func=coverage.out | awk '/^total:/ { print $3 }')" >> "$GITHUB_STEP_SUMMARY"
+          scripts/coverage-floor.sh coverage.out
 
       - name: Validate examples
         run: make validate-examples

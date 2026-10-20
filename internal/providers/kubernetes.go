@@ -16,27 +16,6 @@ import (
 	"k8s.io/client-go/transport/spdy"
 )
 
-// GetClientsetFromKubeconfig creates a Kubernetes clientset from a kubeconfig file path
-func GetClientsetFromKubeconfig(kubeconfigPath string) (kubernetes.Interface, error) {
-	if kubeconfigPath == "" {
-		return nil, fmt.Errorf("kubeconfig path is empty")
-	}
-
-	// Load kubeconfig from file
-	config, err := clientcmd.BuildConfigFromFlags("", kubeconfigPath)
-	if err != nil {
-		return nil, fmt.Errorf("failed to build config from kubeconfig: %w", err)
-	}
-
-	// Create clientset
-	clientset, err := kubernetes.NewForConfig(config)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create clientset: %w", err)
-	}
-
-	return clientset, nil
-}
-
 // GetClientsetFromKubeconfigContent creates a Kubernetes clientset from kubeconfig content (YAML string)
 // skipTLSVerify should only be set to true for local kind clusters where IPs may be patched for custom networks.
 // For external clusters (Docker Desktop, Minikube, etc.) this should be false to maintain proper TLS verification.
@@ -78,16 +57,14 @@ func GetClientsetFromKubeconfigContent(kubeconfigContent string, skipTLSVerify b
 // For Helm services: uses helm release labels
 // For manifest services: uses user-specified labels or service name
 func GetPodsForService(ctx context.Context, kubeconfig string, service *config.ServiceConfig) ([]string, error) {
-	restConfig, err := getRESTConfigFromKubeconfig(kubeconfig)
+	clientset, err := clientsetFromKubeconfig(kubeconfig)
 	if err != nil {
 		return nil, err
 	}
+	return podsForService(ctx, clientset, service)
+}
 
-	clientset, err := kubernetes.NewForConfig(restConfig)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create clientset: %w", err)
-	}
-
+func podsForService(ctx context.Context, clientset kubernetes.Interface, service *config.ServiceConfig) ([]string, error) {
 	namespace := service.GetNamespace()
 
 	// Build label selector based on service type

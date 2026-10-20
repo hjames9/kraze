@@ -2,15 +2,10 @@ package cli
 
 import (
 	"fmt"
-	"strings"
 	"time"
 
-	"github.com/hjames9/kraze/internal/cluster"
 	"github.com/hjames9/kraze/internal/color"
-	"github.com/hjames9/kraze/internal/config"
 	"github.com/hjames9/kraze/internal/history"
-	"github.com/hjames9/kraze/internal/providers"
-	"github.com/hjames9/kraze/internal/state"
 	"github.com/spf13/cobra"
 )
 
@@ -27,177 +22,156 @@ For kind clusters (default):
 For external clusters (cluster.external.enabled: true):
   - Verify the cluster is accessible
   - Initialize the state file`,
-	RunE: func(cmd *cobra.Command, args []string) (retErr error) {
-		ctx := cmd.Context()
+	RunE: runInit,
+}
 
-		cfgPaths, cleanupPack, err := resolveAndExtractConfigFiles(cmd)
+func runInit(cmd *cobra.Command, args []string) (retErr error) {
+	ctx := cmd.Context()
+
+	loaded, cleanupPack, err := loadConfig(cmd, "Initializing cluster from config file(s): %s")
+	if err != nil {
+		return err
+	}
+	defer cleanupPack()
+	cfg := loaded.cfg
+	Verbose("Configuration parsed successfully")
+
+	isExternal := cfg.Cluster.IsExternal()
+	kindMgr := deps.newClusterManager()
+
+	if isExternal {
+		// External cluster mode
+		fmt.Printf("Using external cluster '%s'\n", cfg.Cluster.Name)
+		Verbose("External cluster mode - skipping cluster creation")
+
+		if dryRun {
+			fmt.Printf("[DRY RUN] Would verify external cluster '%s' is accessible\n", cfg.Cluster.Name)
+			return nil
+		}
+
+		// Verify cluster is accessible
+		kubeconfig, err := kindMgr.GetKubeconfigForExternalCluster(&cfg.Cluster)
 		if err != nil {
+			return fmt.Errorf("failed to get kubeconfig for external cluster: %w", err)
+		}
+
+		// Test cluster connectivity
+		Verbose("Verifying cluster connectivity...")
+		if err := kindMgr.VerifyClusterAccess(ctx, kubeconfig); err != nil {
+			return fmt.Errorf("failed to access external cluster '%s': %w", cfg.Cluster.Name, err)
+		}
+
+		fmt.Printf("%s External cluster is accessible\n", color.Checkmark())
+	} else {
+		// Kind cluster mode (default)
+		Verbose("Creating kind cluster...")
+
+		// Check Docker availability
+		Verbose("Checking Docker availability...")
+		if err := deps.checkDocker(ctx); err != nil {
 			return err
 		}
-		defer cleanupPack()
-		Verbose("Initializing cluster from config file(s): %s", strings.Join(cfgPaths, ", "))
+		Verbose("Docker is available")
 
-		// Parse config file
-		Verbose("Parsing configuration...")
-		cfg, err := config.ParseMultiple(cfgPaths)
-		if err != nil {
-			return fmt.Errorf("failed to parse config: %w", err)
+		if dryRun {
+			fmt.Printf("[DRY RUN] Would create kind cluster '%s'\n", cfg.Cluster.Name)
+			if cfg.Cluster.Version != "" {
+				fmt.Printf("  Kubernetes version: %s\n", cfg.Cluster.Version)
+			}
+			if cfg.Cluster.NodeImage != "" {
+				fmt.Printf("  Node image: %s\n", cfg.Cluster.NodeImage)
+			} else if cfg.Cluster.Version != "" {
+				fmt.Printf("  Node image: kindest/node:v%s\n", cfg.Cluster.Version)
+			}
+			fmt.Printf("  Nodes: %d\n", len(cfg.Cluster.Config))
+			return nil
 		}
-		Verbose("Configuration parsed successfully")
 
-		isExternal := cfg.Cluster.IsExternal()
-		kindMgr := cluster.NewKindManager()
+		// Create kind cluster
+		if err := kindMgr.CreateCluster(ctx, &cfg.Cluster); err != nil {
+			return fmt.Errorf("failed to create cluster: %w", err)
+		}
 
-		if isExternal {
-			// External cluster mode
-			fmt.Printf("Using external cluster '%s'\n", cfg.Cluster.Name)
-			Verbose("External cluster mode - skipping cluster creation")
-
-			if dryRun {
-				fmt.Printf("[DRY RUN] Would verify external cluster '%s' is accessible\n", cfg.Cluster.Name)
-				return nil
-			}
-
-			// Verify cluster is accessible
-			kubeconfig, err := kindMgr.GetKubeconfigForExternalCluster(&cfg.Cluster)
-			if err != nil {
-				return fmt.Errorf("failed to get kubeconfig for external cluster: %w", err)
-			}
-
-			// Test cluster connectivity
-			Verbose("Verifying cluster connectivity...")
-			if err := kindMgr.VerifyClusterAccess(ctx, kubeconfig); err != nil {
-				return fmt.Errorf("failed to access external cluster '%s': %w", cfg.Cluster.Name, err)
-			}
-
-			fmt.Printf("%s External cluster is accessible\n", color.Checkmark())
+		// Update ~/.kube/config with cluster access (Use container IP in case you're accessing control plane from another container)
+		fmt.Printf("\nUpdating kubeconfig...\n")
+		if err := kindMgr.UpdateKubeconfigFile(cfg.Cluster.Name); err != nil {
+			fmt.Printf("Warning: failed to update kubeconfig: %v\n", err)
+			fmt.Printf("You may need to manually run: kind export kubeconfig --name %s\n", cfg.Cluster.Name)
 		} else {
-			// Kind cluster mode (default)
-			Verbose("Creating kind cluster...")
+			fmt.Printf("%s Kubeconfig updated (context: kind-%s)\n", color.Checkmark(), cfg.Cluster.Name)
+		}
+	}
 
-			// Check Docker availability
-			Verbose("Checking Docker availability...")
-			if err := cluster.CheckDockerAvailable(ctx); err != nil {
-				return err
-			}
-			Verbose("Docker is available")
+	// Preload images if specified. Results are recorded in the history once the
+	// cluster client exists below.
+	type preloadResult struct {
+		image    string
+		duration time.Duration
+		err      error
+	}
+	var preloaded []preloadResult
+	if len(cfg.Cluster.PreloadImages) > 0 {
+		fmt.Printf("\nPreloading %d image(s) into cluster...\n", len(cfg.Cluster.PreloadImages))
 
-			if dryRun {
-				fmt.Printf("[DRY RUN] Would create kind cluster '%s'\n", cfg.Cluster.Name)
-				if cfg.Cluster.Version != "" {
-					fmt.Printf("  Kubernetes version: %s\n", cfg.Cluster.Version)
-				}
-				if cfg.Cluster.NodeImage != "" {
-					fmt.Printf("  Node image: %s\n", cfg.Cluster.NodeImage)
-				} else if cfg.Cluster.Version != "" {
-					fmt.Printf("  Node image: kindest/node:v%s\n", cfg.Cluster.Version)
-				}
-				fmt.Printf("  Nodes: %d\n", len(cfg.Cluster.Config))
-				return nil
-			}
+		for itr, image := range cfg.Cluster.PreloadImages {
+			fmt.Printf("[%d/%d] Loading image '%s'...\n", itr+1, len(cfg.Cluster.PreloadImages), image)
 
-			// Create kind cluster
-			if err := kindMgr.CreateCluster(ctx, &cfg.Cluster); err != nil {
-				return fmt.Errorf("failed to create cluster: %w", err)
-			}
-
-			// Update ~/.kube/config with cluster access (Use container IP in case you're accessing control plane from another container)
-			fmt.Printf("\nUpdating kubeconfig...\n")
-			if err := kindMgr.UpdateKubeconfigFile(cfg.Cluster.Name); err != nil {
-				fmt.Printf("Warning: failed to update kubeconfig: %v\n", err)
-				fmt.Printf("You may need to manually run: kind export kubeconfig --name %s\n", cfg.Cluster.Name)
+			start := time.Now()
+			err := kindMgr.LoadImage(ctx, cfg.Cluster.Name, image)
+			preloaded = append(preloaded, preloadResult{image, time.Since(start), err})
+			if err != nil {
+				// Don't fail cluster creation if image loading fails
+				fmt.Printf("Warning: failed to load image '%s': %v\n", image, err)
+				fmt.Printf("  You can load it later with: kraze load-image %s\n", image)
 			} else {
-				fmt.Printf("%s Kubeconfig updated (context: kind-%s)\n", color.Checkmark(), cfg.Cluster.Name)
+				fmt.Printf("%s Image '%s' loaded successfully\n", color.Checkmark(), image)
 			}
 		}
 
-		// Preload images if specified. Results are recorded in the history once the
-		// cluster client exists below.
-		type preloadResult struct {
-			image    string
-			duration time.Duration
-			err      error
-		}
-		var preloaded []preloadResult
-		if len(cfg.Cluster.PreloadImages) > 0 {
-			fmt.Printf("\nPreloading %d image(s) into cluster...\n", len(cfg.Cluster.PreloadImages))
+		fmt.Printf("\n%s Images preloaded successfully\n", color.Checkmark())
+	}
 
-			for itr, image := range cfg.Cluster.PreloadImages {
-				fmt.Printf("[%d/%d] Loading image '%s'...\n", itr+1, len(cfg.Cluster.PreloadImages), image)
+	// Initialize cluster state
+	Verbose("Initializing cluster state...")
 
-				start := time.Now()
-				err := kindMgr.LoadImage(ctx, cfg.Cluster.Name, image)
-				preloaded = append(preloaded, preloadResult{image, time.Since(start), err})
-				if err != nil {
-					// Don't fail cluster creation if image loading fails
-					fmt.Printf("Warning: failed to load image '%s': %v\n", image, err)
-					fmt.Printf("  You can load it later with: kraze load-image %s\n", image)
-				} else {
-					fmt.Printf("%s Image '%s' loaded successfully\n", color.Checkmark(), image)
-				}
-			}
+	// Get kubeconfig content (not file path)
+	kubeconfig, err := clusterKubeconfig(kindMgr, cfg)
+	if err != nil {
+		return err
+	}
+	clientset, err := clusterClient(cfg, kubeconfig)
+	if err != nil {
+		return fmt.Errorf("failed to create Kubernetes client: %w", err)
+	}
 
-			fmt.Printf("\n%s Images preloaded successfully\n", color.Checkmark())
-		}
+	rec := beginHistory(ctx, clientset, cfg.Project, "init", !isExternal)
+	defer func() { finishHistory(rec, retErr) }()
+	for _, p := range preloaded {
+		rec.RecordChange(p.image, history.ActionLoadImage, p.duration, p.err)
+	}
 
-		// Initialize cluster state
-		Verbose("Initializing cluster state...")
+	// Load the cluster state, creating it if needed. An external cluster may
+	// already hold other projects' state, which must not be overwritten.
+	st, _, err := loadClusterState(ctx, clientset, cfg, stateRequired)
+	if err != nil {
+		return err
+	}
+	adoptProject(st, cfg, configuredServices(cfg), false)
+	if !isExternal {
+		st.SetClusterConfig(clusterConfigHash(cfg.Cluster), cfg.Project)
+	}
+	// The paths given (an archive, not its extracted contents), as up stores them
+	st.SetConfigPaths(loaded.original)
+	if err := st.Save(ctx, clientset); err != nil {
+		return fmt.Errorf("failed to save cluster state: %w", err)
+	}
+	Verbose("Cluster state ConfigMap created in kube-system namespace")
 
-		// Get kubeconfig content (not file path)
-		var kubeconfig string
-		if isExternal {
-			kubeconfig, err = kindMgr.GetKubeconfigForExternalCluster(&cfg.Cluster)
-			if err != nil {
-				return fmt.Errorf("failed to get kubeconfig for external cluster: %w", err)
-			}
-		} else {
-			kubeconfig, err = kindMgr.GetKubeConfig(cfg.Cluster.Name, false)
-			if err != nil {
-				return fmt.Errorf("failed to get kubeconfig: %w", err)
-			}
-		}
-
-		// Create Kubernetes clientset from kubeconfig content
-		// Only skip TLS verification for kind clusters (not external clusters)
-		clientset, err := providers.GetClientsetFromKubeconfigContent(kubeconfig, !isExternal)
-		if err != nil {
-			return fmt.Errorf("failed to create Kubernetes client: %w", err)
-		}
-
-		rec := beginHistory(ctx, clientset, cfg.Project, "init", !isExternal)
-		defer func() { finishHistory(rec, retErr) }()
-		for _, p := range preloaded {
-			rec.RecordChange(p.image, history.ActionLoadImage, p.duration, p.err)
-		}
-
-		// Load the cluster state, creating it if needed. An external cluster may
-		// already hold other projects' state, which must not be overwritten.
-		st, err := state.Load(ctx, clientset, cfg.Cluster.Name)
-		if err != nil {
-			return fmt.Errorf("failed to load cluster state: %w", err)
-		}
-		if st == nil {
-			nvidiaEnabled := cfg.Cluster.GPU.IsNvidiaEnabled()
-			amdEnabled := cfg.Cluster.GPU.IsAMDEnabled()
-			st = state.New(cfg.Cluster.Name, isExternal, nvidiaEnabled, 0, amdEnabled, 0)
-		}
-		st.SetProject(cfg.Project)
-		checkProjectAccess(st, cfg, configuredServices(cfg))
-		if !isExternal {
-			st.SetClusterConfig(clusterConfigHash(cfg.Cluster), cfg.Project)
-		}
-		st.SetConfigPaths(cfgPaths)
-		if err := st.Save(ctx, clientset); err != nil {
-			return fmt.Errorf("failed to save cluster state: %w", err)
-		}
-		Verbose("Cluster state ConfigMap created in kube-system namespace")
-
-		if isExternal {
-			fmt.Printf("\n%s External cluster initialized successfully\n", color.Checkmark())
-		} else {
-			fmt.Printf("\n%s Cluster initialized successfully\n", color.Checkmark())
-		}
-		fmt.Printf("\nTo start services, run: kraze up\n")
-		return nil
-	},
+	if isExternal {
+		fmt.Printf("\n%s External cluster initialized successfully\n", color.Checkmark())
+	} else {
+		fmt.Printf("\n%s Cluster initialized successfully\n", color.Checkmark())
+	}
+	fmt.Printf("\nTo start services, run: kraze up\n")
+	return nil
 }

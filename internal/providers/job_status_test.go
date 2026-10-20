@@ -76,7 +76,7 @@ func jobProvider(opts *ProviderOptions, objs ...runtime.Object) *ManifestsProvid
 	mapper := meta.NewDefaultRESTMapper(nil)
 	mapper.Add(schema.GroupVersionKind{Version: "v1", Kind: "ConfigMap"}, meta.RESTScopeNamespace)
 	mapper.Add(schema.GroupVersionKind{Group: "batch", Version: "v1", Kind: "Job"}, meta.RESTScopeNamespace)
-	return &ManifestsProvider{opts: opts, dynamicClient: dyn, clientset: fake.NewSimpleClientset(), mapper: mapper}
+	return newManifestsProviderWithClients(opts, &kubeClients{dynamic: dyn, clientset: fake.NewSimpleClientset(), mapper: mapper})
 }
 
 func liveObject(apiVersion, kind, name string, status map[string]interface{}) *unstructured.Unstructured {

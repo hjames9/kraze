@@ -49,6 +49,15 @@ type Provider interface {
 	IsInstalled(ctx context.Context, service *config.ServiceConfig) (bool, error)
 }
 
+// ResourceRecorder is implemented by providers that know the objects a
+// service applies, so they can be recorded in state and removed once the
+// service leaves the config
+type ResourceRecorder interface {
+	ResourceRefs(service *config.ServiceConfig) ([]state.ResourceRef, error)
+}
+
+var _ ResourceRecorder = (*ManifestsProvider)(nil)
+
 // ServiceStatus represents the status of a deployed service
 type ServiceStatus struct {
 	Name      string
@@ -102,15 +111,6 @@ func NewProvider(service *config.ServiceConfig, opts *ProviderOptions) (Provider
 	}
 }
 
-// CheckNamespaceExists checks if a namespace exists in the cluster
-func CheckNamespaceExists(ctx context.Context, kubeconfig, namespace string) (bool, error) {
-	restConfig, err := getRESTConfigFromKubeconfig(kubeconfig)
-	if err != nil {
-		return false, err
-	}
-	return namespaceExists(ctx, restConfig, namespace)
-}
-
 // getRESTConfigFromKubeconfig creates a REST config from kubeconfig content
 func getRESTConfigFromKubeconfig(kubeconfigContent string) (*rest.Config, error) {
 	if kubeconfigContent == "" {
@@ -139,117 +139,60 @@ func getRESTConfigFromKubeconfig(kubeconfigContent string) (*rest.Config, error)
 	return restConfig, nil
 }
 
-// namespaceExists checks if a namespace exists in the cluster
-func namespaceExists(ctx context.Context, restConfig *rest.Config, namespace string) (bool, error) {
-	clientset, err := kubernetes.NewForConfig(restConfig)
-	if err != nil {
-		return false, fmt.Errorf("failed to create clientset: %w", err)
-	}
-
-	_, err = clientset.CoreV1().Namespaces().Get(ctx, namespace, metav1.GetOptions{})
-	if err != nil {
-		if errors.IsNotFound(err) {
-			return false, nil
-		}
-		return false, fmt.Errorf("failed to check namespace: %w", err)
-	}
-
-	return true, nil
-}
-
-// DeletePVCsInNamespace deletes all PVCs in a namespace
-// This is needed for clean namespace deletion since Helm doesn't delete PVCs by default
-func DeletePVCsInNamespace(ctx context.Context, kubeconfig, namespace string) (int, error) {
+// clientsetFromKubeconfig creates a clientset from kubeconfig content
+func clientsetFromKubeconfig(kubeconfig string) (kubernetes.Interface, error) {
 	restConfig, err := getRESTConfigFromKubeconfig(kubeconfig)
 	if err != nil {
-		return 0, err
+		return nil, err
 	}
-
 	clientset, err := kubernetes.NewForConfig(restConfig)
 	if err != nil {
-		return 0, fmt.Errorf("failed to create clientset: %w", err)
+		return nil, fmt.Errorf("failed to create clientset: %w", err)
 	}
-
-	// List all PVCs in the namespace
-	pvcs, err := clientset.CoreV1().PersistentVolumeClaims(namespace).List(ctx, metav1.ListOptions{})
-	if err != nil {
-		return 0, fmt.Errorf("failed to list PVCs: %w", err)
-	}
-
-	if len(pvcs.Items) == 0 {
-		return 0, nil
-	}
-
-	// Delete each PVC
-	deletedCount := 0
-	for _, pvc := range pvcs.Items {
-		err := clientset.CoreV1().PersistentVolumeClaims(namespace).Delete(ctx, pvc.Name, metav1.DeleteOptions{})
-		if err != nil {
-			if errors.IsNotFound(err) {
-				continue // Already deleted
-			}
-			return deletedCount, fmt.Errorf("failed to delete PVC %s: %w", pvc.Name, err)
-		}
-		deletedCount++
-	}
-
-	return deletedCount, nil
+	return clientset, nil
 }
 
 // DeleteNamespace deletes a namespace, with safety checks
 func DeleteNamespace(ctx context.Context, kubeconfig, namespace string) error {
-	// Safety check: never delete system namespaces
-	systemNamespaces := map[string]bool{
-		"default":         true,
-		"kube-system":     true,
-		"kube-public":     true,
-		"kube-node-lease": true,
-	}
-
-	if systemNamespaces[namespace] {
+	if IsSystemNamespace(namespace) {
 		return fmt.Errorf("refusing to delete system namespace: %s", namespace)
 	}
-
-	restConfig, err := getRESTConfigFromKubeconfig(kubeconfig)
+	clientset, err := clientsetFromKubeconfig(kubeconfig)
 	if err != nil {
 		return err
 	}
+	return deleteNamespace(ctx, clientset, namespace)
+}
 
-	clientset, err := kubernetes.NewForConfig(restConfig)
-	if err != nil {
-		return fmt.Errorf("failed to create clientset: %w", err)
+func deleteNamespace(ctx context.Context, clientset kubernetes.Interface, namespace string) error {
+	if IsSystemNamespace(namespace) {
+		return fmt.Errorf("refusing to delete system namespace: %s", namespace)
 	}
-
-	err = clientset.CoreV1().Namespaces().Delete(ctx, namespace, metav1.DeleteOptions{})
-	if err != nil {
-		if errors.IsNotFound(err) {
-			// Namespace already deleted
-			return nil
-		}
+	err := clientset.CoreV1().Namespaces().Delete(ctx, namespace, metav1.DeleteOptions{})
+	if err != nil && !errors.IsNotFound(err) { // not found: already deleted
 		return fmt.Errorf("failed to delete namespace: %w", err)
 	}
-
 	return nil
 }
 
+// namespaceDeletionPollInterval is how often WaitForNamespaceDeletion checks;
+// a variable so tests run fast
+var namespaceDeletionPollInterval = time.Second
+
 // WaitForNamespaceDeletion waits for a namespace to be fully deleted from the cluster
 func WaitForNamespaceDeletion(ctx context.Context, kubeconfig, namespace string, timeout time.Duration) error {
-	restConfig, err := getRESTConfigFromKubeconfig(kubeconfig)
+	clientset, err := clientsetFromKubeconfig(kubeconfig)
 	if err != nil {
 		return err
 	}
+	return waitForNamespaceDeletion(ctx, clientset, namespace, timeout)
+}
 
-	clientset, err := kubernetes.NewForConfig(restConfig)
-	if err != nil {
-		return fmt.Errorf("failed to create clientset: %w", err)
-	}
-
-	// Create a context with timeout
+func waitForNamespaceDeletion(ctx context.Context, clientset kubernetes.Interface, namespace string, timeout time.Duration) error {
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
-	// Poll for namespace deletion
-	ticker := time.NewTicker(1 * time.Second)
+	ticker := time.NewTicker(namespaceDeletionPollInterval)
 	defer ticker.Stop()
 
 	for {
@@ -257,27 +200,58 @@ func WaitForNamespaceDeletion(ctx context.Context, kubeconfig, namespace string,
 		case <-ctx.Done():
 			return fmt.Errorf("timeout waiting for namespace '%s' to be deleted", namespace)
 		case <-ticker.C:
-			_, err := clientset.CoreV1().Namespaces().Get(ctx, namespace, metav1.GetOptions{})
-			if err != nil {
-				if errors.IsNotFound(err) {
-					// Namespace is gone!
-					return nil
-				}
-				// Other error - continue waiting
+			// Other errors: keep waiting
+			if _, err := clientset.CoreV1().Namespaces().Get(ctx, namespace, metav1.GetOptions{}); errors.IsNotFound(err) {
+				return nil
 			}
 		}
 	}
 }
 
-// WaitForManifests waits for resources defined in YAML manifests to become ready
-// This is a convenience wrapper for WaitForManifestsInNamespace with no default namespace
-func WaitForManifests(ctx context.Context, kubeconfigContent, manifestYAML string, opts *ProviderOptions) error {
-	return WaitForManifestsInNamespace(ctx, kubeconfigContent, manifestYAML, "", opts)
+// kubeClients are the clients waiting for resources needs
+type kubeClients struct {
+	dynamic   dynamic.Interface
+	clientset kubernetes.Interface // for events and logs of failing pods
+	mapper    meta.RESTMapper
+}
+
+// newKubeClients creates kubeClients from kubeconfig content
+func newKubeClients(kubeconfigContent string) (*kubeClients, error) {
+	restConfig, err := getRESTConfigFromKubeconfig(kubeconfigContent)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get REST config: %w", err)
+	}
+	dynamicClient, err := dynamic.NewForConfig(restConfig)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create dynamic client: %w", err)
+	}
+	clientset, err := kubernetes.NewForConfig(restConfig)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create clientset: %w", err)
+	}
+	discoveryClient, err := discovery.NewDiscoveryClientForConfig(restConfig)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create discovery client: %w", err)
+	}
+	mapper := restmapper.NewDeferredDiscoveryRESTMapper(memory.NewMemCacheClient(discoveryClient))
+	return &kubeClients{dynamic: dynamicClient, clientset: clientset, mapper: mapper}, nil
 }
 
 // WaitForManifestsInNamespace waits for resources defined in YAML manifests to become ready
 // The defaultNamespace is applied to resources that don't have a namespace set
 func WaitForManifestsInNamespace(ctx context.Context, kubeconfigContent, manifestYAML, defaultNamespace string, opts *ProviderOptions) error {
+	if !opts.Wait {
+		return nil
+	}
+	clients, err := newKubeClients(kubeconfigContent)
+	if err != nil {
+		return err
+	}
+	return waitForManifests(ctx, clients, manifestYAML, defaultNamespace, opts)
+}
+
+// waitForManifests is WaitForManifestsInNamespace with the clients given
+func waitForManifests(ctx context.Context, clients *kubeClients, manifestYAML, defaultNamespace string, opts *ProviderOptions) error {
 	if !opts.Wait {
 		return nil
 	}
@@ -290,32 +264,7 @@ func WaitForManifestsInNamespace(ctx context.Context, kubeconfigContent, manifes
 			timeout = parsedTimeout
 		}
 	}
-
-	// Create REST config and dynamic client
-	restConfig, err := getRESTConfigFromKubeconfig(kubeconfigContent)
-	if err != nil {
-		return fmt.Errorf("failed to get REST config: %w", err)
-	}
-
-	dynamicClient, err := dynamic.NewForConfig(restConfig)
-	if err != nil {
-		return fmt.Errorf("failed to create dynamic client: %w", err)
-	}
-
-	// Create clientset for fetching events and logs
-	clientset, err := kubernetes.NewForConfig(restConfig)
-	if err != nil {
-		return fmt.Errorf("failed to create clientset: %w", err)
-	}
-
-	// Create discovery client for REST mapper
-	discoveryClient, err := discovery.NewDiscoveryClientForConfig(restConfig)
-	if err != nil {
-		return fmt.Errorf("failed to create discovery client: %w", err)
-	}
-
-	cachedDiscoveryClient := memory.NewMemCacheClient(discoveryClient)
-	mapper := restmapper.NewDeferredDiscoveryRESTMapper(cachedDiscoveryClient)
+	dynamicClient, clientset, mapper := clients.dynamic, clients.clientset, clients.mapper
 
 	// Parse YAML manifests into resources
 	resources, err := parseManifestsYAML(manifestYAML)

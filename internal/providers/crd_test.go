@@ -2,6 +2,7 @@ package providers
 
 import (
 	"context"
+	"k8s.io/client-go/kubernetes/fake"
 	"os"
 	"path/filepath"
 	"slices"
@@ -81,7 +82,7 @@ func crdProvider(t *testing.T, establish bool) (*ManifestsProvider, *discovering
 	mapper.Add(schema.GroupVersionKind{Version: "v1", Kind: "ConfigMap"}, meta.RESTScopeNamespace)
 	mapper.Add(schema.GroupVersionKind{Group: "apiextensions.k8s.io", Version: "v1", Kind: "CustomResourceDefinition"}, meta.RESTScopeRoot)
 
-	return &ManifestsProvider{opts: &ProviderOptions{Project: "web", Quiet: true}, dynamicClient: dyn, mapper: mapper}, mapper, dyn
+	return newManifestsProviderWithClients(&ProviderOptions{Project: "web", Quiet: true}, &kubeClients{dynamic: dyn, clientset: fake.NewSimpleClientset(), mapper: mapper}), mapper, dyn
 }
 
 func crdService(t *testing.T) *config.ServiceConfig {

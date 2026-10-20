@@ -31,7 +31,7 @@ func stubNamespaceDeletion(t *testing.T) func() []string {
 	t.Helper()
 	var mu sync.Mutex
 	var deleted []string
-	deleteNamespace = func(_ context.Context, _, ns string) error {
+	deps.deleteNamespace = func(_ context.Context, _, ns string) error {
 		mu.Lock()
 		defer mu.Unlock()
 		deleted = append(deleted, ns)
@@ -40,7 +40,7 @@ func stubNamespaceDeletion(t *testing.T) func() []string {
 	timeout := downNamespaceDeletionTimeout
 	downNamespaceDeletionTimeout = 0
 	t.Cleanup(func() {
-		deleteNamespace = providers.DeleteNamespace
+		deps.deleteNamespace = providers.DeleteNamespace
 		downNamespaceDeletionTimeout = timeout
 	})
 	return func() []string {
@@ -65,10 +65,11 @@ func reload(t *testing.T, clientset kubernetes.Interface, project string) *state
 
 func newOrphanBackend() *fakeOrphanBackend {
 	return &fakeOrphanBackend{
-		helmReleases: map[string]bool{},
-		uninstallErr: map[string]error{},
-		deleted:      map[string][]state.ResourceRef{},
-		keepCRDs:     map[string]bool{},
+		helmReleases:  map[string]bool{},
+		failUninstall: map[string]bool{},
+		uninstallErr:  map[string]error{},
+		deleted:       map[string][]state.ResourceRef{},
+		keepCRDs:      map[string]bool{},
 	}
 }
 

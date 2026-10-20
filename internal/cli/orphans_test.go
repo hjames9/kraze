@@ -50,7 +50,7 @@ func (b *fakeOrphanBackend) deleteManifests(_ context.Context, name string, refs
 func TestRemoveOrphans(t *testing.T) {
 	var mu sync.Mutex
 	var deletedNamespaces []string
-	deleteNamespace = func(_ context.Context, _, ns string) error {
+	deps.deleteNamespace = func(_ context.Context, _, ns string) error {
 		mu.Lock()
 		defer mu.Unlock()
 		deletedNamespaces = append(deletedNamespaces, ns)
@@ -59,7 +59,7 @@ func TestRemoveOrphans(t *testing.T) {
 	timeout := downNamespaceDeletionTimeout
 	downNamespaceDeletionTimeout = 0
 	t.Cleanup(func() {
-		deleteNamespace = providers.DeleteNamespace
+		deps.deleteNamespace = providers.DeleteNamespace
 		downNamespaceDeletionTimeout = timeout
 	})
 
@@ -135,14 +135,14 @@ func TestRemoveOrphans(t *testing.T) {
 // removes the old name, the new one isn't installed yet but needs it
 func TestRemoveOrphansKeepsConfiguredNamespaces(t *testing.T) {
 	var deleted []string
-	deleteNamespace = func(_ context.Context, _, ns string) error {
+	deps.deleteNamespace = func(_ context.Context, _, ns string) error {
 		deleted = append(deleted, ns)
 		return nil
 	}
 	timeout := downNamespaceDeletionTimeout
 	downNamespaceDeletionTimeout = 0
 	t.Cleanup(func() {
-		deleteNamespace = providers.DeleteNamespace
+		deps.deleteNamespace = providers.DeleteNamespace
 		downNamespaceDeletionTimeout = timeout
 	})
 
@@ -317,11 +317,11 @@ func TestMovedInstalls(t *testing.T) {
 // A moved service's old installation is removed by what was recorded: the
 // old namespace and type, not the config's
 func TestRemoveOrphansRemovesMovedInstallByRecord(t *testing.T) {
-	deleteNamespace = func(context.Context, string, string) error { return nil }
+	deps.deleteNamespace = func(context.Context, string, string) error { return nil }
 	timeout := downNamespaceDeletionTimeout
 	downNamespaceDeletionTimeout = 0
 	t.Cleanup(func() {
-		deleteNamespace = providers.DeleteNamespace
+		deps.deleteNamespace = providers.DeleteNamespace
 		downNamespaceDeletionTimeout = timeout
 	})
 

@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"strings"
 	"sync"
 	"time"
 
@@ -13,7 +12,6 @@ import (
 	"github.com/hjames9/kraze/internal/config"
 	"github.com/hjames9/kraze/internal/graph"
 	"github.com/hjames9/kraze/internal/history"
-	"github.com/hjames9/kraze/internal/pack"
 	"github.com/hjames9/kraze/internal/providers"
 	"github.com/hjames9/kraze/internal/state"
 	"github.com/hjames9/kraze/internal/ui"
@@ -56,36 +54,15 @@ Services this project installed earlier that are no longer in its config
 func runUp(cmd *cobra.Command, args []string) (retErr error) {
 	ctx := cmd.Context()
 
-	cfgPaths, err := resolveConfigFiles(cmd)
-	if err != nil {
-		return err
-	}
-
-	// Keep the original paths (archive or yml) to persist in cluster state so
-	// future commands can re-resolve the config without -f.
-	originalCfgPaths := cfgPaths
-
-	cfgPaths, cleanupPack, err := pack.MaybeExtract(cfgPaths)
+	loaded, cleanupPack, err := loadConfig(cmd, "Starting services from config file(s): %s")
 	if err != nil {
 		return err
 	}
 	defer cleanupPack()
+	cfg := loaded.cfg
 
-	Verbose("Starting services from config file(s): %s", strings.Join(cfgPaths, ", "))
-
-	// Parse configuration
-	cfg, err := config.ParseMultiple(cfgPaths)
-	if err != nil {
-		return fmt.Errorf("failed to parse config: %w", err)
-	}
-
-	// Check Docker availability (only for kind clusters, not external)
-	if !cfg.Cluster.IsExternal() {
-		Verbose("Checking Docker availability...")
-		if err := cluster.CheckDockerAvailable(ctx); err != nil {
-			return err
-		}
-		Verbose("Docker is available")
+	if err := requireDocker(ctx, cfg); err != nil {
+		return err
 	}
 
 	// Filter services if specified (including dependencies)
@@ -207,89 +184,31 @@ func runUp(cmd *cobra.Command, args []string) (retErr error) {
 	// Create progress manager
 	progress := ui.NewProgressManager(verbose, plain, len(orderedServices))
 
-	// Create or verify cluster
-	kindMgr := cluster.NewKindManager()
-	isExternal := cfg.Cluster.IsExternal()
-	var kubeconfig string
-	clusterCreated := false
-
-	if isExternal {
-		// External cluster mode - don't create, just verify access
-		Verbose("Using external cluster '%s'", cfg.Cluster.Name)
-
-		kubeconfig, err = kindMgr.GetKubeconfigForExternalCluster(&cfg.Cluster)
-		if err != nil {
-			return fmt.Errorf("failed to get kubeconfig for external cluster: %w", err)
-		}
-
-		// Verify cluster is accessible
-		Verbose("Verifying cluster connectivity...")
-		if err := kindMgr.VerifyClusterAccess(ctx, kubeconfig); err != nil {
-			return fmt.Errorf("failed to access external cluster '%s': %w", cfg.Cluster.Name, err)
-		}
-		Verbose("External cluster is accessible")
-	} else {
-		// Kind cluster mode - create if doesn't exist
-		exists, err := kindMgr.ClusterExists(cfg.Cluster.Name)
-		if err != nil {
-			return fmt.Errorf("failed to check cluster: %w", err)
-		}
-
-		if !exists {
-			fmt.Printf("Cluster '%s' does not exist, creating it...\n", cfg.Cluster.Name)
-			if err := kindMgr.CreateCluster(ctx, &cfg.Cluster); err != nil {
-				return fmt.Errorf("failed to create cluster: %w", err)
-			}
-			clusterCreated = true
-
-			// Update ~/.kube/config with cluster access (Use container IP)
-			Verbose("Updating kubeconfig...")
-			if err := kindMgr.UpdateKubeconfigFile(cfg.Cluster.Name); err != nil {
-				Verbose("Warning: failed to update kubeconfig: %v", err)
-			} else {
-				Verbose("Kubeconfig updated (context: kind-%s)", cfg.Cluster.Name)
-			}
-		} else {
-			Verbose("Cluster '%s' already exists", cfg.Cluster.Name)
-		}
-
-		// Get kubeconfig for the cluster (will be patched with container IP)
-		kubeconfig, err = kindMgr.GetKubeConfig(cfg.Cluster.Name, false)
-		if err != nil {
-			return fmt.Errorf("failed to get kubeconfig: %w", err)
-		}
-	}
-
-	// Create Kubernetes clientset for cluster state management
-	// Use the kubeconfig content (not file path)
-	// Only skip TLS verification for kind clusters (not external clusters)
-	clientset, err := providers.GetClientsetFromKubeconfigContent(kubeconfig, !isExternal)
+	// Create or verify cluster. The same manager must create the cluster and
+	// get its kubeconfig, since it remembers the network it used.
+	kindMgr := deps.newClusterManager()
+	conn, err := connectCluster(ctx, kindMgr, cfg, createMissing)
 	if err != nil {
-		return fmt.Errorf("failed to create Kubernetes client: %w", err)
+		return err
 	}
+	kubeconfig, clientset, clusterCreated := conn.kubeconfig, conn.clientset, conn.created
 
 	rec := beginHistory(ctx, clientset, cfg.Project, "up", clusterCreated)
 	defer func() { finishHistory(rec, retErr) }()
 
 	// Load or create cluster state
-	st, err := state.Load(ctx, clientset, cfg.Cluster.Name)
+	st, existing, err := loadClusterState(ctx, clientset, cfg, stateRequired)
 	if err != nil {
-		return fmt.Errorf("failed to load cluster state: %w", err)
+		return err
 	}
-	if st == nil {
-		nvidiaEnabled := cfg.Cluster.GPU.IsNvidiaEnabled()
-		amdEnabled := cfg.Cluster.GPU.IsAMDEnabled()
-		st = state.New(cfg.Cluster.Name, cfg.Cluster.IsExternal(), nvidiaEnabled, 0, amdEnabled, 0)
-	} else if !cfg.Cluster.IsExternal() {
+	if existing && !cfg.Cluster.IsExternal() {
 		// GPU config mismatch check (GPU requires cluster recreation)
 		if err := checkGPUCompatibility(st, cfg); err != nil {
 			return err
 		}
 	}
-	st.SetProject(cfg.Project)
-	checkProjectAccess(st, cfg, configured)
-	claimServices(st, cfg.Services)
-	if err := checkServiceConflicts(st, cfg.Services, cfg.Project, originalCfgPaths); err != nil {
+	adoptProject(st, cfg, configured, true)
+	if err := checkServiceConflicts(st, cfg.Services, cfg.Project, loaded.original); err != nil {
 		return err
 	}
 
@@ -301,7 +220,7 @@ func runUp(cmd *cobra.Command, args []string) (retErr error) {
 
 	// Store the original config paths (before pack extraction) so future commands
 	// can locate the config or archive without -f.
-	st.SetConfigPaths(originalCfgPaths)
+	st.SetConfigPaths(loaded.original)
 	if saveErr := st.Save(ctx, clientset); saveErr != nil {
 		Verbose("Warning: failed to store config paths in cluster state: %v", saveErr)
 	}
@@ -316,13 +235,7 @@ func runUp(cmd *cobra.Command, args []string) (retErr error) {
 		return movedServicesError(moved, cfg.Services)
 	}
 	if upRemoveOrphans {
-		backend := providerOrphanBackend{opts: &providers.ProviderOptions{
-			ClusterName: cfg.Cluster.Name,
-			Project:     cfg.Project,
-			KubeConfig:  kubeconfig,
-			Verbose:     verbose,
-			Quiet:       !verbose,
-		}}
+		backend := deps.orphanBackend(quietProviderOptions(cfg, kubeconfig))
 		old := append(st.Orphans(configured), moved...)
 		if err := removeOrphans(ctx, st, clientset, kubeconfig, old, configuredNS, backend, false, rec, Verbose); err != nil {
 			return err
@@ -341,7 +254,7 @@ func runUp(cmd *cobra.Command, args []string) (retErr error) {
 	}
 
 	// Create image manager for automatic image loading
-	imgMgr := cluster.NewImageManager(verbose)
+	imgMgr := deps.newImageManager(verbose)
 
 	defer progress.Stop()
 
@@ -442,7 +355,7 @@ func runUp(cmd *cobra.Command, args []string) (retErr error) {
 		if levelNum < len(serviceLevels)-1 {
 			delay := 3 * time.Second
 			progress.Verbose("Level %d complete, waiting %v before next level...", levelNum, delay)
-			time.Sleep(delay)
+			deps.sleep(delay)
 		}
 	}
 
@@ -470,8 +383,8 @@ func installService(
 	kubeconfig string,
 	st *state.ClusterState,
 	clientset kubernetes.Interface,
-	kindMgr *cluster.KindManager,
-	imgMgr *cluster.ImageManager,
+	kindMgr clusterManager,
+	imgMgr imageManager,
 	progress ui.ProgressManager,
 	globalWait bool,
 	globalTimeout string,
@@ -496,18 +409,12 @@ func installService(
 	}
 
 	// Create provider options
-	providerOpts := &providers.ProviderOptions{
-		ClusterName: cfg.Cluster.Name,
-		Project:     cfg.Project,
-		KubeConfig:  kubeconfig,
-		Wait:        serviceWait,
-		Timeout:     serviceTimeout,
-		Verbose:     verbose,
-		Quiet:       !verbose, // Suppress intermediate output unless verbose
-	}
+	providerOpts := quietProviderOptions(cfg, kubeconfig)
+	providerOpts.Wait = serviceWait
+	providerOpts.Timeout = serviceTimeout
 
 	// Create provider for this service
-	provider, err := providers.NewProvider(svc, providerOpts)
+	provider, err := deps.newProvider(svc, providerOpts)
 	if err != nil {
 		return fmt.Errorf("failed to create provider for '%s': %w", svc.Name, err)
 	}
@@ -695,7 +602,7 @@ func installService(
 	// longer in the config (--remove-orphans)
 	record := func() {
 		var resources []state.ResourceRef
-		if mp, ok := provider.(*providers.ManifestsProvider); ok {
+		if mp, ok := provider.(providers.ResourceRecorder); ok {
 			var err error
 			if resources, err = mp.ResourceRefs(svc); err != nil {
 				progress.Verbose("Warning: failed to record resources of '%s': %v", svc.Name, err)
@@ -739,7 +646,7 @@ func installService(
 	}
 	if delay > 0 {
 		progress.Verbose("Waiting %v for service to stabilize...", delay)
-		time.Sleep(delay)
+		deps.sleep(delay)
 	}
 
 	return nil

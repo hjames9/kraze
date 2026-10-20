@@ -4,8 +4,6 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/hjames9/kraze/internal/cluster"
-	"github.com/hjames9/kraze/internal/config"
 	"github.com/spf13/cobra"
 )
 
@@ -24,26 +22,22 @@ Examples:
 func runListImages(cmd *cobra.Command, args []string) error {
 	ctx := cmd.Context()
 
-	cfgPaths, cleanupPack, err := resolveAndExtractConfigFiles(cmd)
+	loaded, cleanupPack, err := loadConfig(cmd, "")
 	if err != nil {
 		return err
 	}
 	defer cleanupPack()
-
-	cfg, err := config.ParseMultiple(cfgPaths)
-	if err != nil {
-		return fmt.Errorf("failed to parse config: %w", err)
-	}
+	cfg := loaded.cfg
 
 	if cfg.Cluster.IsExternal() {
 		return fmt.Errorf("list-images is only supported for kind clusters, not external clusters")
 	}
 
-	if err := cluster.CheckDockerAvailable(ctx); err != nil {
+	if err := deps.checkDocker(ctx); err != nil {
 		return err
 	}
 
-	kindMgr := cluster.NewKindManager()
+	kindMgr := deps.newClusterManager()
 	exists, err := kindMgr.ClusterExists(cfg.Cluster.Name)
 	if err != nil {
 		return fmt.Errorf("failed to check cluster: %w", err)
@@ -52,7 +46,7 @@ func runListImages(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("cluster '%s' does not exist. Run 'kraze up' first", cfg.Cluster.Name)
 	}
 
-	imgMgr := cluster.NewImageManager(verbose)
+	imgMgr := deps.newImageManager(verbose)
 	images, err := imgMgr.ListClusterImages(ctx, cfg.Cluster.Name)
 	if err != nil {
 		return fmt.Errorf("failed to list images: %w", err)

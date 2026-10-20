@@ -1,9 +1,9 @@
 package cluster
 
 import (
+	"context"
 	"fmt"
 	"net/url"
-	osexec "os/exec"
 	"strings"
 
 	"github.com/hjames9/kraze/internal/config"
@@ -99,10 +99,9 @@ func networkIPTemplate(network string) string {
 // runInNode runs a shell script in a node container, with arg as $1 and
 // stdin as its input. Content goes through stdin rather than into the script,
 // so no value can end a heredoc or be read as shell.
-func runInNode(containerName, script, arg, stdin string) error {
-	cmd := osexec.Command("docker", "exec", "-i", containerName, "sh", "-c", script, "sh", arg)
-	cmd.Stdin = strings.NewReader(stdin)
-	if output, err := cmd.CombinedOutput(); err != nil {
+func (kind *KindManager) runInNode(containerName, script, arg, stdin string) error {
+	output, err := kind.run.CombinedOutput(context.Background(), stdin, "docker", "exec", "-i", containerName, "sh", "-c", script, "sh", arg)
+	if err != nil {
 		return fmt.Errorf("%w\nOutput: %s", err, string(output))
 	}
 	return nil
@@ -110,14 +109,14 @@ func runInNode(containerName, script, arg, stdin string) error {
 
 // writeNodeFile writes content to path in a node container, creating its
 // directory
-func writeNodeFile(containerName, path, content string) error {
-	return runInNode(containerName, `mkdir -p "$(dirname "$1")" && cat > "$1"`, path, content)
+func (kind *KindManager) writeNodeFile(containerName, path, content string) error {
+	return kind.runInNode(containerName, `mkdir -p "$(dirname "$1")" && cat > "$1"`, path, content)
 }
 
 // restartContainerd restarts containerd in a node and fails if it doesn't
 // come back (e.g. a configuration it can't parse)
-func restartContainerd(containerName string) error {
-	if err := runInNode(containerName, "systemctl restart containerd", "", ""); err != nil {
+func (kind *KindManager) restartContainerd(containerName string) error {
+	if err := kind.runInNode(containerName, "systemctl restart containerd", "", ""); err != nil {
 		return fmt.Errorf("containerd did not restart in node %s: %w", containerName, err)
 	}
 	return nil

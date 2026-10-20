@@ -6,9 +6,6 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/hjames9/kraze/internal/cluster"
-	"github.com/hjames9/kraze/internal/config"
-	"github.com/hjames9/kraze/internal/providers"
 	"github.com/spf13/cobra"
 )
 
@@ -98,23 +95,15 @@ func runPortForward(cmd *cobra.Command, args []string) error {
 	}
 
 	// Parse configuration
-	cfgPaths, cleanupPack, err := resolveAndExtractConfigFiles(cmd)
+	loaded, cleanupPack, err := loadConfig(cmd, "")
 	if err != nil {
 		return err
 	}
 	defer cleanupPack()
-	cfg, err := config.ParseMultiple(cfgPaths)
-	if err != nil {
-		return fmt.Errorf("failed to parse config: %w", err)
-	}
+	cfg := loaded.cfg
 
-	// Check Docker availability (only for kind clusters, not external)
-	if !cfg.Cluster.IsExternal() {
-		Verbose("Checking Docker availability...")
-		if err := cluster.CheckDockerAvailable(ctx); err != nil {
-			return err
-		}
-		Verbose("Docker is available")
+	if err := requireDocker(ctx, cfg); err != nil {
+		return err
 	}
 
 	// Find the service
@@ -124,41 +113,24 @@ func runPortForward(cmd *cobra.Command, args []string) error {
 	}
 
 	// Check if cluster exists
-	kindMgr := cluster.NewKindManager()
+	kindMgr := deps.newClusterManager()
 
-	clusterExists, err := kindMgr.ClusterExists(cfg.Cluster.Name)
+	if !cfg.Cluster.IsExternal() {
+		clusterExists, err := kindMgr.ClusterExists(cfg.Cluster.Name)
+		if err != nil {
+			return fmt.Errorf("failed to check cluster: %w", err)
+		}
+		if !clusterExists {
+			return fmt.Errorf("cluster '%s' is not running", cfg.Cluster.Name)
+		}
+	}
+
+	kubeconfig, err := clusterKubeconfig(kindMgr, cfg)
 	if err != nil {
-		return fmt.Errorf("failed to check cluster: %w", err)
+		return err
 	}
 
-	if !clusterExists {
-		return fmt.Errorf("cluster '%s' is not running", cfg.Cluster.Name)
-	}
-
-	// Get kubeconfig
-	var kubeconfig string
-	if cfg.Cluster.IsExternal() {
-		kubeconfig, err = kindMgr.GetKubeconfigForExternalCluster(&cfg.Cluster)
-		if err != nil {
-			return fmt.Errorf("failed to get kubeconfig for external cluster: %w", err)
-		}
-	} else {
-		kubeconfig, err = kindMgr.GetKubeConfig(cfg.Cluster.Name, false)
-		if err != nil {
-			return fmt.Errorf("failed to get kubeconfig: %w", err)
-		}
-	}
-
-	// Create provider options
-	providerOpts := &providers.ProviderOptions{
-		ClusterName: cfg.Cluster.Name,
-		Project:     cfg.Project,
-		KubeConfig:  kubeconfig,
-		Verbose:     verbose,
-	}
-
-	// Create provider
-	provider, err := providers.NewProvider(&svc, providerOpts)
+	provider, err := deps.newProvider(&svc, baseProviderOptions(cfg, kubeconfig))
 	if err != nil {
 		return fmt.Errorf("failed to create provider for '%s': %w", svc.Name, err)
 	}
@@ -177,7 +149,7 @@ func runPortForward(cmd *cobra.Command, args []string) error {
 	podName := portForwardPod
 	if podName == "" {
 		// Auto-select a pod from the service
-		pods, err := providers.GetPodsForService(ctx, kubeconfig, &svc)
+		pods, err := deps.podsForService(ctx, kubeconfig, &svc)
 		if err != nil {
 			return fmt.Errorf("failed to get pods for service: %w", err)
 		}
@@ -213,7 +185,7 @@ func runPortForward(cmd *cobra.Command, args []string) error {
 	// Start port forwarding in a goroutine
 	errChan := make(chan error, 1)
 	go func() {
-		err := providers.PortForward(pfCtx, kubeconfig, svc.GetNamespace(), podName, ports)
+		err := deps.portForward(pfCtx, kubeconfig, svc.GetNamespace(), podName, ports)
 		if err != nil {
 			errChan <- err
 		}

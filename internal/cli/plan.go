@@ -4,11 +4,9 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/hjames9/kraze/internal/cluster"
 	"github.com/hjames9/kraze/internal/color"
 	"github.com/hjames9/kraze/internal/config"
 	"github.com/hjames9/kraze/internal/graph"
-	"github.com/hjames9/kraze/internal/providers"
 	"github.com/hjames9/kraze/internal/state"
 	"github.com/spf13/cobra"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -109,27 +107,15 @@ func namespaceAction(namespace string, shouldCreate bool, created map[string]int
 func runPlan(cmd *cobra.Command, args []string) error {
 	ctx := cmd.Context()
 
-	cfgPaths, cleanupPack, err := resolveAndExtractConfigFiles(cmd)
+	loaded, cleanupPack, err := loadConfig(cmd, "Planning deployment from config file(s): %s")
 	if err != nil {
 		return err
 	}
 	defer cleanupPack()
+	cfg := loaded.cfg
 
-	Verbose("Planning deployment from config file(s): %s", strings.Join(cfgPaths, ", "))
-
-	// Parse configuration
-	cfg, err := config.ParseMultiple(cfgPaths)
-	if err != nil {
-		return fmt.Errorf("failed to parse config: %w", err)
-	}
-
-	// Check Docker availability (only for kind clusters, not external)
-	if !cfg.Cluster.IsExternal() {
-		Verbose("Checking Docker availability...")
-		if err := cluster.CheckDockerAvailable(ctx); err != nil {
-			return err
-		}
-		Verbose("Docker is available")
+	if err := requireDocker(ctx, cfg); err != nil {
+		return err
 	}
 
 	// Filter services if specified (including dependencies)
@@ -182,7 +168,7 @@ func runPlan(cmd *cobra.Command, args []string) error {
 	var namespaces clusterNamespaces
 
 	// Check cluster existence
-	kindMgr := cluster.NewKindManager()
+	kindMgr := deps.newClusterManager()
 	isExternal := cfg.Cluster.IsExternal()
 
 	// Try to get kubeconfig and load state from cluster
@@ -193,7 +179,7 @@ func runPlan(cmd *cobra.Command, args []string) error {
 		if err != nil {
 			Verbose("Warning: failed to get kubeconfig for external cluster: %v", err)
 			Verbose("Treating as empty state (no services installed)")
-			st = state.New(cfg.Cluster.Name, isExternal, false, 0, false, 0)
+			st = newClusterState(cfg, false)
 			kubeconfig = "" // Clear to skip state loading
 		}
 	} else {
@@ -207,14 +193,14 @@ func runPlan(cmd *cobra.Command, args []string) error {
 				namespaces = newClusterNamespaces(builtinNamespaces...)
 			}
 			Verbose("Treating as empty state (no services installed)")
-			st = state.New(cfg.Cluster.Name, isExternal, false, 0, false, 0)
+			st = newClusterState(cfg, false)
 			kubeconfig = "" // Clear to skip state loading
 		} else {
 			kubeconfig, err = kindMgr.GetKubeConfig(cfg.Cluster.Name, false)
 			if err != nil {
 				Verbose("Warning: failed to get kubeconfig: %v", err)
 				Verbose("Treating as empty state (no services installed)")
-				st = state.New(cfg.Cluster.Name, isExternal, false, 0, false, 0)
+				st = newClusterState(cfg, false)
 				kubeconfig = "" // Clear to skip state loading
 			}
 		}
@@ -222,11 +208,11 @@ func runPlan(cmd *cobra.Command, args []string) error {
 
 	// If we have kubeconfig, try to load state from cluster
 	if kubeconfig != "" {
-		clientset, err := providers.GetClientsetFromKubeconfigContent(kubeconfig, !isExternal)
+		clientset, err := clusterClient(cfg, kubeconfig)
 		if err != nil {
 			Verbose("Warning: failed to create Kubernetes client: %v", err)
 			Verbose("Treating as empty state (no services installed)")
-			st = state.New(cfg.Cluster.Name, isExternal, false, 0, false, 0)
+			st = newClusterState(cfg, false)
 		} else {
 			if nsList, err := clientset.CoreV1().Namespaces().List(ctx, metav1.ListOptions{}); err != nil {
 				Verbose("Warning: failed to list namespaces: %v", err)
@@ -238,23 +224,15 @@ func runPlan(cmd *cobra.Command, args []string) error {
 				namespaces = newClusterNamespaces(names...)
 			}
 
-			st, err = state.Load(ctx, clientset, cfg.Cluster.Name)
-			if err != nil {
-				Verbose("Warning: failed to load cluster state: %v", err)
-				Verbose("Treating as empty state (no services installed)")
-				st = state.New(cfg.Cluster.Name, isExternal, false, 0, false, 0)
-			}
-			if st == nil {
-				st = state.New(cfg.Cluster.Name, isExternal, false, 0, false, 0)
+			if st, _, err = loadClusterState(ctx, clientset, cfg, stateBestEffort); err != nil {
+				return err
 			}
 		}
 	}
 
 	// Act as this config's project, claiming unowned entries the way `up` would
 	// (in memory only; plan never saves)
-	st.SetProject(cfg.Project)
-	checkProjectAccess(st, cfg, configured)
-	claimServices(st, cfg.Services)
+	adoptProject(st, cfg, configured, true)
 
 	// Determine if cluster exists for display purposes
 	clusterExists := false

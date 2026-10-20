@@ -4,6 +4,7 @@ import (
 	"archive/tar"
 	"compress/gzip"
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -642,6 +643,8 @@ database:
 	}
 
 	im := NewImageManager(false)
+	// The chart can't be pulled (offline): images come from the values alone
+	im.pullChart = func(*config.ServiceConfig, string) (string, error) { return "", errors.New("offline") }
 	ctx := context.Background()
 
 	images, err := im.GetImagesForService(ctx, svc, "")

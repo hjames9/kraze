@@ -11,10 +11,8 @@ import (
 	"strings"
 	"syscall"
 
-	"github.com/hjames9/kraze/internal/cluster"
 	"github.com/hjames9/kraze/internal/config"
 	"github.com/hjames9/kraze/internal/pack"
-	"github.com/hjames9/kraze/internal/providers"
 	"github.com/hjames9/kraze/internal/state"
 	"github.com/spf13/cobra"
 )
@@ -116,7 +114,7 @@ type discoveredCluster struct {
 // or only the cluster named only when it is non-empty. It is a variable so
 // tests can substitute clusters without Docker.
 var discoverClusterStates = func(ctx context.Context, only string) []discoveredCluster {
-	kindMgr := cluster.NewKindManager()
+	kindMgr := deps.newClusterManager()
 	clusters, err := kindMgr.ListClusters()
 	if err != nil {
 		return nil
@@ -129,7 +127,7 @@ var discoverClusterStates = func(ctx context.Context, only string) []discoveredC
 		}
 		dc := discoveredCluster{name: clusterName}
 		if kubeconfig, err := kindMgr.GetKubeConfig(clusterName, false); err == nil {
-			if clientset, err := providers.GetClientsetFromKubeconfigContent(kubeconfig, true); err == nil {
+			if clientset, err := deps.clientset(kubeconfig, true); err == nil {
 				if st, err := state.Load(ctx, clientset, clusterName); err == nil {
 					dc.state = st
 				}

@@ -462,57 +462,6 @@ func TestBuildKindConfig_APIVersion(test *testing.T) {
 	}
 }
 
-func TestPatchKubeconfigWithContainerIP(test *testing.T) {
-	km := NewKindManager()
-
-	tests := []struct {
-		name            string
-		kubeconfig      string
-		clusterName     string
-		expectedPattern string // What we expect to be replaced
-	}{
-		{
-			name:            "replace localhost",
-			kubeconfig:      "server: https://localhost:12345",
-			clusterName:     "test-cluster",
-			expectedPattern: "https://", // Should have https prefix
-		},
-		{
-			name:            "replace 127.0.0.1",
-			kubeconfig:      "server: https://127.0.0.1:54321",
-			clusterName:     "test-cluster",
-			expectedPattern: "https://",
-		},
-		{
-			name:            "replace container name",
-			kubeconfig:      "server: https://test-cluster-control-plane:6443",
-			clusterName:     "test-cluster",
-			expectedPattern: "https://",
-		},
-	}
-
-	for _, tt := range tests {
-		test.Run(tt.name, func(test *testing.T) {
-			// Note: This will fail if Docker is not running or container doesn't exist
-			// That's expected for unit tests - we're just testing the logic
-			result, err := km.patchKubeconfigWithContainerIP(tt.clusterName, tt.kubeconfig, "")
-
-			// If patching succeeds (Docker available, container exists)
-			if err == nil {
-				// Check that result still has https prefix
-				if len(result) > 0 {
-					// Basic sanity check - should still be valid kubeconfig structure
-					if len(result) < len(tt.kubeconfig)/2 {
-						test.Errorf("Result seems too short: %d bytes (original: %d)", len(result), len(tt.kubeconfig))
-					}
-				}
-			}
-			// If patching fails, that's ok - Docker might not be available in test env
-			// We're mainly testing the function doesn't panic
-		})
-	}
-}
-
 func TestNewKindManager(test *testing.T) {
 	km := NewKindManager()
 
@@ -698,7 +647,11 @@ func TestGetEffectiveProxyConfig(test *testing.T) {
 
 	for _, tt := range tests {
 		test.Run(tt.name, func(test *testing.T) {
-			// Set up environment variables
+			// Only the case's variables: a developer behind a proxy has
+			// these set in their shell
+			for _, key := range []string{"HTTP_PROXY", "http_proxy", "HTTPS_PROXY", "https_proxy", "NO_PROXY", "no_proxy"} {
+				test.Setenv(key, "")
+			}
 			for key, value := range tt.envVars {
 				test.Setenv(key, value)
 			}

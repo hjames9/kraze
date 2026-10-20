@@ -48,6 +48,12 @@ type HelmProvider struct {
 	opts       *ProviderOptions
 	restConfig *rest.Config
 	settings   *cli.EnvSettings
+
+	// Where the provider reaches the cluster; nil builds them from
+	// restConfig. Tests set them.
+	actionConfigFor func(namespace string) (*action.Configuration, error)
+	dynamicClient   func() (dynamic.Interface, error)
+	waitClients     func() (*kubeClients, error)
 }
 
 // NewHelmProvider creates a new Helm provider
@@ -65,6 +71,14 @@ func NewHelmProvider(opts *ProviderOptions) (*HelmProvider, error) {
 		restConfig: restConfig,
 		settings:   settings,
 	}, nil
+}
+
+// actionConfig returns the Helm action configuration for a namespace
+func (helm *HelmProvider) actionConfig(namespace string) (*action.Configuration, error) {
+	if helm.actionConfigFor != nil {
+		return helm.actionConfigFor(namespace)
+	}
+	return helm.getActionConfig(namespace)
 }
 
 // getActionConfig creates an action.Configuration for a specific namespace
@@ -106,7 +120,7 @@ func (helm *HelmProvider) getActionConfig(namespace string) (*action.Configurati
 // Install installs or upgrades a Helm chart (idempotent)
 func (helm *HelmProvider) Install(ctx context.Context, service *config.ServiceConfig) error {
 	// Get action config for this service's namespace
-	actionConfig, err := helm.getActionConfig(service.GetNamespace())
+	actionConfig, err := helm.actionConfig(service.GetNamespace())
 	if err != nil {
 		return err
 	}
@@ -118,10 +132,11 @@ func (helm *HelmProvider) Install(ctx context.Context, service *config.ServiceCo
 	releaseExists := err == nil
 
 	// Get chart path - download if remote
-	chartPath, err := helm.getChartPath(ctx, service)
+	chartPath, cleanupChart, err := helm.getChartPath(ctx, service)
 	if err != nil {
 		return fmt.Errorf("failed to get chart: %w", err)
 	}
+	defer cleanupChart()
 
 	chart, err := loader.Load(chartPath)
 	if err != nil {
@@ -175,8 +190,16 @@ func (helm *HelmProvider) Install(ctx context.Context, service *config.ServiceCo
 
 	// Wait for resources to be ready using our shared wait logic
 	if helm.opts.Wait && manifest != "" {
-		// Use WaitForManifestsInNamespace to apply the release namespace to resources
-		if err := WaitForManifestsInNamespace(ctx, helm.opts.KubeConfig, manifest, service.GetNamespace(), helm.opts); err != nil {
+		newClients := helm.waitClients
+		if newClients == nil {
+			newClients = func() (*kubeClients, error) { return newKubeClients(helm.opts.KubeConfig) }
+		}
+		clients, err := newClients()
+		if err != nil {
+			return fmt.Errorf("failed waiting for resources: %w", err)
+		}
+		// Resources without a namespace are in the release's
+		if err := waitForManifests(ctx, clients, manifest, service.GetNamespace(), helm.opts); err != nil {
 			return fmt.Errorf("failed waiting for resources: %w", err)
 		}
 	}
@@ -257,7 +280,7 @@ func (helm *HelmProvider) newInstallClient(actionConfig *action.Configuration, s
 // Uninstall removes a Helm release
 func (helm *HelmProvider) Uninstall(ctx context.Context, service *config.ServiceConfig) error {
 	// Get action config for this service's namespace
-	actionConfig, err := helm.getActionConfig(service.GetNamespace())
+	actionConfig, err := helm.actionConfig(service.GetNamespace())
 	if err != nil {
 		return err
 	}
@@ -359,7 +382,7 @@ func IsReleaseNotFound(err error) bool {
 // Status returns the status of a Helm release
 func (helm *HelmProvider) Status(ctx context.Context, service *config.ServiceConfig) (*ServiceStatus, error) {
 	// Get action config for this service's namespace
-	actionConfig, err := helm.getActionConfig(service.GetNamespace())
+	actionConfig, err := helm.actionConfig(service.GetNamespace())
 	if err != nil {
 		return nil, err
 	}
@@ -394,7 +417,7 @@ func (helm *HelmProvider) Status(ctx context.Context, service *config.ServiceCon
 // IsInstalled checks if a Helm release is installed
 func (helm *HelmProvider) IsInstalled(ctx context.Context, service *config.ServiceConfig) (bool, error) {
 	// Get action config for this service's namespace
-	actionConfig, err := helm.getActionConfig(service.GetNamespace())
+	actionConfig, err := helm.actionConfig(service.GetNamespace())
 	if err != nil {
 		return false, err
 	}
@@ -420,21 +443,26 @@ func (helm *HelmProvider) IsInstalled(ctx context.Context, service *config.Servi
 	return false, nil
 }
 
-// getChartPath returns the local path to a chart, downloading it if necessary
-func (helm *HelmProvider) getChartPath(ctx context.Context, service *config.ServiceConfig) (string, error) {
+// getChartPath returns the local path to a chart, downloading it if
+// necessary. The caller must call cleanup once the chart is loaded: an HTTP
+// repository's chart is pulled into a temp dir it removes.
+func (helm *HelmProvider) getChartPath(ctx context.Context, service *config.ServiceConfig) (path string, cleanup func(), err error) {
+	noCleanup := func() {}
+
 	// Local chart - return the local path directly
 	if service.IsLocalChart() {
-		return service.Path, nil
+		return service.Path, noCleanup, nil
 	}
 
 	// Remote chart - need to download it
 	if service.IsRemoteChart() {
-		// For OCI registries, use LocateChart (it handles OCI natively)
+		// For OCI registries, use LocateChart (it handles OCI natively, into
+		// Helm's cache)
 		if config.IsOCIURL(service.Repo) {
 			// Get properly initialized action config with registry client
-			actionConfig, err := helm.getActionConfig(service.GetNamespace())
+			actionConfig, err := helm.actionConfig(service.GetNamespace())
 			if err != nil {
-				return "", fmt.Errorf("failed to get action config for OCI chart: %w", err)
+				return "", noCleanup, fmt.Errorf("failed to get action config for OCI chart: %w", err)
 			}
 
 			client := action.NewInstall(actionConfig)
@@ -442,7 +470,8 @@ func (helm *HelmProvider) getChartPath(ctx context.Context, service *config.Serv
 				client.Version = service.Version
 			}
 			chartRef := fmt.Sprintf("%s/%s", service.Repo, service.Chart)
-			return client.LocateChart(chartRef, helm.settings)
+			path, err := client.LocateChart(chartRef, helm.settings)
+			return path, noCleanup, err
 		}
 
 		// For HTTP/HTTPS repositories, we need to pull the chart using the SDK
@@ -451,20 +480,31 @@ func (helm *HelmProvider) getChartPath(ctx context.Context, service *config.Serv
 		}
 
 		// Fallback: try direct path reference
-		return service.Path, nil
+		return service.Path, noCleanup, nil
 	}
 
-	return "", fmt.Errorf("unable to determine chart path: service must have either 'path' (for local) or 'repo' and 'chart' (for remote)")
+	return "", noCleanup, fmt.Errorf("unable to determine chart path: service must have either 'path' (for local) or 'repo' and 'chart' (for remote)")
 }
 
-// pullHTTPChart downloads a chart from an HTTP/HTTPS repository using Helm SDK
-func (helm *HelmProvider) pullHTTPChart(service *config.ServiceConfig) (string, error) {
-	// Create a temporary directory for chart download
+// pullHTTPChart downloads a chart from an HTTP/HTTPS repository into a temp
+// dir, which cleanup removes. Every run used to leave one behind.
+func (helm *HelmProvider) pullHTTPChart(service *config.ServiceConfig) (path string, cleanup func(), err error) {
 	tmpDir, err := os.MkdirTemp("", "kraze-helm-")
 	if err != nil {
-		return "", fmt.Errorf("failed to create temp directory: %w", err)
+		return "", func() {}, fmt.Errorf("failed to create temp directory: %w", err)
 	}
+	cleanup = func() { _ = os.RemoveAll(tmpDir) }
 
+	path, err = helm.pullHTTPChartInto(service, tmpDir)
+	if err != nil {
+		cleanup()
+		return "", func() {}, err
+	}
+	return path, cleanup, nil
+}
+
+// pullHTTPChartInto downloads a chart from an HTTP/HTTPS repository into tmpDir using Helm SDK
+func (helm *HelmProvider) pullHTTPChartInto(service *config.ServiceConfig, tmpDir string) (string, error) {
 	// Add the repository first so Pull can find it, refreshing its index when
 	// the requested chart version is not already cached
 	repoName, err := helm.addHTTPRepositoryForChart(service.Repo, service.Chart, service.Version)
@@ -911,54 +951,24 @@ func (cfg *simpleClientConfig) ConfigAccess() clientcmd.ConfigAccess {
 	return nil
 }
 
-// extractCRDsFromManifest parses a Helm manifest and extracts CRD names
+// extractCRDsFromManifest returns the names of the CRDs in a Helm release
+// manifest. It parses the documents: a line scan missed names in flow style
+// (metadata: {name: x}), so those CRDs were never deleted.
 func (helm *HelmProvider) extractCRDsFromManifest(manifest string) []string {
-	var crds []string
-
-	// Split manifest by document separator
-	docs := strings.Split(manifest, "\n---\n")
-
-	for _, doc := range docs {
-		doc = strings.TrimSpace(doc)
-		if doc == "" {
-			continue
+	objs, err := parseManifestsYAML(manifest)
+	if err != nil {
+		if helm.opts.Verbose {
+			fmt.Printf("[HELM] Failed to parse the release manifest for CRDs: %v\n", err)
 		}
-
-		// Simple check for CRD kind (more efficient than full YAML parsing)
-		if strings.Contains(doc, "kind: CustomResourceDefinition") ||
-			strings.Contains(doc, "kind:CustomResourceDefinition") {
-
-			// Extract the CRD name from metadata.name
-			// Look for "  name: something" after "metadata:"
-			lines := strings.Split(doc, "\n")
-			inMetadata := false
-			for _, line := range lines {
-				trimmed := strings.TrimSpace(line)
-				if trimmed == "metadata:" {
-					inMetadata = true
-					continue
-				}
-				if inMetadata && strings.HasPrefix(trimmed, "name:") {
-					// Extract name
-					parts := strings.SplitN(trimmed, ":", 2)
-					if len(parts) == 2 {
-						name := strings.TrimSpace(parts[1])
-						// Remove quotes if present
-						name = strings.Trim(name, "\"'")
-						if name != "" {
-							crds = append(crds, name)
-						}
-					}
-					break
-				}
-				// Stop if we hit another top-level key
-				if inMetadata && strings.HasPrefix(line, "apiVersion") {
-					break
-				}
-			}
+		return nil
+	}
+	var crds []string
+	for _, obj := range objs {
+		gvk := obj.GroupVersionKind()
+		if gvk.Group == apiextv1.GroupName && gvk.Kind == "CustomResourceDefinition" && obj.GetName() != "" {
+			crds = append(crds, obj.GetName())
 		}
 	}
-
 	return crds
 }
 
@@ -968,8 +978,11 @@ func (helm *HelmProvider) deleteCRDs(ctx context.Context, crdNames []string) err
 		return nil
 	}
 
-	// Create a dynamic client to delete CRDs
-	dynamicClient, err := dynamic.NewForConfig(helm.restConfig)
+	newClient := helm.dynamicClient
+	if newClient == nil {
+		newClient = func() (dynamic.Interface, error) { return dynamic.NewForConfig(helm.restConfig) }
+	}
+	dynamicClient, err := newClient()
 	if err != nil {
 		return fmt.Errorf("failed to create dynamic client: %w", err)
 	}

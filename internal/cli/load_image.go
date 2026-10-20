@@ -4,11 +4,8 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/hjames9/kraze/internal/cluster"
 	"github.com/hjames9/kraze/internal/color"
-	"github.com/hjames9/kraze/internal/config"
 	"github.com/hjames9/kraze/internal/history"
-	"github.com/hjames9/kraze/internal/providers"
 	"github.com/spf13/cobra"
 	"k8s.io/client-go/kubernetes"
 )
@@ -47,19 +44,16 @@ func runLoadImage(cmd *cobra.Command, args []string) (retErr error) {
 	}
 
 	// Parse configuration to get cluster name
-	cfgPaths, cleanupPack, err := resolveAndExtractConfigFiles(cmd)
+	loaded, cleanupPack, err := loadConfig(cmd, "")
 	if err != nil {
 		return err
 	}
 	defer cleanupPack()
-	cfg, err := config.ParseMultiple(cfgPaths)
-	if err != nil {
-		return fmt.Errorf("failed to parse config: %w", err)
-	}
+	cfg := loaded.cfg
 
 	// Check Docker availability (load-image always requires Docker/kind)
 	Verbose("Checking Docker availability...")
-	if err := cluster.CheckDockerAvailable(ctx); err != nil {
+	if err := deps.checkDocker(ctx); err != nil {
 		return err
 	}
 	Verbose("Docker is available")
@@ -71,7 +65,7 @@ func runLoadImage(cmd *cobra.Command, args []string) (retErr error) {
 	}
 
 	// Create kind manager
-	kindMgr := cluster.NewKindManager()
+	kindMgr := deps.newClusterManager()
 
 	// Check if cluster exists
 	exists, err := kindMgr.ClusterExists(clusterName)
@@ -86,7 +80,7 @@ func runLoadImage(cmd *cobra.Command, args []string) (retErr error) {
 	var clientset kubernetes.Interface
 	if kubeconfig, err := kindMgr.GetKubeConfig(clusterName, false); err != nil {
 		Verbose("Warning: failed to get kubeconfig, history will not be recorded: %v", err)
-	} else if clientset, err = providers.GetClientsetFromKubeconfigContent(kubeconfig, true); err != nil {
+	} else if clientset, err = deps.clientset(kubeconfig, true); err != nil {
 		Verbose("Warning: failed to create Kubernetes client, history will not be recorded: %v", err)
 	}
 	rec := beginHistory(ctx, clientset, cfg.Project, "load-image", false)

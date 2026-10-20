@@ -85,7 +85,7 @@ func TestPropertySplitYAMLRoundTrip(t *testing.T) {
 				b.WriteString("# a comment between documents\n")
 			}
 			data := map[string]string{}
-			b.WriteString(fmt.Sprintf("apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: cm%d\ndata:\n", i))
+			fmt.Fprintf(&b, "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: cm%d\ndata:\n", i)
 			for k := rng.Intn(3); k >= 0; k-- {
 				key := fmt.Sprintf("k%d", k)
 				value := pieces[rng.Intn(len(pieces))]

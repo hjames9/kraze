@@ -1,4 +1,4 @@
-.PHONY: all build test clean install fmt vet lint sec vuln security help run-tests coverage validate-examples release release-publish bump-patch bump-minor bump-major show-version
+.PHONY: all build test test-race cover-check clean install fmt vet lint lint-install sec vuln security help run-tests coverage validate-examples release release-publish bump-patch bump-minor bump-major show-version
 
 BINARY_NAME=kraze
 VERSION?=$(shell cat VERSION 2>/dev/null || echo "dev")
@@ -18,6 +18,10 @@ GOVET=$(GOCMD) vet
 GHCMD=gh
 
 BUILD_DIR=build
+
+# golangci-lint must bundle an x/tools new enough for the Go toolchain (see
+# CLAUDE.md). CI installs this version; bump it with the Go version.
+GOLANGCI_LINT_VERSION=v2.14.0
 CMD_DIR=./cmd/$(BINARY_NAME)
 
 # Platform targets for cross-compilation
@@ -119,6 +123,15 @@ test: ## Run all tests
 	@echo "Running tests..."
 	$(GOTEST) -v ./...
 
+test-race: ## Run all tests with the race detector (needs cgo)
+	@echo "Running tests with the race detector..."
+	$(GOTEST) -race ./...
+
+cover-check: ## Fail if total test coverage is below the floor (scripts/coverage-floor.sh)
+	@mkdir -p $(BUILD_DIR)
+	$(GOTEST) -covermode=atomic -coverprofile=$(BUILD_DIR)/coverage.out ./...
+	@scripts/coverage-floor.sh $(BUILD_DIR)/coverage.out
+
 test-coverage: ## Run tests with coverage report
 	@echo "Running tests with coverage..."
 	@mkdir -p $(BUILD_DIR)
@@ -156,6 +169,9 @@ vet: ## Run go vet
 lint: ## Run golangci-lint
 	@echo "Running linter..."
 	golangci-lint run ./...
+
+lint-install: ## Install the golangci-lint version CI uses
+	$(GOCMD) install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@$(GOLANGCI_LINT_VERSION)
 
 # gosec rules that fire on kraze's core design rather than on defects. Each is a
 # whole-class exclusion because the finding is inherent to being a cluster tool,

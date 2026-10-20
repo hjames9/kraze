@@ -8,7 +8,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/hjames9/kraze/internal/cluster"
 	"github.com/hjames9/kraze/internal/color"
 	"github.com/hjames9/kraze/internal/config"
 	"github.com/hjames9/kraze/internal/graph"
@@ -63,26 +62,15 @@ are left alone; --remove-orphans removes them too:
 func runDown(cmd *cobra.Command, args []string) (retErr error) {
 	ctx := cmd.Context()
 
-	cfgPaths, cleanupPack, err := resolveAndExtractConfigFiles(cmd)
+	loaded, cleanupPack, err := loadConfig(cmd, "Stopping services from config file(s): %s")
 	if err != nil {
 		return err
 	}
 	defer cleanupPack()
-	Verbose("Stopping services from config file(s): %s", strings.Join(cfgPaths, ", "))
+	cfg := loaded.cfg
 
-	// Parse configuration
-	cfg, err := config.ParseMultiple(cfgPaths)
-	if err != nil {
-		return fmt.Errorf("failed to parse config: %w", err)
-	}
-
-	// Check Docker availability (only for kind clusters, not external)
-	if !cfg.Cluster.IsExternal() {
-		Verbose("Checking Docker availability...")
-		if err := cluster.CheckDockerAvailable(ctx); err != nil {
-			return err
-		}
-		Verbose("Docker is available")
+	if err := requireDocker(ctx, cfg); err != nil {
+		return err
 	}
 
 	// Filter services if specified
@@ -226,70 +214,25 @@ func runDown(cmd *cobra.Command, args []string) (retErr error) {
 		return nil
 	}
 
-	// Verify cluster exists and get kubeconfig
-	kindMgr := cluster.NewKindManager()
-	isExternal := cfg.Cluster.IsExternal()
-	var kubeconfig string
-
-	if isExternal {
-		// External cluster mode - get kubeconfig from external cluster config
-		Verbose("Using external cluster '%s'", cfg.Cluster.Name)
-
-		kubeconfig, err = kindMgr.GetKubeconfigForExternalCluster(&cfg.Cluster)
-		if err != nil {
-			return fmt.Errorf("failed to get kubeconfig for external cluster: %w", err)
-		}
-
-		// Verify cluster is accessible
-		Verbose("Verifying cluster connectivity...")
-		if err := kindMgr.VerifyClusterAccess(ctx, kubeconfig); err != nil {
-			return fmt.Errorf("failed to access external cluster '%s': %w", cfg.Cluster.Name, err)
-		}
-		Verbose("External cluster is accessible")
-	} else {
-		// Kind cluster mode - verify cluster exists
-		exists, err := kindMgr.ClusterExists(cfg.Cluster.Name)
-		if err != nil {
-			return fmt.Errorf("failed to check cluster: %w", err)
-		}
-
-		if !exists {
-			fmt.Printf("Cluster '%s' does not exist, nothing to uninstall\n", cfg.Cluster.Name)
-			return nil
-		}
-
-		// Get kubeconfig for the cluster
-		kubeconfig, err = kindMgr.GetKubeConfig(cfg.Cluster.Name, false)
-		if err != nil {
-			return fmt.Errorf("failed to get kubeconfig: %w", err)
-		}
-	}
-
-	// Create Kubernetes clientset for cluster state management
-	// Use the kubeconfig content (not file path)
-	// Only skip TLS verification for kind clusters (not external clusters)
-	clientset, err := providers.GetClientsetFromKubeconfigContent(kubeconfig, !isExternal)
+	conn, err := connectCluster(ctx, deps.newClusterManager(), cfg, skipMissing)
 	if err != nil {
-		return fmt.Errorf("failed to create Kubernetes client: %w", err)
+		return err
 	}
+	if conn == nil {
+		fmt.Printf("Cluster '%s' does not exist, nothing to uninstall\n", cfg.Cluster.Name)
+		return nil
+	}
+	kubeconfig, clientset := conn.kubeconfig, conn.clientset
 
 	rec := beginHistory(ctx, clientset, cfg.Project, "down", false)
 	defer func() { finishHistory(rec, retErr) }()
 
 	// Load cluster state
-	st, err := state.Load(ctx, clientset, cfg.Cluster.Name)
+	st, _, err := loadClusterState(ctx, clientset, cfg, stateBestEffort)
 	if err != nil {
-		Verbose("Warning: failed to load cluster state: %v", err)
-		st = state.New(cfg.Cluster.Name, cfg.Cluster.IsExternal(), false, 0, false, 0)
+		return err
 	}
-	if st == nil {
-		// ConfigMap doesn't exist yet (Load returns nil, nil in this case)
-		st = state.New(cfg.Cluster.Name, cfg.Cluster.IsExternal(), false, 0, false, 0)
-	}
-
-	st.SetProject(cfg.Project)
-	checkProjectAccess(st, cfg, configured)
-	claimServices(st, cfg.Services)
+	adoptProject(st, cfg, configured, true)
 
 	// Collect namespace candidates BEFORE uninstalling, since uninstalling
 	// removes the services' entries from state
@@ -310,13 +253,7 @@ func runDown(cmd *cobra.Command, args []string) (retErr error) {
 
 	// Removes orphans, and services that moved namespace or changed type since
 	// they were installed (the config no longer says where they are)
-	backend := providerOrphanBackend{opts: &providers.ProviderOptions{
-		ClusterName: cfg.Cluster.Name,
-		Project:     cfg.Project,
-		KubeConfig:  kubeconfig,
-		Verbose:     verbose,
-		Quiet:       !verbose,
-	}}
+	backend := deps.orphanBackend(quietProviderOptions(cfg, kubeconfig))
 
 	// Uninstall each service in reverse dependency order
 	for itr, svc := range orderedServices {
@@ -337,6 +274,7 @@ func runDown(cmd *cobra.Command, args []string) (retErr error) {
 			rec.RecordChange(svc.Name, history.ActionUninstall, time.Since(start), err)
 			if err != nil {
 				progress.UpdateService(itr, svc.Name, ui.StatusFailed, err.Error())
+				delete(namespaceCandidates, meta.Namespace) // its resources may still be there
 				continue
 			}
 			st.MarkServiceUninstalled(svc.Name)
@@ -354,17 +292,11 @@ func runDown(cmd *cobra.Command, args []string) (retErr error) {
 		}
 
 		// Create provider options
-		providerOpts := &providers.ProviderOptions{
-			ClusterName: cfg.Cluster.Name,
-			Project:     cfg.Project,
-			KubeConfig:  kubeconfig,
-			Verbose:     verbose,
-			KeepCRDs:    downKeepCRDs,
-			Quiet:       !verbose, // Suppress intermediate output unless verbose
-		}
+		providerOpts := quietProviderOptions(cfg, kubeconfig)
+		providerOpts.KeepCRDs = downKeepCRDs
 
 		// Create provider for this service
-		provider, err := providers.NewProvider(svc, providerOpts)
+		provider, err := deps.newProvider(svc, providerOpts)
 		if err != nil {
 			progress.Verbose("Warning: failed to create provider for '%s': %v", svc.Name, err)
 			progress.UpdateService(itr, svc.Name, ui.StatusSkipped, "Failed to create provider")
@@ -398,6 +330,9 @@ func runDown(cmd *cobra.Command, args []string) (retErr error) {
 		if err != nil {
 			progress.Verbose("Warning: failed to uninstall '%s': %v", svc.Name, err)
 			progress.UpdateService(itr, svc.Name, ui.StatusFailed, err.Error())
+			// Deleting its namespace would remove what's left of it behind
+			// kraze's back, leaving its state entry pointing at nothing
+			delete(namespaceCandidates, svc.GetNamespace())
 			continue
 		}
 
@@ -479,9 +414,6 @@ func collectNamespaceCandidates(st *state.ClusterState, services []*config.Servi
 // workloads of just-uninstalled services to go away before it decides that an
 // unmanaged namespace still holds someone else's workloads
 var unmanagedNamespaceSettle = 20 * time.Second
-
-// deleteNamespace deletes a namespace; a variable so tests can record calls
-var deleteNamespace = providers.DeleteNamespace
 
 // keptNamespace is a namespace `down` leaves in place, and why
 type keptNamespace struct {
@@ -602,14 +534,14 @@ func cleanupNamespaces(ctx context.Context, clientset kubernetes.Interface, kube
 			verbosef("Deleting namespace '%s' (including all remaining resources)...", namespace)
 
 			// Delete the namespace (cascades to all resources including secrets, configmaps, etc.)
-			if err := deleteNamespace(ctx, kubeconfig, namespace); err != nil {
+			if err := deps.deleteNamespace(ctx, kubeconfig, namespace); err != nil {
 				fmt.Printf("%s Warning: failed to delete namespace '%s': %v\n", color.Warning(), namespace, err)
 				return
 			}
 
 			// Wait for deletion (unless timeout is 0)
 			if downNamespaceDeletionTimeout > 0 {
-				if err := providers.WaitForNamespaceDeletion(ctx, kubeconfig, namespace, downNamespaceDeletionTimeout); err != nil {
+				if err := deps.waitNamespaceDeleted(ctx, kubeconfig, namespace, downNamespaceDeletionTimeout); err != nil {
 					fmt.Printf("%s Warning: namespace '%s' still terminating after %v\n", color.Warning(), namespace, downNamespaceDeletionTimeout)
 					mu.Lock()
 					timeoutCount++

@@ -26,11 +26,8 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/apimachinery/pkg/util/yaml"
-	"k8s.io/client-go/discovery"
-	"k8s.io/client-go/discovery/cached/memory"
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes"
-	"k8s.io/client-go/restmapper"
 )
 
 const (
@@ -70,42 +67,22 @@ func NewManifestsProvider(opts *ProviderOptions) (*ManifestsProvider, error) {
 		return nil, fmt.Errorf("manifests provider needs a project (ProviderOptions.Project is empty)")
 	}
 
-	// Create REST config
-	restConfig, err := getRESTConfigFromKubeconfig(opts.KubeConfig)
+	clients, err := newKubeClients(opts.KubeConfig)
 	if err != nil {
-		return nil, fmt.Errorf("failed to get REST config: %w", err)
+		return nil, err
 	}
+	return newManifestsProviderWithClients(opts, clients), nil
+}
 
-	// Create dynamic client
-	dynamicClient, err := dynamic.NewForConfig(restConfig)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create dynamic client: %w", err)
-	}
-
-	// Create clientset for fetching events and logs
-	clientset, err := kubernetes.NewForConfig(restConfig)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create clientset: %w", err)
-	}
-
-	// Create discovery client for REST mapper
-	discoveryClient, err := discovery.NewDiscoveryClientForConfig(restConfig)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create discovery client: %w", err)
-	}
-
-	// Wrap in a cached discovery client
-	cachedDiscoveryClient := memory.NewMemCacheClient(discoveryClient)
-
-	// Create REST mapper for GVK to GVR mapping
-	mapper := restmapper.NewDeferredDiscoveryRESTMapper(cachedDiscoveryClient)
-
+// newManifestsProviderWithClients creates a Manifests provider that reaches
+// the cluster through clients
+func newManifestsProviderWithClients(opts *ProviderOptions, clients *kubeClients) *ManifestsProvider {
 	return &ManifestsProvider{
 		opts:          opts,
-		dynamicClient: dynamicClient,
-		clientset:     clientset,
-		mapper:        mapper,
-	}, nil
+		dynamicClient: clients.dynamic,
+		clientset:     clients.clientset,
+		mapper:        clients.mapper,
+	}
 }
 
 // Install applies Kubernetes manifests

@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
-	osexec "os/exec"
 	"path/filepath"
 	"strings"
 
@@ -32,7 +31,7 @@ type ImageReference struct {
 // ImageInfo contains metadata about a Docker image
 type ImageInfo struct {
 	Reference     ImageReference
-	SHA256        string // Image digest/hash from Docker
+	SHA256        string // Docker's image ID: what crictl reports for the same image in a node (see GetClusterImageHash)
 	IsLocal       bool   // True if image was built locally (no RepoDigests — never pushed to a registry)
 	InLocalDaemon bool   // True if image physically exists in the local Docker daemon (built or pulled)
 	Size          int64  // Image size in bytes
@@ -41,12 +40,22 @@ type ImageInfo struct {
 // ImageManager handles image detection, loading, and management
 type ImageManager struct {
 	verbose bool
+
+	run commandRunner
+	// pullChart downloads a remote chart into dir, returning its path
+	pullChart func(svc *config.ServiceConfig, dir string) (string, error)
 }
 
 // NewImageManager creates a new image manager
 func NewImageManager(verbose bool) *ImageManager {
 	return &ImageManager{
 		verbose: verbose,
+		run:     execRunner{},
+		pullChart: func(svc *config.ServiceConfig, dir string) (string, error) {
+			// The provider's pull handles OCI and HTTP(S) repositories the way
+			// install does (repository registration, cached index, credentials)
+			return providers.NewHelmProviderForPacking(verbose).PullChartToDir(svc, dir)
+		},
 	}
 }
 
@@ -135,8 +144,7 @@ func (im *ImageManager) GetImageInfo(ctx context.Context, imageName string) (*Im
 	}
 
 	// Check if image exists locally using docker inspect
-	cmd := osexec.CommandContext(ctx, "docker", "inspect", imageName)
-	output, err := cmd.Output()
+	output, err := im.run.Output(ctx, "docker", "inspect", imageName)
 
 	if err != nil {
 		// Image doesn't exist in the local Docker daemon
@@ -160,17 +168,12 @@ func (im *ImageManager) GetImageInfo(ctx context.Context, imageName string) (*Im
 	if len(inspectData) > 0 {
 		info.Size = inspectData[0].Size
 
-		// Extract SHA256 from ID (format: sha256:abc123...)
-		if inspectData[0].ID != "" {
-			info.SHA256 = inspectData[0].ID
-		}
+		// The image ID (sha256:...), for pulled images too. A pulled image's
+		// registry digest hashes its manifest, not the image: it never equals
+		// the ID crictl reports in the node, so every `up` reloaded the image
+		info.SHA256 = inspectData[0].ID
 
-		// If we have repo digests, use the first one
 		if len(inspectData[0].RepoDigests) > 0 {
-			digestParts := strings.SplitN(inspectData[0].RepoDigests[0], "@", 2)
-			if len(digestParts) == 2 {
-				info.SHA256 = digestParts[1]
-			}
 			// Image was pulled from a registry (has RepoDigests).
 			// IsLocal stays false — it describes origin, not daemon presence.
 			// InLocalDaemon is already true (set above).
@@ -205,8 +208,7 @@ func (im *ImageManager) GetClusterImageHash(ctx context.Context, clusterName, im
 	containerName := clusterName + "-control-plane"
 
 	// Check if image exists in cluster using crictl inspecti (inspect image, not container)
-	cmd := osexec.CommandContext(ctx, "docker", "exec", containerName, "crictl", "inspecti", clusterImageName)
-	output, err := cmd.Output()
+	output, err := im.run.Output(ctx, "docker", "exec", containerName, "crictl", "inspecti", clusterImageName)
 
 	if err != nil {
 		// Image doesn't exist in cluster
@@ -238,8 +240,7 @@ type ClusterImage struct {
 func (im *ImageManager) ListClusterImages(ctx context.Context, clusterName string) ([]ClusterImage, error) {
 	containerName := clusterName + "-control-plane"
 
-	cmd := osexec.CommandContext(ctx, "docker", "exec", containerName, "crictl", "images", "-o", "json")
-	output, err := cmd.Output()
+	output, err := im.run.Output(ctx, "docker", "exec", containerName, "crictl", "images", "-o", "json")
 	if err != nil {
 		return nil, fmt.Errorf("failed to list cluster images: %w", err)
 	}
@@ -383,9 +384,7 @@ func (im *ImageManager) renderedHelmImages(ctx context.Context, svc *config.Serv
 			return nil, fmt.Errorf("failed to create temp dir: %w", err)
 		}
 		defer func() { _ = os.RemoveAll(tmpDir) }()
-		// The provider's pull handles OCI and HTTP(S) repositories the way
-		// install does (repository registration, cached index, credentials)
-		chartPath, err = providers.NewHelmProviderForPacking(im.verbose).PullChartToDir(svc, tmpDir)
+		chartPath, err = im.pullChart(svc, tmpDir)
 		if err != nil {
 			return nil, err
 		}
@@ -605,24 +604,6 @@ func extractImageFieldsRecursive(node interface{}, images *[]string) {
 			extractImageFieldsRecursive(item, images)
 		}
 	}
-}
-
-// FilterLocalImages returns only images that exist in the local Docker daemon
-func (im *ImageManager) FilterLocalImages(ctx context.Context, images []string) ([]string, error) {
-	localImages := make([]string, 0)
-
-	for _, image := range images {
-		info, err := im.GetImageInfo(ctx, image)
-		if err != nil {
-			return nil, fmt.Errorf("failed to get info for image %s: %w", image, err)
-		}
-
-		if info.IsLocal {
-			localImages = append(localImages, image)
-		}
-	}
-
-	return localImages, nil
 }
 
 // DeduplicateImages removes duplicate images from a list

@@ -9,11 +9,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/hjames9/kraze/internal/cluster"
 	"github.com/hjames9/kraze/internal/color"
-	"github.com/hjames9/kraze/internal/config"
 	"github.com/hjames9/kraze/internal/history"
-	"github.com/hjames9/kraze/internal/providers"
 	"github.com/spf13/cobra"
 	"k8s.io/client-go/kubernetes"
 )
@@ -56,26 +53,26 @@ func runHistory(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("--limit must be 0 (all) or a positive number")
 	}
 
-	cfgPaths, cleanupPack, err := resolveAndExtractConfigFiles(cmd)
+	loaded, cleanupPack, err := loadConfig(cmd, "")
 	if err != nil {
 		return err
 	}
 	defer cleanupPack()
-	cfg, err := config.ParseMultiple(cfgPaths)
-	if err != nil {
-		return fmt.Errorf("failed to parse config: %w", err)
-	}
+	cfg := loaded.cfg
 
-	clientset, err := historyClient(ctx, &cfg.Cluster)
+	if err := requireDocker(ctx, cfg); err != nil {
+		return err
+	}
+	conn, err := connectCluster(ctx, deps.newClusterManager(), cfg, skipMissing)
 	if err != nil {
 		return err
 	}
-	if clientset == nil {
+	if conn == nil {
 		fmt.Printf("Cluster '%s' is not running\n", cfg.Cluster.Name)
 		return nil
 	}
 
-	entries, err := history.Load(ctx, clientset)
+	entries, err := history.Load(ctx, conn.clientset)
 	if err != nil {
 		return err
 	}
@@ -101,43 +98,6 @@ func runHistory(cmd *cobra.Command, args []string) error {
 	fmt.Println()
 	fmt.Print(formatHistory(entries, verbose, historyAllProjects))
 	return nil
-}
-
-// historyClient returns a client for the cluster, or nil if a kind cluster does
-// not exist
-func historyClient(ctx context.Context, clusterCfg *config.ClusterConfig) (kubernetes.Interface, error) {
-	kindMgr := cluster.NewKindManager()
-	isExternal := clusterCfg.IsExternal()
-
-	var kubeconfig string
-	var err error
-	if isExternal {
-		kubeconfig, err = kindMgr.GetKubeconfigForExternalCluster(clusterCfg)
-		if err != nil {
-			return nil, fmt.Errorf("failed to get kubeconfig for external cluster: %w", err)
-		}
-	} else {
-		if err := cluster.CheckDockerAvailable(ctx); err != nil {
-			return nil, err
-		}
-		exists, err := kindMgr.ClusterExists(clusterCfg.Name)
-		if err != nil {
-			return nil, fmt.Errorf("failed to check cluster: %w", err)
-		}
-		if !exists {
-			return nil, nil
-		}
-		kubeconfig, err = kindMgr.GetKubeConfig(clusterCfg.Name, false)
-		if err != nil {
-			return nil, fmt.Errorf("failed to get kubeconfig: %w", err)
-		}
-	}
-
-	clientset, err := providers.GetClientsetFromKubeconfigContent(kubeconfig, !isExternal)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create Kubernetes client: %w", err)
-	}
-	return clientset, nil
 }
 
 // selectHistory returns entries newest first, keeping only those run by project

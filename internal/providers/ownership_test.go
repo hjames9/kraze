@@ -3,6 +3,7 @@ package providers
 import (
 	"context"
 	"fmt"
+	"k8s.io/client-go/kubernetes/fake"
 	"os"
 	"path/filepath"
 	"strings"
@@ -45,7 +46,7 @@ func fakeManifestsProvider(project string, objs ...runtime.Object) *ManifestsPro
 	mapper := meta.NewDefaultRESTMapper(nil)
 	mapper.Add(schema.GroupVersionKind{Version: "v1", Kind: "ConfigMap"}, meta.RESTScopeNamespace)
 	mapper.Add(schema.GroupVersionKind{Group: "rbac.authorization.k8s.io", Version: "v1", Kind: "ClusterRole"}, meta.RESTScopeRoot)
-	return &ManifestsProvider{opts: &ProviderOptions{Project: project, Quiet: true}, dynamicClient: dyn, mapper: mapper}
+	return newManifestsProviderWithClients(&ProviderOptions{Project: project, Quiet: true}, &kubeClients{dynamic: dyn, clientset: fake.NewSimpleClientset(), mapper: mapper})
 }
 
 // object builds an existing cluster object with the given labels and annotations

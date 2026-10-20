@@ -3,11 +3,8 @@ package cli
 import (
 	"context"
 	"fmt"
-	"strings"
 
-	"github.com/hjames9/kraze/internal/cluster"
 	"github.com/hjames9/kraze/internal/config"
-	"github.com/hjames9/kraze/internal/providers"
 	"github.com/hjames9/kraze/internal/state"
 	"github.com/spf13/cobra"
 )
@@ -33,26 +30,15 @@ You can filter services by name or by labels:
 func runStatus(cmd *cobra.Command, args []string) error {
 	ctx := cmd.Context()
 
-	cfgPaths, cleanupPack, err := resolveAndExtractConfigFiles(cmd)
+	loaded, cleanupPack, err := loadConfig(cmd, "Checking status from config file(s): %s")
 	if err != nil {
 		return err
 	}
 	defer cleanupPack()
-	Verbose("Checking status from config file(s): %s", strings.Join(cfgPaths, ", "))
+	cfg := loaded.cfg
 
-	// Parse configuration
-	cfg, err := config.ParseMultiple(cfgPaths)
-	if err != nil {
-		return fmt.Errorf("failed to parse config: %w", err)
-	}
-
-	// Check Docker availability (only for kind clusters, not external)
-	if !cfg.Cluster.IsExternal() {
-		Verbose("Checking Docker availability...")
-		if err := cluster.CheckDockerAvailable(ctx); err != nil {
-			return err
-		}
-		Verbose("Docker is available")
+	if err := requireDocker(ctx, cfg); err != nil {
+		return err
 	}
 
 	// Filter services if specified
@@ -82,28 +68,26 @@ func runStatus(cmd *cobra.Command, args []string) error {
 		cfg.Services = filteredServices
 	}
 
-	// Check if cluster exists
-	kindMgr := cluster.NewKindManager()
-
-	clusterExists, err := kindMgr.ClusterExists(cfg.Cluster.Name)
-	if err != nil {
-		return fmt.Errorf("failed to check cluster: %w", err)
+	kindMgr := deps.newClusterManager()
+	if !cfg.Cluster.IsExternal() {
+		clusterExists, err := kindMgr.ClusterExists(cfg.Cluster.Name)
+		if err != nil {
+			return fmt.Errorf("failed to check cluster: %w", err)
+		}
+		if !clusterExists {
+			fmt.Printf("Cluster '%s' is not running\n", cfg.Cluster.Name)
+			fmt.Println("\nNo services are currently deployed.")
+			return nil
+		}
 	}
 
-	if !clusterExists {
-		fmt.Printf("Cluster '%s' is not running\n", cfg.Cluster.Name)
-		fmt.Println("\nNo services are currently deployed.")
-		return nil
-	}
-
-	// Get kubeconfig
-	kubeconfig, err := kindMgr.GetKubeConfig(cfg.Cluster.Name, false)
+	kubeconfig, err := clusterKubeconfig(kindMgr, cfg)
 	if err != nil {
-		return fmt.Errorf("failed to get kubeconfig: %w", err)
+		return err
 	}
 
 	if statusAllProjects {
-		return printAllProjectsStatus(ctx, cfg.Cluster.Name, kubeconfig)
+		return printAllProjectsStatus(ctx, cfg, kubeconfig)
 	}
 
 	fmt.Printf("Cluster: %s\n", cfg.Cluster.Name)
@@ -119,12 +103,12 @@ func runStatus(cmd *cobra.Command, args []string) error {
 	// What `up` recorded (completed Jobs, see ManifestsProvider.Status).
 	// Without it, status still reports what exists.
 	var st *state.ClusterState
-	if clientset, err := providers.GetClientsetFromKubeconfigContent(kubeconfig, true); err != nil {
+	if clientset, err := clusterClient(cfg, kubeconfig); err != nil {
 		Verbose("Warning: failed to create Kubernetes client: %v", err)
 	} else if st, err = state.Load(ctx, clientset, cfg.Cluster.Name); err != nil {
 		Verbose("Warning: failed to load cluster state: %v", err)
 		st = nil
-	} else {
+	} else if st != nil { // nil: nothing recorded on this cluster yet
 		st.SetProject(cfg.Project)
 	}
 
@@ -143,12 +127,7 @@ func runStatus(cmd *cobra.Command, args []string) error {
 		}
 
 		// Create provider options
-		providerOpts := &providers.ProviderOptions{
-			ClusterName: cfg.Cluster.Name,
-			Project:     cfg.Project,
-			KubeConfig:  kubeconfig,
-			Verbose:     verbose,
-		}
+		providerOpts := baseProviderOptions(cfg, kubeconfig)
 		if st != nil {
 			if recorded, ok := st.GetService(name); ok {
 				providerOpts.Recorded = recorded.Resources
@@ -156,7 +135,7 @@ func runStatus(cmd *cobra.Command, args []string) error {
 		}
 
 		// Create provider
-		provider, err := providers.NewProvider(&svc, providerOpts)
+		provider, err := deps.newProvider(&svc, providerOpts)
 		if err != nil {
 			fmt.Printf("%-20s %-12s %-10s %-10s %s\n",
 				name, svc.Type, "ERROR", "ERROR", fmt.Sprintf("Failed to create provider: %v", err))
@@ -216,16 +195,16 @@ func init() {
 // printAllProjectsStatus lists every service recorded in the cluster state,
 // across all projects sharing the cluster. It reads state only and doesn't
 // query each service's live status.
-func printAllProjectsStatus(ctx context.Context, clusterName, kubeconfig string) error {
-	clientset, err := providers.GetClientsetFromKubeconfigContent(kubeconfig, true)
+func printAllProjectsStatus(ctx context.Context, cfg *config.Config, kubeconfig string) error {
+	clientset, err := clusterClient(cfg, kubeconfig)
 	if err != nil {
 		return fmt.Errorf("failed to create Kubernetes client: %w", err)
 	}
-	st, err := state.Load(ctx, clientset, clusterName)
+	st, err := state.Load(ctx, clientset, cfg.Cluster.Name)
 	if err != nil {
 		return fmt.Errorf("failed to load cluster state: %w", err)
 	}
-	printProjectsTable(clusterName, st)
+	printProjectsTable(cfg.Cluster.Name, st)
 	return nil
 }
 
