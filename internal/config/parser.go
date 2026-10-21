@@ -39,9 +39,7 @@ func Parse(configPath string) (*Config, error) {
 	}
 
 	// Resolve relative paths
-	if err := config.ResolvePaths(configPath); err != nil {
-		return nil, fmt.Errorf("failed to resolve paths: %w", err)
-	}
+	config.ResolvePaths(configPath)
 
 	return &config, nil
 }
@@ -184,7 +182,7 @@ func (cfg *Config) Validate() error {
 
 // ResolvePaths resolves all relative paths in the configuration to absolute paths
 // relative to the config file location
-func (cfg *Config) ResolvePaths(configPath string) error {
+func (cfg *Config) ResolvePaths(configPath string) {
 	configDir := filepath.Dir(configPath)
 
 	for name, svc := range cfg.Services {
@@ -216,8 +214,6 @@ func (cfg *Config) ResolvePaths(configPath string) error {
 
 		cfg.Services[name] = svc
 	}
-
-	return nil
 }
 
 // GetService returns a service by name

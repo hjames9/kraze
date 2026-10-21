@@ -152,7 +152,7 @@ func runInit(cmd *cobra.Command, args []string) (retErr error) {
 
 	// Load the cluster state, creating it if needed. An external cluster may
 	// already hold other projects' state, which must not be overwritten.
-	st, _, err := loadClusterState(ctx, clientset, cfg, stateRequired)
+	st, _, err := loadClusterState(ctx, clientset, cfg)
 	if err != nil {
 		return err
 	}

@@ -1284,12 +1284,8 @@ func (kind *KindManager) connectToHostNetwork(clusterName string, networkName st
 			return fmt.Errorf("failed to ensure network '%s' exists: %w", networkName, err)
 		}
 	} else {
-		// Auto-detect networks
+		// Auto-detect networks (never empty: bridge is the fallback)
 		networksToTry = kind.detectNetworks()
-		if len(networksToTry) == 0 {
-			// Not running in a container — no additional network connection needed.
-			return nil
-		}
 	}
 
 	for _, network := range networksToTry {

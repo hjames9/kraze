@@ -228,10 +228,7 @@ func runDown(cmd *cobra.Command, args []string) (retErr error) {
 	defer func() { finishHistory(rec, retErr) }()
 
 	// Load cluster state
-	st, _, err := loadClusterState(ctx, clientset, cfg, stateBestEffort)
-	if err != nil {
-		return err
-	}
+	st := loadClusterStateOrEmpty(ctx, clientset, cfg)
 	adoptProject(st, cfg, configured, true)
 
 	// Collect namespace candidates BEFORE uninstalling, since uninstalling

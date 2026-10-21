@@ -444,7 +444,7 @@ func deepMergeValues(base, override map[string]interface{}) map[string]interface
 	return result
 }
 
-func (im *ImageManager) extractImagesFromLocalChart(svc *config.ServiceConfig) ([]string, error) {
+func (im *ImageManager) extractImagesFromLocalChart(svc *config.ServiceConfig) []string {
 	// Start with chart's default values.yaml as the base, then deep-merge each
 	// override file on top — exactly as Helm does. This ensures that a tag defined
 	// only in an override file is paired with the repository from the chart defaults.
@@ -508,7 +508,7 @@ func (im *ImageManager) extractImagesFromLocalChart(svc *config.ServiceConfig) (
 
 	images := make([]string, 0)
 	im.extractImagesRecursive(merged, &images)
-	return images, nil
+	return images
 }
 
 // ExtractImagesFromManifests extracts images from Kubernetes manifest files
@@ -661,14 +661,7 @@ func (im *ImageManager) GetImagesForService(ctx context.Context, svc *config.Ser
 			}
 		}
 		if svc.IsLocalChart() {
-			chartImages, err := im.extractImagesFromLocalChart(svc)
-			if err != nil {
-				if im.verbose {
-					fmt.Printf("Warning: Failed to extract images from chart: %v\n", err)
-				}
-			} else {
-				images = append(images, chartImages...)
-			}
+			images = append(images, im.extractImagesFromLocalChart(svc)...)
 		}
 
 	} else if svc.IsManifests() {

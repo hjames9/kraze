@@ -136,6 +136,13 @@ func (v *ValuesField) UnmarshalYAML(unmarshal func(interface{}) error) error {
 	return fmt.Errorf("values must be a string or array of strings")
 }
 
+// IsZero reports whether no values files are set. yaml.v3's omitempty uses it:
+// without it the struct, having no exported fields, always counted as empty,
+// so `values` was dropped from marshaled configs.
+func (v ValuesField) IsZero() bool {
+	return v.IsEmpty()
+}
+
 // MarshalYAML implements custom marshaling
 func (v ValuesField) MarshalYAML() (interface{}, error) {
 	if len(v.files) == 0 {

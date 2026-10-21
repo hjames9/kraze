@@ -135,6 +135,9 @@ type fakeProvider struct {
 	kubeconfig string
 	createErr  error
 	listErr    error
+	deleteErr  error
+	kubeErr    error // KubeConfig
+	nodesErr   error // ListInternalNodes
 	created    []string
 	deleted    []string
 }
@@ -156,7 +159,7 @@ func (p *fakeProvider) Delete(name, _ string) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.deleted = append(p.deleted, name)
-	return nil
+	return p.deleteErr
 }
 
 func (p *fakeProvider) List() ([]string, error) {
@@ -166,12 +169,15 @@ func (p *fakeProvider) List() ([]string, error) {
 }
 
 func (p *fakeProvider) KubeConfig(string, bool) (string, error) {
-	return p.kubeconfig, nil
+	return p.kubeconfig, p.kubeErr
 }
 
 func (p *fakeProvider) ListInternalNodes(string) ([]nodes.Node, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	if p.nodesErr != nil {
+		return nil, p.nodesErr
+	}
 	var out []nodes.Node
 	for _, n := range p.nodes {
 		out = append(out, fakeNode{name: n})
@@ -187,6 +193,12 @@ type testHost struct {
 	bins   map[string]string
 	home   string
 	sleeps []time.Duration
+	// statErr fails stat (with something other than not-exist) for a path;
+	// readErr fails readFile; homeErr fails homeDir
+	statErr map[string]error
+	readErr map[string]error
+	homeErr error
+	hostErr error
 	// existing is the user's kubeconfig before UpdateKubeconfigFile (nil: none)
 	existing *clientcmdapi.Config
 }
@@ -196,25 +208,31 @@ type fakeFileInfo struct{ fs.FileInfo }
 func (h *testHost) env(t *testing.T) hostEnv {
 	return hostEnv{
 		stat: func(path string) (fs.FileInfo, error) {
+			if err := h.statErr[path]; err != nil {
+				return nil, err
+			}
 			if _, ok := h.files[path]; ok {
 				return fakeFileInfo{}, nil
 			}
 			return nil, fs.ErrNotExist
 		},
 		readFile: func(path string) ([]byte, error) {
+			if err := h.readErr[path]; err != nil {
+				return nil, err
+			}
 			if content, ok := h.files[path]; ok {
 				return []byte(content), nil
 			}
 			return nil, fs.ErrNotExist
 		},
-		hostname: func() (string, error) { return "devbox", nil },
+		hostname: func() (string, error) { return "devbox", h.hostErr },
 		lookPath: func(file string) (string, error) {
 			if path, ok := h.bins[file]; ok {
 				return path, nil
 			}
 			return "", fmt.Errorf("%s: not found", file)
 		},
-		homeDir: func() (string, error) { return h.home, nil },
+		homeDir: func() (string, error) { return h.home, h.homeErr },
 		sleep: func(d time.Duration) {
 			h.mu.Lock()
 			defer h.mu.Unlock()

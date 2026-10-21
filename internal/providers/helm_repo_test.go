@@ -6,6 +6,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync/atomic"
 	"testing"
 
@@ -299,5 +300,29 @@ func TestAddHTTPRepositoryForChart_PreservesRepositoryEntry(test *testing.T) {
 	}
 	if entry.Username != "someone" || entry.Password != "s3cret" || !entry.InsecureSkipTLSVerify {
 		test.Errorf("repository entry was clobbered by refresh: %+v", entry)
+	}
+}
+
+// The offline fallback tells the user it's using the cached index, and a
+// cached index that doesn't parse never counts as having a version
+func TestAddHTTPRepositoryOfflineWarningAndCorruptCache(test *testing.T) {
+	server, _, _ := newIndexServer(test)
+	helm := newTestHelmProvider(test)
+	repoName, err := helm.addHTTPRepositoryForChart(server.URL, "mychart", "1.0.0")
+	if err != nil {
+		test.Fatal(err)
+	}
+	server.Close()
+	helm.opts.Quiet = false
+	out := captureOutput(test, func() { _, err = helm.addHTTPRepositoryForChart(server.URL, "mychart", "2.0.0") })
+	if err != nil || !strings.Contains(out, "using cached index") {
+		test.Errorf("err = %v, output:\n%s", err, out)
+	}
+
+	if err := os.WriteFile(helm.cachedIndexPath(repoName), []byte("not: [yaml"), 0o644); err != nil {
+		test.Fatal(err)
+	}
+	if helm.cachedIndexHasVersion(repoName, "mychart", "1.0.0") {
+		test.Error("a corrupt cached index has no versions")
 	}
 }

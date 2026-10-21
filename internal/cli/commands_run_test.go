@@ -383,6 +383,7 @@ func TestDestroyUnreadableState(t *testing.T) {
 		"no client":        func(env *fakeEnv) { env.clientsetErr = errBoom },
 		"cluster check":    func(env *fakeEnv) { env.cluster.errs["ClusterExists"] = errBoom },
 		"state never made": func(env *fakeEnv) {},
+		"state unreadable": func(env *fakeEnv) { env.failVerb("get", "configmaps") },
 	} {
 		t.Run(name, func(t *testing.T) {
 			env := withFakeDeps(t)

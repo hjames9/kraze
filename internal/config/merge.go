@@ -105,9 +105,7 @@ func parseWithoutCrossRefValidation(configPath string) (*Config, error) {
 	}
 
 	// Resolve relative paths based on this file's directory.
-	if err := cfg.ResolvePaths(configPath); err != nil {
-		return nil, fmt.Errorf("failed to resolve paths: %w", err)
-	}
+	cfg.ResolvePaths(configPath)
 
 	return &cfg, nil
 }
@@ -270,13 +268,8 @@ func mergeProxyConfigs(a, b *ProxyConfig, fileIdx int) (*ProxyConfig, error) {
 	}
 
 	// http_proxy / https_proxy: must agree if both set.
-	if err := mergeStringField(&result.HTTPProxy, a.HTTPProxy, "cluster.proxy.http_proxy", fileIdx); err != nil {
-		return nil, err
-	}
+	result.HTTPProxy, result.HTTPSProxy = a.HTTPProxy, a.HTTPSProxy
 	if err := mergeStringField(&result.HTTPProxy, b.HTTPProxy, "cluster.proxy.http_proxy", fileIdx); err != nil {
-		return nil, err
-	}
-	if err := mergeStringField(&result.HTTPSProxy, a.HTTPSProxy, "cluster.proxy.https_proxy", fileIdx); err != nil {
 		return nil, err
 	}
 	if err := mergeStringField(&result.HTTPSProxy, b.HTTPSProxy, "cluster.proxy.https_proxy", fileIdx); err != nil {

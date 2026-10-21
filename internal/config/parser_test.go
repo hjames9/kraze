@@ -275,9 +275,7 @@ func TestResolvePaths(test *testing.T) {
 		},
 	}
 
-	if err := cfg.ResolvePaths(configFile); err != nil {
-		test.Fatalf("ResolvePaths failed: %v", err)
-	}
+	cfg.ResolvePaths(configFile)
 
 	expected := filepath.Join(tmpDir, "manifests")
 	if cfg.Services["api"].Path != expected {

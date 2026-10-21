@@ -197,7 +197,7 @@ func runUp(cmd *cobra.Command, args []string) (retErr error) {
 	defer func() { finishHistory(rec, retErr) }()
 
 	// Load or create cluster state
-	st, existing, err := loadClusterState(ctx, clientset, cfg, stateRequired)
+	st, existing, err := loadClusterState(ctx, clientset, cfg)
 	if err != nil {
 		return err
 	}

@@ -39,7 +39,7 @@ You can filter services by name or by labels:
 type ServicePlanInfo struct {
 	Name            string
 	Type            string
-	Action          string // "add", "change", "no-change", "skipped", "conflict"
+	Action          string // "add", "no-change", "skipped", "conflict"
 	Version         string
 	Namespace       string
 	NamespaceAction string // one of the namespace* constants
@@ -224,9 +224,7 @@ func runPlan(cmd *cobra.Command, args []string) error {
 				namespaces = newClusterNamespaces(names...)
 			}
 
-			if st, _, err = loadClusterState(ctx, clientset, cfg, stateBestEffort); err != nil {
-				return err
-			}
+			st = loadClusterStateOrEmpty(ctx, clientset, cfg)
 		}
 	}
 
@@ -257,7 +255,6 @@ func runPlan(cmd *cobra.Command, args []string) error {
 	// Analyze services
 	serviceInfos := make(map[string]*ServicePlanInfo)
 	toAdd := 0
-	toChange := 0
 	noChange := 0
 	skipped := 0
 	conflicts := 0
@@ -284,8 +281,6 @@ func runPlan(cmd *cobra.Command, args []string) error {
 		switch info.Action {
 		case "add":
 			toAdd++
-		case "change":
-			toChange++
 		case "no-change":
 			noChange++
 		case "conflict":
@@ -318,7 +313,7 @@ func runPlan(cmd *cobra.Command, args []string) error {
 	printMovedPlan(movedInstalls(st, cfg.Services), cfg.Services)
 
 	// Print summary
-	printPlanSummary(toAdd, toChange, noChange, skipped, conflicts, orphans)
+	printPlanSummary(toAdd, noChange, skipped, conflicts, orphans)
 
 	return nil
 }
@@ -366,11 +361,8 @@ func analyzeService(svc *config.ServiceConfig, st *state.ClusterState, namespace
 
 	if owner, ok := st.ConflictingOwner(svc.Name, info.Namespace); ok {
 		// kraze up refuses to install over another project's release
-		if owner == "" {
-			owner = "(no project)"
-		}
 		info.Action = "conflict"
-		info.Details = fmt.Sprintf("already installed in namespace '%s' by project %s", info.Namespace, owner)
+		info.Details = fmt.Sprintf("already installed in namespace '%s' by project %s", info.Namespace, projectLabel(owner))
 		return info
 	}
 
@@ -413,8 +405,6 @@ func printServicePlan(info *ServicePlanInfo) {
 	switch info.Action {
 	case "add":
 		formattedSymbol = color.Green("+")
-	case "change":
-		formattedSymbol = color.Yellow("~")
 	case "skipped":
 		formattedSymbol = color.Gray("-")
 	case "conflict":
@@ -486,15 +476,12 @@ func printMovedPlan(moved []state.ServiceMetadata, services map[string]config.Se
 	fmt.Println()
 }
 
-func printPlanSummary(toAdd, toChange, noChange, skipped, conflicts, orphans int) {
+func printPlanSummary(toAdd, noChange, skipped, conflicts, orphans int) {
 	fmt.Printf("%s", color.Bold("Plan:"))
 
 	parts := []string{}
 	if toAdd > 0 {
 		parts = append(parts, color.Green(fmt.Sprintf("%d to add", toAdd)))
-	}
-	if toChange > 0 {
-		parts = append(parts, color.Yellow(fmt.Sprintf("%d to change", toChange)))
 	}
 	if noChange > 0 {
 		parts = append(parts, fmt.Sprintf("%d no change", noChange))

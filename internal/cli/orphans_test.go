@@ -19,6 +19,7 @@ import (
 // fakeOrphanBackend records what removeOrphans asks it to do
 type fakeOrphanBackend struct {
 	helmReleases  map[string]bool // releases that exist, by name
+	existsErr     error           // helmReleaseExists fails
 	failUninstall map[string]bool
 	uninstallErr  map[string]error // returned by uninstallHelm, by name
 	uninstalled   []string
@@ -27,7 +28,7 @@ type fakeOrphanBackend struct {
 }
 
 func (b *fakeOrphanBackend) helmReleaseExists(_ context.Context, svc *config.ServiceConfig) (bool, error) {
-	return b.helmReleases[svc.Name], nil
+	return b.helmReleases[svc.Name], b.existsErr
 }
 
 func (b *fakeOrphanBackend) uninstallHelm(_ context.Context, svc *config.ServiceConfig) error {
@@ -266,7 +267,7 @@ func TestPrintOrphanPlan(t *testing.T) {
 		t.Errorf("no orphans should print nothing, got %d and %q", count, out)
 	}
 
-	summary := captureStdout(t, func() { printPlanSummary(1, 0, 0, 0, 0, 2) })
+	summary := captureStdout(t, func() { printPlanSummary(1, 0, 0, 0, 2) })
 	if !strings.Contains(summary, "2 orphaned") {
 		t.Errorf("summary should count orphans, got %q", summary)
 	}

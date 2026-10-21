@@ -6,14 +6,14 @@
 # usually code that went back to calling the outside world directly.
 #
 # Raise FLOOR when coverage rises, to just under what CI measures (CI has no
-# Docker, so the four Docker tests skip there). Lowering it needs a reason in
+# Docker; the Docker tests that need a real daemon skip there). Lowering it needs a reason in
 # the commit.
 #
 # Usage: scripts/coverage-floor.sh <coverage.out>
 
 set -euo pipefail
 
-FLOOR=78.0
+FLOOR=99.0
 
 profile=${1:?usage: $0 <coverage.out>}
 

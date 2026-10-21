@@ -869,10 +869,7 @@ worker:
 	}
 
 	im := NewImageManager(false)
-	images, err := im.extractImagesFromLocalChart(svc)
-	if err != nil {
-		test.Fatalf("extractImagesFromLocalChart() error: %v", err)
-	}
+	images := im.extractImagesFromLocalChart(svc)
 
 	// Must find the merged worker image with the overridden tag
 	expectedImages := []string{"hjames/ruya:latest", "hjames/ruya_worker:rocm7.2.1-torch2.9.1"}
@@ -965,10 +962,7 @@ sidecar:
 	}
 
 	im := NewImageManager(false)
-	images, err := im.extractImagesFromLocalChart(svc)
-	if err != nil {
-		test.Fatalf("extractImagesFromLocalChart() error: %v", err)
-	}
+	images := im.extractImagesFromLocalChart(svc)
 
 	expected := []string{"myrepo/myservice:2.5.0", "myrepo/sidecar:latest"}
 	for _, want := range expected {
@@ -1018,10 +1012,7 @@ image:
 	}
 
 	im := NewImageManager(false)
-	images, err := im.extractImagesFromLocalChart(svc)
-	if err != nil {
-		test.Fatalf("extractImagesFromLocalChart() error: %v", err)
-	}
+	images := im.extractImagesFromLocalChart(svc)
 
 	for _, img := range images {
 		if img == "myrepo/myservice:1.0.0" {

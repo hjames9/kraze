@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
+	"os"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -47,8 +49,10 @@ type fakeEnv struct {
 	dockerChecks int
 	sleeps       []time.Duration
 
-	deletedNamespaces []string
-	waitedNamespaces  []string
+	deletedNamespaces  []string
+	waitedNamespaces   []string
+	deleteNamespaceErr error
+	waitNamespaceErr   error
 
 	pods           map[string][]string // per service
 	podsErr        error
@@ -71,7 +75,8 @@ func withFakeDeps(t *testing.T) *fakeEnv {
 		pods:         map[string][]string{},
 	}
 	env.cluster = &fakeCluster{env: env, kubeconfig: "kind-kubeconfig", externalKubeconfig: "external-kubeconfig", errs: map[string]error{}}
-	env.images = &fakeImages{images: map[string][]string{}, info: map[string]*cluster.ImageInfo{}, clusterHash: map[string]string{}}
+	env.images = &fakeImages{images: map[string][]string{}, info: map[string]*cluster.ImageInfo{}, clusterHash: map[string]string{},
+		infoErr: map[string]error{}, hashErr: map[string]error{}}
 
 	orig := deps
 	t.Cleanup(func() { deps = orig })
@@ -115,13 +120,13 @@ func withFakeDeps(t *testing.T) *fakeEnv {
 			env.mu.Lock()
 			defer env.mu.Unlock()
 			env.deletedNamespaces = append(env.deletedNamespaces, ns)
-			return nil
+			return env.deleteNamespaceErr
 		},
 		waitNamespaceDeleted: func(_ context.Context, _, ns string, _ time.Duration) error {
 			env.mu.Lock()
 			defer env.mu.Unlock()
 			env.waitedNamespaces = append(env.waitedNamespaces, ns)
-			return nil
+			return env.waitNamespaceErr
 		},
 		podsForService: func(_ context.Context, _ string, svc *config.ServiceConfig) ([]string, error) {
 			env.mu.Lock()
@@ -309,17 +314,24 @@ type fakeImages struct {
 	info        map[string]*cluster.ImageInfo
 	clusterHash map[string]string
 	listed      []cluster.ClusterImage
+	imagesErr   error // GetImagesForService
+	listErr     error // ListClusterImages
+	infoErr     map[string]error
+	hashErr     map[string]error
 }
 
 func (f *fakeImages) GetImagesForService(_ context.Context, svc *config.ServiceConfig, _ string) ([]string, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	return f.images[svc.Name], nil
+	return f.images[svc.Name], f.imagesErr
 }
 
 func (f *fakeImages) GetImageInfo(_ context.Context, image string) (*cluster.ImageInfo, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if err := f.infoErr[image]; err != nil {
+		return nil, err
+	}
 	if info, ok := f.info[image]; ok {
 		return info, nil
 	}
@@ -329,13 +341,13 @@ func (f *fakeImages) GetImageInfo(_ context.Context, image string) (*cluster.Ima
 func (f *fakeImages) GetClusterImageHash(_ context.Context, _, image string) (string, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	return f.clusterHash[image], nil
+	return f.clusterHash[image], f.hashErr[image]
 }
 
 func (f *fakeImages) ListClusterImages(context.Context, string) ([]cluster.ClusterImage, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	return f.listed, nil
+	return f.listed, f.listErr
 }
 
 // fakeProvider installs a service by remembering it. The *Err fields make
@@ -351,6 +363,7 @@ type fakeProvider struct {
 	status       *providers.ServiceStatus
 	statusErr    error
 	refs         []state.ResourceRef
+	refsErr      error
 
 	installs   int
 	uninstalls int
@@ -406,7 +419,7 @@ func (p *fakeProvider) IsInstalled(context.Context, *config.ServiceConfig) (bool
 func (p *fakeProvider) ResourceRefs(*config.ServiceConfig) ([]state.ResourceRef, error) {
 	p.env.mu.Lock()
 	defer p.env.mu.Unlock()
-	return p.refs, nil
+	return p.refs, p.refsErr
 }
 
 // eventOrphanBackend logs orphan removal to the env's events
@@ -461,6 +474,7 @@ func resetFlags(t *testing.T) {
 	setVar(t, &historyLimit, 20)
 	setVar(t, &historyAllProjects, false)
 	setVar(t, &historyOutput, "table")
+	setVar(t, &packOutput, "")
 }
 
 // setVar sets *p to v for the rest of the test
@@ -568,3 +582,34 @@ func assertContains(t *testing.T, out string, want ...string) {
 }
 
 var errBoom = errors.New("boom")
+
+// parseConfig parses a config from YAML
+func parseConfig(t *testing.T, content string) *config.Config {
+	t.Helper()
+	path := writeConfig(t, filepath.Join(t.TempDir(), "kraze.yml"), content)
+	cfg, err := config.ParseMultiple([]string{path})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return cfg
+}
+
+// captureStderr runs fn while redirecting os.Stderr, returning what it wrote
+func captureStderr(t *testing.T, fn func()) string {
+	t.Helper()
+	orig := os.Stderr
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	os.Stderr = w
+	done := make(chan []byte)
+	go func() {
+		data, _ := io.ReadAll(r)
+		done <- data
+	}()
+	fn()
+	_ = w.Close()
+	os.Stderr = orig
+	return string(<-done)
+}

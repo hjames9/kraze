@@ -339,12 +339,8 @@ func parseManifestsYAML(manifestYAML string) ([]*unstructured.Unstructured, erro
 		return nil, err
 	}
 
+	// Blank documents were dropped by the split
 	for _, doc := range docs {
-		doc = strings.TrimSpace(doc)
-		if doc == "" {
-			continue
-		}
-
 		obj, err := parseYAMLToUnstructured(doc)
 		if err != nil {
 			// Skip parse errors (might be comments or invalid YAML)

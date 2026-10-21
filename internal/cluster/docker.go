@@ -48,6 +48,9 @@ func getCommonDockerSockets() []string {
 	return sockets
 }
 
+// dockerSockets lists the socket paths to try; a variable so tests choose them
+var dockerSockets = getCommonDockerSockets
+
 // tryDockerSocket attempts to create a Docker client using the specified socket
 // Returns the client if successful, nil otherwise
 func tryDockerSocket(ctx context.Context, socketPath string) (*client.Client, error) {
@@ -92,7 +95,7 @@ func getDockerClientWithFallback(ctx context.Context) (*client.Client, error) {
 	var lastErr error
 	triedPaths := []string{}
 
-	for _, socketPath := range getCommonDockerSockets() {
+	for _, socketPath := range dockerSockets() {
 		triedPaths = append(triedPaths, socketPath)
 		cli, err := tryDockerSocket(ctx, socketPath)
 		if err == nil {

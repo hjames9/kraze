@@ -297,7 +297,7 @@ func (manifest *ManifestsProvider) Status(ctx context.Context, service *config.S
 			obj.SetNamespace(service.GetNamespace())
 		}
 
-		exists, _ := manifest.resourceExists(ctx, obj)
+		exists := manifest.resourceExists(ctx, obj)
 		if exists {
 			existCount++
 		} else if isTTLJob(obj) && completed[jobKey(obj.GetNamespace(), obj.GetName())] {
@@ -710,10 +710,7 @@ func (manifest *ManifestsProvider) existingOwner(ctx context.Context, obj *unstr
 
 // getExisting fetches the cluster's copy of obj, or nil if it doesn't exist
 func (manifest *ManifestsProvider) getExisting(ctx context.Context, obj *unstructured.Unstructured) (*unstructured.Unstructured, error) {
-	gvr, err := manifest.getGVR(obj)
-	if err != nil {
-		return nil, err
-	}
+	gvr := manifest.getGVR(obj)
 	var client dynamic.ResourceInterface
 	if obj.GetNamespace() != "" {
 		client = manifest.dynamicClient.Resource(gvr).Namespace(obj.GetNamespace())
@@ -740,10 +737,7 @@ func describeObject(obj *unstructured.Unstructured) string {
 
 // applyResource applies a resource using the dynamic client
 func (manifest *ManifestsProvider) applyResource(ctx context.Context, obj *unstructured.Unstructured) error {
-	gvr, err := manifest.getGVR(obj)
-	if err != nil {
-		return err
-	}
+	gvr := manifest.getGVR(obj)
 
 	namespace := obj.GetNamespace()
 	name := obj.GetName()
@@ -812,10 +806,7 @@ func (manifest *ManifestsProvider) applyResource(ctx context.Context, obj *unstr
 
 // deleteResource deletes a resource using the dynamic client
 func (manifest *ManifestsProvider) deleteResource(ctx context.Context, obj *unstructured.Unstructured) error {
-	gvr, err := manifest.getGVR(obj)
-	if err != nil {
-		return err
-	}
+	gvr := manifest.getGVR(obj)
 
 	namespace := obj.GetNamespace()
 	name := obj.GetName()
@@ -830,12 +821,10 @@ func (manifest *ManifestsProvider) deleteResource(ctx context.Context, obj *unst
 	return client.Delete(ctx, name, metav1.DeleteOptions{})
 }
 
-// resourceExists checks if a resource exists
-func (manifest *ManifestsProvider) resourceExists(ctx context.Context, obj *unstructured.Unstructured) (bool, error) {
-	gvr, err := manifest.getGVR(obj)
-	if err != nil {
-		return false, err
-	}
+// resourceExists reports whether a resource exists; one that can't be read
+// counts as missing
+func (manifest *ManifestsProvider) resourceExists(ctx context.Context, obj *unstructured.Unstructured) bool {
+	gvr := manifest.getGVR(obj)
 
 	namespace := obj.GetNamespace()
 	name := obj.GetName()
@@ -847,12 +836,8 @@ func (manifest *ManifestsProvider) resourceExists(ctx context.Context, obj *unst
 		client = manifest.dynamicClient.Resource(gvr)
 	}
 
-	_, err = client.Get(ctx, name, metav1.GetOptions{})
-	if err != nil {
-		return false, nil
-	}
-
-	return true, nil
+	_, err := client.Get(ctx, name, metav1.GetOptions{})
+	return err == nil
 }
 
 // isNamespacedResource checks if a resource is namespaced (not cluster-scoped)
@@ -888,7 +873,7 @@ func (manifest *ManifestsProvider) isNamespacedResource(obj *unstructured.Unstru
 }
 
 // getGVR returns the GroupVersionResource for an object
-func (manifest *ManifestsProvider) getGVR(obj *unstructured.Unstructured) (schema.GroupVersionResource, error) {
+func (manifest *ManifestsProvider) getGVR(obj *unstructured.Unstructured) schema.GroupVersionResource {
 	gvk := obj.GroupVersionKind()
 
 	// Use REST mapper to properly map GVK to GVR
@@ -903,10 +888,10 @@ func (manifest *ManifestsProvider) getGVR(obj *unstructured.Unstructured) (schem
 			Group:    gvk.Group,
 			Version:  gvk.Version,
 			Resource: resource,
-		}, nil
+		}
 	}
 
-	return mapping.Resource, nil
+	return mapping.Resource
 }
 
 // waitForAppliedResources waits for already-parsed and applied resources to be ready

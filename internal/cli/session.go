@@ -166,33 +166,32 @@ func newClusterState(cfg *config.Config, recordGPU bool) *state.ClusterState {
 	return state.New(cfg.Cluster.Name, cfg.Cluster.IsExternal(), nvidia, 0, amd, 0)
 }
 
-// stateLoad says how loadClusterState treats a state it can't read
-type stateLoad int
-
-const (
-	// stateRequired: a state that can't be read is an error, and a new one
-	// records the cluster's GPUs (up, init, which write the state)
-	stateRequired stateLoad = iota
-	// stateBestEffort: a state that can't be read counts as empty (down, plan)
-	stateBestEffort
-)
-
-// loadClusterState loads the cluster's state, or returns an empty one if
-// none is recorded yet. existing reports whether one was loaded.
-func loadClusterState(ctx context.Context, clientset kubernetes.Interface, cfg *config.Config, mode stateLoad) (st *state.ClusterState, existing bool, err error) {
+// loadClusterState loads the cluster's state, or returns an empty one that
+// records the cluster's GPUs if none is recorded yet; existing reports which.
+// A state that can't be read is an error: up and init write it back.
+func loadClusterState(ctx context.Context, clientset kubernetes.Interface, cfg *config.Config) (st *state.ClusterState, existing bool, err error) {
 	st, err = state.Load(ctx, clientset, cfg.Cluster.Name)
 	if err != nil {
-		if mode == stateRequired {
-			return nil, false, fmt.Errorf("failed to load cluster state: %w", err)
-		}
-		Verbose("Warning: failed to load cluster state: %v", err)
-		Verbose("Treating as empty state (no services installed)")
-		st = nil
+		return nil, false, fmt.Errorf("failed to load cluster state: %w", err)
 	}
 	if st == nil {
-		return newClusterState(cfg, mode == stateRequired), false, nil
+		return newClusterState(cfg, true), false, nil
 	}
 	return st, true, nil
+}
+
+// loadClusterStateOrEmpty loads the cluster's state for down and plan, which
+// treat a state that can't be read, or none, as empty
+func loadClusterStateOrEmpty(ctx context.Context, clientset kubernetes.Interface, cfg *config.Config) *state.ClusterState {
+	st, err := state.Load(ctx, clientset, cfg.Cluster.Name)
+	if err != nil {
+		Verbose("Warning: failed to load cluster state: %v", err)
+		Verbose("Treating as empty state (no services installed)")
+	}
+	if err != nil || st == nil {
+		return newClusterState(cfg, false)
+	}
+	return st
 }
 
 // adoptProject makes st act as the config's project, warning about unowned

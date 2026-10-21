@@ -60,10 +60,7 @@ func checkServiceConflicts(st *state.ClusterState, services map[string]config.Se
 		if owner != "" && slices.ContainsFunc(storedPaths[owner], func(p string) bool { return slices.Contains(cfgPaths, p) }) {
 			renamedFrom = owner
 		}
-		if owner == "" {
-			owner = "(no project)"
-		}
-		conflicts = append(conflicts, fmt.Sprintf("'%s' in namespace '%s' is owned by project %s", name, svc.GetNamespace(), owner))
+		conflicts = append(conflicts, fmt.Sprintf("'%s' in namespace '%s' is owned by project %s", name, svc.GetNamespace(), projectLabel(owner)))
 	}
 	if len(conflicts) == 0 {
 		return nil
