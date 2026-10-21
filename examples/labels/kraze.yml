@@ -19,9 +19,9 @@ services:
   # Frontend Services
   web-dev:
     type: helm
-    repo: oci://registry-1.docker.io/bitnamicharts
+    repo: oci://registry-1.docker.io/cloudpirates
     chart: nginx
-    version: 18.2.5
+    version: 0.16.12
     namespace: frontend
     labels:
       env: dev
@@ -30,9 +30,9 @@ services:
 
   web-staging:
     type: helm
-    repo: oci://registry-1.docker.io/bitnamicharts
+    repo: oci://registry-1.docker.io/cloudpirates
     chart: nginx
-    version: 18.2.5
+    version: 0.16.12
     namespace: frontend
     labels:
       env: staging
@@ -42,9 +42,9 @@ services:
   # Backend Services
   api-dev:
     type: helm
-    repo: oci://registry-1.docker.io/bitnamicharts
+    repo: oci://registry-1.docker.io/cloudpirates
     chart: redis
-    version: 20.2.1
+    version: 0.37.4
     namespace: backend
     labels:
       env: dev
@@ -53,9 +53,9 @@ services:
 
   api-staging:
     type: helm
-    repo: oci://registry-1.docker.io/bitnamicharts
+    repo: oci://registry-1.docker.io/cloudpirates
     chart: redis
-    version: 20.2.1
+    version: 0.37.4
     namespace: backend
     labels:
       env: staging
@@ -65,9 +65,9 @@ services:
   # Data Services
   database-dev:
     type: helm
-    repo: oci://registry-1.docker.io/bitnamicharts
-    chart: postgresql
-    version: 16.2.4
+    repo: oci://registry-1.docker.io/cloudpirates
+    chart: postgres
+    version: 0.21.2
     namespace: data
     labels:
       env: dev
@@ -76,9 +76,9 @@ services:
 
   database-staging:
     type: helm
-    repo: oci://registry-1.docker.io/bitnamicharts
-    chart: postgresql
-    version: 16.2.4
+    repo: oci://registry-1.docker.io/cloudpirates
+    chart: postgres
+    version: 0.21.2
     namespace: data
     labels:
       env: staging

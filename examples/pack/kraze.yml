@@ -31,16 +31,13 @@ services:
   # Remote Helm chart (OCI) — pulled from registry and bundled as .tgz at pack time
   redis:
     type: helm
-    repo: oci://registry-1.docker.io/bitnamicharts
+    repo: oci://registry-1.docker.io/cloudpirates
     chart: redis
-    version: 20.2.1
+    version: 0.37.4
     namespace: data
     create_namespace: true
     values_inline: |
-      master:
-        resources:
-          requests:
-            memory: "128Mi"
-            cpu: "100m"
-      replica:
-        replicaCount: 1
+      resources:
+        requests:
+          memory: "128Mi"
+          cpu: "100m"

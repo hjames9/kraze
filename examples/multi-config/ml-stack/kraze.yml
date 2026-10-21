@@ -47,19 +47,28 @@ cluster:
         stack: ml
 
 services:
+  # PostgreSQL with the pgvector extension: the postgres chart running the
+  # pgvector image (built on the official postgres image)
   pgvector:
     type: helm
-    chart: postgresql
-    repo: oci://registry-1.docker.io/bitnamicharts
-    version: 16.2.1
+    chart: postgres
+    repo: oci://registry-1.docker.io/cloudpirates
+    version: 0.21.2
     namespace: ml
     depends_on: [postgres]
+    values_inline: |
+      image:
+        repository: pgvector/pgvector
+        tag: "0.8.7-pg18"
 
+  # vLLM's production-stack chart. It serves no model until
+  # servingEngineSpec.modelSpec is set in values (with a ROCm vLLM image for
+  # AMD GPUs); see https://github.com/vllm-project/production-stack
   vllm:
     type: helm
-    chart: vllm
-    repo: oci://registry-1.docker.io/bitnamicharts
-    version: 0.1.0
+    chart: vllm-stack
+    repo: https://vllm-project.github.io/production-stack
+    version: 0.1.13
     namespace: ml
     depends_on: [pgvector]
 
@@ -67,6 +76,6 @@ services:
     type: helm
     chart: open-webui
     repo: https://helm.openwebui.com
-    version: 3.4.1
+    version: 16.6.0
     namespace: ml
     depends_on: [vllm]

@@ -42,13 +42,13 @@ services:
   redis:
     type: helm
     chart: redis
-    repo: oci://registry-1.docker.io/bitnamicharts
-    version: 20.2.1
+    repo: oci://registry-1.docker.io/cloudpirates
+    version: 0.37.4
     namespace: data
 
   postgres:
     type: helm
-    chart: postgresql
-    repo: oci://registry-1.docker.io/bitnamicharts
-    version: 16.2.1
+    chart: postgres
+    repo: oci://registry-1.docker.io/cloudpirates
+    version: 0.21.2
     namespace: data

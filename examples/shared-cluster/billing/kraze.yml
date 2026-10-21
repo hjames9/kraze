@@ -28,7 +28,7 @@ cluster:
 services:
   postgres:
     type: helm
-    chart: postgresql
-    repo: oci://registry-1.docker.io/bitnamicharts
-    version: 16.2.4
+    chart: postgres
+    repo: oci://registry-1.docker.io/cloudpirates
+    version: 0.21.2
     namespace: billing

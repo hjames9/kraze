@@ -21,18 +21,15 @@ services:
   redis:
     type: helm
     chart: redis
-    repo: oci://registry-1.docker.io/bitnamicharts
-    version: 20.2.1
+    repo: oci://registry-1.docker.io/cloudpirates
+    version: 0.37.4
     namespace: data
     create_namespace: true
     values_inline: |
-      master:
-        resources:
-          requests:
-            memory: "128Mi"
-            cpu: "100m"
-      replica:
-        replicaCount: 1
+      resources:
+        requests:
+          memory: "128Mi"
+          cpu: "100m"
 
   # 2. HTTPS Repository - Prometheus Community
   kube-state-metrics:

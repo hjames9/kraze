@@ -1,53 +1,28 @@
-# Values for the bitnami/keycloak chart.
+# Values for the cloudpirates/keycloak chart (official keycloak/keycloak image).
 #
-# The `extraInitContainers` block below is a raw YAML *string* as far as the
-# chart is concerned. kraze's image auto-detection walks structured values and
-# cannot parse an image reference out of an opaque string, so the theme image
-# is listed explicitly under `images:` in kraze.yml.
-#
-# The keycloak image itself comes from the chart defaults and IS auto-detected.
+# The theme ships as a Keycloak provider jar in hjames/kora-keycloak-theme,
+# whose entrypoint copies it to /providers. The init container below mounts
+# the chart's providers volume there, so Keycloak finds the jar in
+# /opt/keycloak/providers at startup.
 
 # Single replica is plenty for local development
 replicaCount: 1
 
-auth:
+keycloak:
   adminUser: admin
   adminPassword: admin
+  # Runs `kc.sh start-dev` (no TLS or hostname setup needed)
+  production: false
 
-# Use the lightweight dev-mode database rather than a bundled PostgreSQL
-postgresql:
-  enabled: false
+# The chart's embedded PostgreSQL (postgres.enabled) is the database.
 
-extraEnvVars:
-  - name: KC_DB
-    value: dev-file
-
-# Copies a custom theme into the Keycloak themes directory before startup.
-# The image referenced here is invisible to auto-detection - see kraze.yml.
-extraInitContainers: |
+extraInitContainers:
   - name: theme-provider
     image: hjames/kora-keycloak-theme:latest
     imagePullPolicy: IfNotPresent
-    command:
-      - sh
-      - -c
-      - cp -R /themes/. /shared-themes/
     volumeMounts:
-      - name: themes
-        mountPath: /shared-themes
-
-extraVolumes:
-  - name: themes
-    emptyDir: {}
-
-extraVolumeMounts:
-  - name: themes
-    mountPath: /opt/bitnami/keycloak/themes/custom
-
-service:
-  type: ClusterIP
-  ports:
-    http: 80
+      - name: keycloak-providers   # the chart's emptyDir for /opt/keycloak/providers
+        mountPath: /providers
 
 resources:
   requests:

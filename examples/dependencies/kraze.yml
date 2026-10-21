@@ -27,9 +27,9 @@ services:
   # Database layer
   postgres:
     type: helm
-    chart: postgresql
-    repo: oci://registry-1.docker.io/bitnamicharts
-    version: 15.5.38
+    chart: postgres
+    repo: oci://registry-1.docker.io/cloudpirates
+    version: 0.21.2
     namespace: data
     create_namespace: true
     post_ready_delay: "5s"  # Give PostgreSQL extra time to stabilize before dependent services start
@@ -38,27 +38,23 @@ services:
         username: appuser
         password: devpassword
         database: appdb
-      primary:
-        resources:
-          requests:
-            memory: "128Mi"
-            cpu: "100m"
+      resources:
+        requests:
+          memory: "128Mi"
+          cpu: "100m"
 
   redis:
     type: helm
     chart: redis
-    repo: oci://registry-1.docker.io/bitnamicharts
-    version: 20.2.1
+    repo: oci://registry-1.docker.io/cloudpirates
+    version: 0.37.4
     namespace: data
     create_namespace: true
     values_inline: |
-      master:
-        resources:
-          requests:
-            memory: "64Mi"
-            cpu: "50m"
-      replica:
-        replicaCount: 0
+      resources:
+        requests:
+          memory: "64Mi"
+          cpu: "50m"
 
   # Application layer
   backend:

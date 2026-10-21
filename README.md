@@ -283,7 +283,7 @@ services:
   # Deploy Redis from Helm chart
   redis:
     type: helm
-    repo: oci://registry-1.docker.io/bitnamicharts
+    repo: oci://registry-1.docker.io/cloudpirates
     chart: redis
     namespace: data
     create_namespace: true
@@ -291,9 +291,9 @@ services:
   # Deploy PostgreSQL from Helm chart
   postgres:
     type: helm
-    repo: oci://registry-1.docker.io/bitnamicharts
-    chart: postgresql
-    version: 18.1.9
+    repo: oci://registry-1.docker.io/cloudpirates
+    chart: postgres
+    version: 0.21.2
     namespace: data
     create_namespace: true
 
@@ -454,9 +454,9 @@ Cluster: deps-cluster
 Services to install: 4
 
 Level 0 (parallel installation):
-  + postgres (add) - helm chart postgresql@15.5.38
+  + postgres (add) - helm chart postgres@0.21.2
     + Namespace: data (will be created)
-  + redis (add) - helm chart redis@20.2.1
+  + redis (add) - helm chart redis@0.37.4
     + Namespace: data (will be created)
 
 Level 1:
@@ -645,9 +645,9 @@ services:
   # Helm chart from OCI registry
   service-name:
     type: helm
-    repo: oci://registry-1.docker.io/bitnamicharts
+    repo: oci://registry-1.docker.io/cloudpirates
     chart: redis
-    version: 23.2.6              # Optional - defaults to latest
+    version: 0.37.4              # Optional - defaults to latest
     namespace: data
     create_namespace: true       # Defaults to true
     values: values.yml           # Single values file
@@ -664,8 +664,8 @@ services:
   # Helm chart from HTTP repository
   another-service:
     type: helm
-    repo: https://charts.bitnami.com/bitnami
-    chart: postgresql
+    repo: https://groundhog2k.github.io/helm-charts
+    chart: postgres
     namespace: database
 
   # Local Helm chart
@@ -684,10 +684,10 @@ services:
 
   # Explicit image list (supplements auto-detection)
   # Use when images are in non-standard locations that auto-detection cannot reach
-  # (e.g., extraInitContainers YAML strings, operator-managed pods, ConfigMap-sourced images)
+  # (e.g., operator-managed pods, ConfigMap-sourced images, charts that won't render offline)
   service-with-extra-images:
     type: helm
-    repo: oci://registry-1.docker.io/bitnamicharts
+    repo: oci://registry-1.docker.io/cloudpirates
     chart: keycloak
     namespace: auth
     images:
@@ -734,15 +734,15 @@ You can temporarily disable services without removing them from your configurati
 services:
   postgres:
     type: helm
-    chart: postgresql
-    repo: oci://registry-1.docker.io/bitnamicharts
+    chart: postgres
+    repo: oci://registry-1.docker.io/cloudpirates
     namespace: data
     enabled: true               # Explicitly enabled (default)
 
   redis:
     type: helm
     chart: redis
-    repo: oci://registry-1.docker.io/bitnamicharts
+    repo: oci://registry-1.docker.io/cloudpirates
     namespace: data
     enabled: false              # Disabled - will be skipped
 
@@ -816,7 +816,7 @@ You can use environment variable substitution in your configuration:
 services:
   myapp:
     type: helm
-    repo: ${HELM_REPO:-https://charts.bitnami.com/bitnami}
+    repo: ${HELM_REPO:-https://groundhog2k.github.io/helm-charts}
     chart: ${APP_CHART:-redis}
     namespace: ${NAMESPACE:-default}
 ```
@@ -1010,7 +1010,7 @@ services:
   rabbitmq:
     type: helm
     chart: rabbitmq
-    repo: oci://registry-1.docker.io/bitnamicharts
+    repo: oci://registry-1.docker.io/cloudpirates
     namespace: messaging
     wait: true           # Ensure RabbitMQ is fully ready
     wait_timeout: "15m"  # Give it 15 minutes to start
