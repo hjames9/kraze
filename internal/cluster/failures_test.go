@@ -36,16 +36,18 @@ func TestKindManagerFailures(test *testing.T) {
 	}{
 		{"create: cluster check", func(tk *testKind) { tk.provider.listErr = errFail },
 			func(tk *testKind) error { return tk.CreateCluster(ctx, &config.ClusterConfig{Name: "c"}) }, "failed to check if cluster exists"},
-		{"create: no home for the GODEBUG drop-in", func(tk *testKind) { tk.host.homeErr = errFail },
-			func(tk *testKind) error { return tk.CreateCluster(ctx, &config.ClusterConfig{Name: "c"}) }, "failed to build kind config"},
-		{"create: drop-in directory blocked", func(tk *testKind) {
-			// a file where ~/.kraze should be
-			_ = os.WriteFile(filepath.Join(tk.host.home, ".kraze"), nil, 0o644)
-		}, func(tk *testKind) error { return tk.CreateCluster(ctx, &config.ClusterConfig{Name: "c"}) }, "failed to create kraze directory"},
-		{"create: drop-in can't be written", func(tk *testKind) {
-			dir := filepath.Join(tk.host.home, ".kraze", "clusters", "c")
-			_ = os.MkdirAll(filepath.Join(dir, "containerd-godebug.conf"), 0o755) // a directory in its place
-		}, func(tk *testKind) error { return tk.CreateCluster(ctx, &config.ClusterConfig{Name: "c"}) }, "failed to write GODEBUG config file"},
+		{"create: containerd can't be configured", nil,
+			func(tk *testKind) error { return tk.CreateCluster(ctx, &config.ClusterConfig{Name: "c"}) }, "failed to configure containerd"},
+		{"GODEBUG: no nodes listed", func(tk *testKind) { tk.provider.nodesErr = errFail },
+			func(tk *testKind) error { return tk.configureContainerdGODEBUG("c") }, "failed to list cluster nodes"},
+		{"GODEBUG: drop-in can't be written", nil,
+			func(tk *testKind) error { return tk.configureContainerdGODEBUG("c") }, "failed to write GODEBUG config in node c-control-plane"},
+		{"GODEBUG: systemd doesn't reload", func(tk *testKind) { tk.run.on("docker exec -i c-control-plane sh -c mkdir", "", nil) },
+			func(tk *testKind) error { return tk.configureContainerdGODEBUG("c") }, "failed to reload systemd in node c-control-plane"},
+		{"GODEBUG: containerd doesn't restart", func(tk *testKind) {
+			tk.run.on("docker exec -i c-control-plane sh -c mkdir", "", nil)
+			tk.run.on("docker exec -i c-control-plane sh -c systemctl daemon-reload", "", nil)
+		}, func(tk *testKind) error { return tk.configureContainerdGODEBUG("c") }, "containerd did not restart in node c-control-plane"},
 		{"delete: cluster check", func(tk *testKind) { tk.provider.listErr = errFail },
 			func(tk *testKind) error { return tk.DeleteCluster("c") }, "failed to check if cluster exists"},
 		{"delete: kind fails", func(tk *testKind) { tk.provider.clusters = []string{"c"}; tk.provider.deleteErr = errFail },
@@ -68,7 +70,11 @@ func TestKindManagerFailures(test *testing.T) {
 		{"cgroup dirs: no nodes listed", func(tk *testKind) { tk.provider.nodesErr = errFail },
 			func(tk *testKind) error { return tk.ensureKubeletCgroupDirectories("c") }, "failed to list cluster nodes"},
 		{"CA certificates: no nodes listed", func(tk *testKind) { tk.provider.nodesErr = errFail },
-			func(tk *testKind) error { return tk.updateCACertificates(ctx, "c") }, "failed to list cluster nodes"},
+			func(tk *testKind) error { return tk.updateCACertificates(ctx, "c", nil) }, "failed to list cluster nodes"},
+		{"CA certificates: certificate can't be read", nil,
+			func(tk *testKind) error { return tk.updateCACertificates(ctx, "c", []string{"/missing.crt"}) }, "failed to read CA certificate"},
+		{"CA certificates: certificate can't be written", func(tk *testKind) { tk.host.files["/c.crt"] = "cert" },
+			func(tk *testKind) error { return tk.updateCACertificates(ctx, "c", []string{"/c.crt"}) }, "failed to write CA certificate in node c-control-plane"},
 		{"registries: no nodes listed", func(tk *testKind) { tk.provider.nodesErr = errFail },
 			func(tk *testKind) error { return tk.configureInsecureRegistries("c", []string{"r"}) }, "failed to list cluster nodes"},
 		{"registries: config can't be patched", func(tk *testKind) { tk.run.on("docker exec -i", "unsupported", errNotFaked) },
@@ -101,6 +107,7 @@ func TestKindManagerFailures(test *testing.T) {
 		}, func(tk *testKind) error { return tk.registerNvidiaRuntimeClass(ctx, "c") }, "failed to create dynamic client"},
 		{"runtime class: can't be read", func(tk *testKind) {
 			tk.provider.kubeconfig = kindKubeconfig
+			tk.run.on("docker exec -i", "", nil) // containerd is configured
 			tk.dynamic.PrependReactor("get", "runtimeclasses", func(k8stesting.Action) (bool, runtime.Object, error) { return true, nil, errFail })
 		}, func(tk *testKind) error { return tk.registerNvidiaRuntimeClass(ctx, "c") }, "failed to check for existing RuntimeClass"},
 		{"runtime class: can't be created", func(tk *testKind) {
@@ -141,6 +148,7 @@ func TestKindManagerFailures(test *testing.T) {
 			tk.host.bins["nvidia-ctk"] = "/usr/bin/nvidia-ctk"
 			tk.provider.kubeErr = nil
 			tk.provider.kubeconfig = kindKubeconfig
+			tk.run.on("docker exec -i", "", nil) // containerd is configured
 			tk.dynamic.PrependReactor("get", "runtimeclasses", func(k8stesting.Action) (bool, runtime.Object, error) { return true, nil, errFail })
 		}, func(tk *testKind) error {
 			var err error

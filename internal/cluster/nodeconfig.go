@@ -13,10 +13,19 @@ import (
 // builders are pure so tests can parse their output back.
 
 const (
-	containerdConfigPath = "/etc/containerd/config.toml"
-	containerdCertsDir   = "/etc/containerd/certs.d"
-	containerdProxyConf  = "/etc/systemd/system/containerd.service.d/http-proxy.conf"
+	containerdConfigPath  = "/etc/containerd/config.toml"
+	containerdCertsDir    = "/etc/containerd/certs.d"
+	containerdProxyConf   = "/etc/systemd/system/containerd.service.d/http-proxy.conf"
+	containerdGODEBUGConf = "/etc/systemd/system/containerd.service.d/godebug.conf"
+	nodeCACertificateDir  = "/usr/local/share/ca-certificates"
 )
+
+// containerdGODEBUGDropIn sets GODEBUG=x509negativeserial=1 for containerd,
+// so Go accepts X.509 certificates with negative serial numbers, which some
+// corporate CAs, SSL-inspecting proxies and registries still issue
+const containerdGODEBUGDropIn = `[Service]
+Environment="GODEBUG=x509negativeserial=1"
+`
 
 // containerdRegistryConfigPatch points containerd's CRI plugin at certs.d.
 // It is appended to the config (version 2 format) and starts on a new line,

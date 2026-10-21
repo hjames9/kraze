@@ -220,6 +220,13 @@ func (manifest *ManifestsProvider) Uninstall(ctx context.Context, service *confi
 	// Delete each resource
 	deletedCount := 0
 	for _, obj := range append(others, crds...) {
+		if isNamespace(obj.GetAPIVersion(), obj.GetKind()) {
+			if manifest.opts.Verbose {
+				fmt.Printf("  Leaving %s to namespace cleanup\n", describeObject(obj))
+			}
+			continue
+		}
+
 		// Never delete an object another service has taken over
 		if owner, _ := manifest.existingOwner(ctx, obj, service.Name); owner != "" {
 			if !manifest.opts.Quiet {
@@ -283,6 +290,7 @@ func (manifest *ManifestsProvider) Status(ctx context.Context, service *config.S
 	// resource; counting it made a service never ready ("12/13 resources
 	// exist"). One that doesn't parse counts as missing.
 	existCount, total, finishedJobs := 0, 0, 0
+	var existing []*unstructured.Unstructured
 	for _, manifestContent := range manifests {
 		obj, err := manifest.parseManifest(manifestContent)
 		if err == nil && obj == nil {
@@ -300,6 +308,7 @@ func (manifest *ManifestsProvider) Status(ctx context.Context, service *config.S
 		exists := manifest.resourceExists(ctx, obj)
 		if exists {
 			existCount++
+			existing = append(existing, obj)
 		} else if isTTLJob(obj) && completed[jobKey(obj.GetNamespace(), obj.GetName())] {
 			// Deleted by its TTL after `up` saw it complete: expected
 			existCount++
@@ -307,15 +316,18 @@ func (manifest *ManifestsProvider) Status(ctx context.Context, service *config.S
 		}
 	}
 
-	installed := existCount > 0
-	ready := existCount == total
-
-	return &ServiceStatus{
+	status := &ServiceStatus{
 		Name:      service.Name,
-		Installed: installed,
-		Ready:     ready,
+		Installed: existCount > 0,
+		Ready:     existCount == total,
 		Message:   statusMessage(existCount, total, finishedJobs),
-	}, nil
+	}
+	// Existing isn't ready: check the workloads as `up` waits for them.
+	// Missing ones are already counted above.
+	if status.Ready {
+		status.markUnready(unreadyWorkloads(ctx, manifest.dynamicClient, manifest.mapper, existing, "", false))
+	}
+	return status, nil
 }
 
 // isTTLJob reports whether obj is a Job that Kubernetes deletes some time after
@@ -607,6 +619,9 @@ func (manifest *ManifestsProvider) DeleteResources(ctx context.Context, serviceN
 	ordered := make([]state.ResourceRef, 0, len(refs))
 	var crdRefs []state.ResourceRef
 	for _, ref := range refs {
+		if isNamespace(ref.APIVersion, ref.Kind) {
+			continue // left to namespace cleanup, as in Uninstall
+		}
 		if isCRD(ref.APIVersion, ref.Kind) {
 			crdRefs = append(crdRefs, ref)
 		} else {
@@ -678,10 +693,31 @@ func (manifest *ManifestsProvider) checkOwnership(ctx context.Context, objects [
 	return fmt.Errorf("%w: service '%s' would overwrite objects it doesn't own:\n  %s\n%s", ErrOwnershipConflict, serviceName, strings.Join(conflicts, "\n  "), hint)
 }
 
+// isNamespace reports whether apiVersion and kind name a Namespace. Uninstall
+// and DeleteResources never delete one a service ships: other services may
+// still use it. `kraze down` deletes it, like the namespaces services are
+// installed in, once no installed service does (ShippedNamespaces).
+func isNamespace(apiVersion, kind string) bool {
+	return apiVersion == "v1" && kind == "Namespace"
+}
+
+// ShippedNamespaces returns the Namespaces among a service's recorded objects
+func ShippedNamespaces(refs []state.ResourceRef) []string {
+	var names []string
+	for _, ref := range refs {
+		if isNamespace(ref.APIVersion, ref.Kind) {
+			names = append(names, ref.Name)
+		}
+	}
+	return names
+}
+
 // existingOwner returns who owns the existing copy of obj, if that isn't this
 // service. It returns "" when the object doesn't exist, can't be read, or has
 // no owner. Objects labeled by older kraze carry no project label; they count
-// as this service's if the service label matches. sameProject reports an owner
+// as this service's if the service label matches. A namespace kraze created
+// for a service (EnsureNamespace) has no service label and is unowned, so a
+// service that ships its own Namespace adopts it. sameProject reports an owner
 // that is another service of this project.
 func (manifest *ManifestsProvider) existingOwner(ctx context.Context, obj *unstructured.Unstructured, serviceName string) (owner string, sameProject bool) {
 	existing, err := manifest.getExisting(ctx, obj)
@@ -696,6 +732,9 @@ func (manifest *ManifestsProvider) existingOwner(ctx context.Context, obj *unstr
 		return "", false
 	}
 	service, project := labels[serviceLabel], labels[projectLabel]
+	if service == "" {
+		return "", false
+	}
 	if service == serviceName && (project == "" || project == manifest.opts.Project) {
 		return "", false
 	}

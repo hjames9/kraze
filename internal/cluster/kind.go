@@ -74,10 +74,7 @@ func (kind *KindManager) CreateCluster(ctx context.Context, cfg *config.ClusterC
 	}
 
 	// Convert kraze config to kind config
-	kindConfig, err := kind.buildKindConfig(cfg)
-	if err != nil {
-		return fmt.Errorf("failed to build kind config: %w", err)
-	}
+	kindConfig := kind.buildKindConfig(cfg)
 
 	// Create the cluster
 	createOpts := []cluster.CreateOption{
@@ -123,19 +120,24 @@ func (kind *KindManager) CreateCluster(ctx context.Context, cfg *config.ClusterC
 	fmt.Printf("Waiting for cluster to fully stabilize...\n")
 	kind.host.sleep(5 * time.Second)
 
-	// Update CA certificates if custom CAs were mounted
+	// Install CA certificates if specified
 	// This is done after cluster init to avoid interfering with kubeadm init
-	// Note: We don't reload containerd - the CAs will be picked up on next image pull
 	if len(cfg.CACertificates) > 0 {
 		// Give a bit more time for all systemd services to be fully up
 		// This ensures update-ca-certificates has all dependencies ready
 		fmt.Printf("Preparing to update CA certificates...\n")
 		kind.host.sleep(3 * time.Second)
 
-		if err := kind.updateCACertificates(ctx, cfg.Name); err != nil {
+		if err := kind.updateCACertificates(ctx, cfg.Name, cfg.CACertificates); err != nil {
 			// This is a critical error - without CA certificates, application images won't pull
 			return fmt.Errorf("failed to update CA certificates: %w", err)
 		}
+	}
+
+	// After the CA update: the restart also makes containerd load the new
+	// trust store, which Go reads once per process
+	if err := kind.configureContainerdGODEBUG(cfg.Name); err != nil {
+		return fmt.Errorf("failed to configure containerd: %w", err)
 	}
 
 	// Configure insecure registries if specified
@@ -475,7 +477,7 @@ func (kind *KindManager) getNodeImage(cfg *config.ClusterConfig) string {
 }
 
 // buildKindConfig converts kraze cluster config to kind v1alpha4 config
-func (kind *KindManager) buildKindConfig(cfg *config.ClusterConfig) (*v1alpha4.Cluster, error) {
+func (kind *KindManager) buildKindConfig(cfg *config.ClusterConfig) *v1alpha4.Cluster {
 	kindCfg := &v1alpha4.Cluster{
 		TypeMeta: v1alpha4.TypeMeta{
 			APIVersion: "kind.x-k8s.io/v1alpha4",
@@ -503,23 +505,18 @@ func (kind *KindManager) buildKindConfig(cfg *config.ClusterConfig) (*v1alpha4.C
 	// Determine which node image to use
 	nodeImage := kind.getNodeImage(cfg)
 
-	// Build extra mounts for CA certificates and GODEBUG configuration (applied to all nodes)
-	caMounts := kind.buildCAMounts(cfg)
-	godebugMount, err := kind.buildGODEBUGMount(cfg.Name)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create GODEBUG configuration: %w", err)
-	}
+	// CA certificates and the GODEBUG drop-in aren't bind-mounted: a mount
+	// names a path on the Docker daemon's host, which isn't where kraze runs
+	// in a dev container using the host's daemon. CreateCluster writes them
+	// into the nodes instead.
 	gpuMounts := kind.buildGPUMounts(cfg)
-
-	// Combine CA mounts and GODEBUG mount (applied to all nodes)
-	allMounts := append(caMounts, godebugMount)
 
 	// If no nodes specified in config, create a default control-plane node
 	// GPU mounts are applied to this node since it handles all workloads
 	if len(cfg.Config) == 0 {
 		node := v1alpha4.Node{
 			Role:        v1alpha4.ControlPlaneRole,
-			ExtraMounts: append(allMounts, gpuMounts...),
+			ExtraMounts: gpuMounts,
 		}
 		if cfg.GPU.IsNvidiaEnabled() {
 			node.GPUs = "all"
@@ -528,7 +525,7 @@ func (kind *KindManager) buildKindConfig(cfg *config.ClusterConfig) (*v1alpha4.C
 			node.Image = nodeImage
 		}
 		kindCfg.Nodes = append(kindCfg.Nodes, node)
-		return kindCfg, nil
+		return kindCfg
 	}
 
 	// Determine whether to apply GPU mounts to worker nodes or fall back to control-plane
@@ -551,9 +548,6 @@ func (kind *KindManager) buildKindConfig(cfg *config.ClusterConfig) (*v1alpha4.C
 			kindNode.Image = nodeImage
 		}
 
-		// Add CA certificate and GODEBUG mounts to all nodes
-		kindNode.ExtraMounts = append(kindNode.ExtraMounts, allMounts...)
-
 		// Add GPU mounts: to worker nodes when workers exist, otherwise to control-plane
 		applyGPU := kindNode.Role == v1alpha4.WorkerRole || (!hasWorker && kindNode.Role == v1alpha4.ControlPlaneRole)
 		if applyGPU {
@@ -573,7 +567,7 @@ func (kind *KindManager) buildKindConfig(cfg *config.ClusterConfig) (*v1alpha4.C
 		}
 	}
 
-	return kindCfg, nil
+	return kindCfg
 }
 
 // LoadImage loads a Docker image into the kind cluster
@@ -716,11 +710,20 @@ func (kind *KindManager) ensureKubeletCgroupDirectories(clusterName string) erro
 // under a second; a variable so tests run fast
 var caUpdateTimeout = 30 * time.Second
 
-// updateCACertificates runs update-ca-certificates in all nodes
-// This updates the system CA trust store with custom certificates mounted via extraMounts
-// Note: We don't reload containerd - CAs will be automatically used on next image pull
-func (kind *KindManager) updateCACertificates(ctx context.Context, clusterName string) error {
+// updateCACertificates copies the CA certificates into all nodes and runs
+// update-ca-certificates there. containerd picks them up when it restarts
+// (configureContainerdGODEBUG).
+func (kind *KindManager) updateCACertificates(ctx context.Context, clusterName string, certPaths []string) error {
 	fmt.Printf("Updating CA certificates in cluster nodes...\n")
+
+	certs := make([]string, len(certPaths))
+	for iter, certPath := range certPaths {
+		data, err := kind.host.readFile(certPath)
+		if err != nil {
+			return fmt.Errorf("failed to read CA certificate: %w", err)
+		}
+		certs[iter] = string(data)
+	}
 
 	// Get cluster nodes
 	nodes, err := kind.provider.ListInternalNodes(clusterName)
@@ -731,6 +734,14 @@ func (kind *KindManager) updateCACertificates(ctx context.Context, clusterName s
 	// Run update-ca-certificates in each node
 	for _, node := range nodes {
 		containerName := node.String()
+
+		// The file name must end in .crt for update-ca-certificates
+		for iter, cert := range certs {
+			path := fmt.Sprintf("%s/kraze-ca-%d.crt", nodeCACertificateDir, iter)
+			if err := kind.writeNodeFile(containerName, path, cert); err != nil {
+				return fmt.Errorf("failed to write CA certificate in node %s: %w", containerName, err)
+			}
+		}
 
 		// A timeout prevents hanging: update-ca-certificates completes in seconds.
 		// (The timeout(1) command this used isn't on macOS.)
@@ -835,24 +846,6 @@ func (kind *KindManager) configureProxy(clusterName, httpProxy, httpsProxy, noPr
 	return nil
 }
 
-// buildCAMounts creates extra mounts for CA certificates
-func (kind *KindManager) buildCAMounts(cfg *config.ClusterConfig) []v1alpha4.Mount {
-	var mounts []v1alpha4.Mount
-
-	for iter, certPath := range cfg.CACertificates {
-		// Mount each CA cert to /usr/local/share/ca-certificates/ in the container
-		// The filename is important - it should end in .crt
-		containerPath := fmt.Sprintf("/usr/local/share/ca-certificates/kraze-ca-%d.crt", iter)
-		mounts = append(mounts, v1alpha4.Mount{
-			HostPath:      certPath,
-			ContainerPath: containerPath,
-			Readonly:      true,
-		})
-	}
-
-	return mounts
-}
-
 // buildGPUMounts returns GPU-related extra mounts for a node.
 // For NVIDIA: mounts nvidia-container-runtime and nvidia-ctk into the kind node.
 // For AMD: mounts /dev/kfd and /dev/dri/renderD* device files.
@@ -918,47 +911,28 @@ func (kind *KindManager) buildAMDGPUMounts(cfg *config.ClusterConfig) []v1alpha4
 	return mounts
 }
 
-// buildGODEBUGMount creates a systemd drop-in file for containerd with GODEBUG settings
-// This file is mounted into the container BEFORE containerd starts, eliminating the need for restarts
-// GODEBUG=x509negativeserial=1 allows Go to accept X.509 certificates with negative serial numbers
-// This is needed for:
-// - Corporate CA certificates that may have negative serial numbers
-// - SSL-inspecting proxies that inject certificates with negative serial numbers
-// - Registry certificates with non-standard serial numbers
-func (kind *KindManager) buildGODEBUGMount(clusterName string) (v1alpha4.Mount, error) {
-	// Create a cluster-specific directory in ~/.kraze/clusters/<cluster-name>/
-	homeDir, err := kind.host.homeDir()
+// configureContainerdGODEBUG writes the GODEBUG drop-in
+// (containerdGODEBUGDropIn) into every node and restarts containerd, since a
+// unit's Environment= only applies when the process starts. Running
+// containers are kept: their shims don't depend on the containerd process.
+func (kind *KindManager) configureContainerdGODEBUG(clusterName string) error {
+	nodes, err := kind.provider.ListInternalNodes(clusterName)
 	if err != nil {
-		return v1alpha4.Mount{}, fmt.Errorf("failed to get user home directory: %w", err)
+		return fmt.Errorf("failed to list cluster nodes: %w", err)
 	}
-
-	krazeDir := filepath.Join(homeDir, ".kraze", "clusters", clusterName)
-	// #nosec G301 -- the drop-in below is bind-mounted into the node container and
-	// read by systemd there. Under userns-remapped Docker the container's root maps
-	// to an unprivileged host uid, so this path must stay traversable by others.
-	if err := os.MkdirAll(krazeDir, 0755); err != nil {
-		return v1alpha4.Mount{}, fmt.Errorf("failed to create kraze directory: %w", err)
+	for _, node := range nodes {
+		containerName := node.String()
+		if err := kind.writeNodeFile(containerName, containerdGODEBUGConf, containerdGODEBUGDropIn); err != nil {
+			return fmt.Errorf("failed to write GODEBUG config in node %s: %w", containerName, err)
+		}
+		if err := kind.runInNode(containerName, "systemctl daemon-reload", "", ""); err != nil {
+			return fmt.Errorf("failed to reload systemd in node %s: %w", containerName, err)
+		}
+		if err := kind.restartContainerd(containerName); err != nil {
+			return err
+		}
 	}
-
-	// Create the systemd drop-in file
-	godebugPath := filepath.Join(krazeDir, "containerd-godebug.conf")
-	godebugContent := `[Service]
-Environment="GODEBUG=x509negativeserial=1"
-`
-	// #nosec G306 -- read by systemd inside the node container via the bind mount
-	// below; must stay world-readable for userns-remapped Docker. Contents are a
-	// fixed, non-secret GODEBUG setting.
-	if err := os.WriteFile(godebugPath, []byte(godebugContent), 0644); err != nil {
-		return v1alpha4.Mount{}, fmt.Errorf("failed to write GODEBUG config file: %w", err)
-	}
-
-	// Mount it to the systemd drop-in directory
-	// When the container starts, systemd will read this file before starting containerd
-	return v1alpha4.Mount{
-		HostPath:      godebugPath,
-		ContainerPath: "/etc/systemd/system/containerd.service.d/godebug.conf",
-		Readonly:      true,
-	}, nil
+	return nil
 }
 
 // validateNvidiaGPUPrerequisites checks that nvidia-container-toolkit is installed.

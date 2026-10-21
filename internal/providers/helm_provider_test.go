@@ -129,6 +129,7 @@ func TestHelmInstallThenUpgrade(t *testing.T) {
 	if installed, err := helm.IsInstalled(ctx, svc); err != nil || !installed {
 		t.Errorf("after install: installed=%v err=%v", installed, err)
 	}
+	helm.waitClients = func() (*kubeClients, error) { return waitTestClients(webDeployment(true)), nil }
 	status, err = helm.Status(ctx, svc)
 	if err != nil || !status.Installed || !status.Ready || status.Message != "deployed" {
 		t.Errorf("status after install = %+v, %v", status, err)

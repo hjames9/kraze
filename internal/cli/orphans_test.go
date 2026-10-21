@@ -24,6 +24,7 @@ type fakeOrphanBackend struct {
 	uninstallErr  map[string]error // returned by uninstallHelm, by name
 	uninstalled   []string
 	deleted       map[string][]state.ResourceRef
+	deleteErr     error // deleteManifests fails
 	keepCRDs      map[string]bool
 }
 
@@ -44,6 +45,9 @@ func (b *fakeOrphanBackend) uninstallHelm(_ context.Context, svc *config.Service
 }
 
 func (b *fakeOrphanBackend) deleteManifests(_ context.Context, name string, refs []state.ResourceRef) (int, error) {
+	if b.deleteErr != nil {
+		return 0, b.deleteErr
+	}
 	b.deleted[name] = refs
 	return len(refs), nil
 }

@@ -6,6 +6,7 @@ import (
 	"k8s.io/client-go/kubernetes/fake"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 
@@ -232,5 +233,114 @@ func TestDeleteResourcesSkipsSameServiceNameInAnotherProject(t *testing.T) {
 	}
 	if _, err := mp.dynamicClient.Resource(clusterRoleGVR).Get(context.Background(), "reader", metav1.GetOptions{}); err != nil {
 		t.Error("billing's 'app' ClusterRole must survive removal of web's 'app' orphan")
+	}
+}
+
+// A manifests service that ships its own Namespace, in a namespace kraze
+// created for it (EnsureNamespace labels it managed-by=kraze, with no
+// service), adopts the namespace rather than refusing it as owned by
+// "kraze service ”". cert-manager's upstream manifest does this.
+func TestInstallAdoptsNamespaceKrazeCreated(t *testing.T) {
+	namespaceGVR := schema.GroupVersionResource{Version: "v1", Resource: "namespaces"}
+	created := object("v1", "Namespace", "", "apps", map[string]string{ManagedByLabel: ManagedByValue}, nil)
+	dyn := dynamicfake.NewSimpleDynamicClientWithCustomListKinds(runtime.NewScheme(), map[schema.GroupVersionResource]string{
+		configMapGVR: "ConfigMapList",
+		namespaceGVR: "NamespaceList",
+	}, created)
+	mapper := meta.NewDefaultRESTMapper(nil)
+	mapper.Add(schema.GroupVersionKind{Version: "v1", Kind: "ConfigMap"}, meta.RESTScopeNamespace)
+	mapper.Add(schema.GroupVersionKind{Version: "v1", Kind: "Namespace"}, meta.RESTScopeRoot)
+	mp := newManifestsProviderWithClients(&ProviderOptions{Project: "web", Quiet: true}, &kubeClients{dynamic: dyn, clientset: fake.NewSimpleClientset(), mapper: mapper})
+
+	path := filepath.Join(t.TempDir(), "app.yaml")
+	manifest := "apiVersion: v1\nkind: Namespace\nmetadata:\n  name: apps\n---\n" + ownershipManifests[:strings.Index(ownershipManifests, "---")]
+	if err := os.WriteFile(path, []byte(manifest), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	svc := &config.ServiceConfig{Name: "app", Type: "manifests", Namespace: "apps", Path: path}
+
+	if err := mp.Install(context.Background(), svc); err != nil {
+		t.Fatalf("Install: %v", err)
+	}
+	ns, err := dyn.Resource(namespaceGVR).Get(context.Background(), "apps", metav1.GetOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ns.GetLabels()[serviceLabel] != "app" || ns.GetLabels()[projectLabel] != "web" {
+		t.Errorf("namespace labels = %v, want it adopted by app", ns.GetLabels())
+	}
+
+	// Once adopted, it belongs to that service
+	if owner, _ := mp.existingOwner(context.Background(), ns, "billing"); owner != "kraze service 'app'" {
+		t.Errorf("adopted namespace owner for another service = %q", owner)
+	}
+}
+
+// A Namespace a manifests service ships is not deleted with the service's
+// other objects: other services, of this project or another, may still use
+// it. `kraze down` deletes it with its namespace check instead.
+func TestUninstallLeavesShippedNamespace(t *testing.T) {
+	namespaceGVR := schema.GroupVersionResource{Version: "v1", Resource: "namespaces"}
+	newProvider := func() *ManifestsProvider {
+		dyn := dynamicfake.NewSimpleDynamicClientWithCustomListKinds(runtime.NewScheme(), map[schema.GroupVersionResource]string{
+			configMapGVR: "ConfigMapList",
+			namespaceGVR: "NamespaceList",
+		})
+		mapper := meta.NewDefaultRESTMapper(nil)
+		mapper.Add(schema.GroupVersionKind{Version: "v1", Kind: "ConfigMap"}, meta.RESTScopeNamespace)
+		mapper.Add(schema.GroupVersionKind{Version: "v1", Kind: "Namespace"}, meta.RESTScopeRoot)
+		return newManifestsProviderWithClients(&ProviderOptions{Project: "web", Quiet: true}, &kubeClients{dynamic: dyn, clientset: fake.NewSimpleClientset(), mapper: mapper})
+	}
+	exists := func(mp *ManifestsProvider, gvr schema.GroupVersionResource, namespace, name string) bool {
+		_, err := mp.dynamicClient.Resource(gvr).Namespace(namespace).Get(context.Background(), name, metav1.GetOptions{})
+		return err == nil
+	}
+
+	path := filepath.Join(t.TempDir(), "app.yaml")
+	manifest := "apiVersion: v1\nkind: Namespace\nmetadata:\n  name: apps\n---\n" + ownershipManifests[:strings.Index(ownershipManifests, "---")]
+	if err := os.WriteFile(path, []byte(manifest), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	svc := &config.ServiceConfig{Name: "app", Type: "manifests", Namespace: "apps", Path: path}
+
+	// Uninstall
+	mp := newProvider()
+	if err := mp.Install(context.Background(), svc); err != nil {
+		t.Fatal(err)
+	}
+	refs, err := mp.ResourceRefs(svc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mp.opts.Verbose, mp.opts.Quiet = true, false
+	var uninstallErr error
+	out := captureOutput(t, func() { uninstallErr = mp.Uninstall(context.Background(), svc) })
+	if uninstallErr != nil {
+		t.Fatal(uninstallErr)
+	}
+	if !strings.Contains(out, "Leaving Namespace/apps to namespace cleanup") {
+		t.Errorf("output:\n%s", out)
+	}
+	if got := ShippedNamespaces(refs); !slices.Equal(got, []string{"apps"}) {
+		t.Errorf("ShippedNamespaces = %v", got)
+	}
+	if exists(mp, configMapGVR, "apps", "settings") {
+		t.Error("the ConfigMap should be deleted")
+	}
+	if !exists(mp, namespaceGVR, "", "apps") {
+		t.Error("Uninstall deleted the Namespace")
+	}
+
+	// Orphan removal by the recorded objects
+	mp = newProvider()
+	if err := mp.Install(context.Background(), svc); err != nil {
+		t.Fatal(err)
+	}
+	deleted, err := mp.DeleteResources(context.Background(), "app", refs)
+	if err != nil || deleted != 1 {
+		t.Errorf("deleted %d, %v; want only the ConfigMap", deleted, err)
+	}
+	if !exists(mp, namespaceGVR, "", "apps") {
+		t.Error("DeleteResources deleted the Namespace")
 	}
 }

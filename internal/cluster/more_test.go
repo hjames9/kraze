@@ -53,6 +53,7 @@ func TestCreateClusterBranches(test *testing.T) {
 	tk.run.on("docker exec c-control-plane mkdir", "read-only", errNotFaked)
 	tk.run.on("docker network inspect dev-net", "", nil)
 	tk.run.on("docker network connect", "no such network", errNotFaked)
+	tk.run.on("docker exec -i", "", nil) // containerd is configured
 	cfg := &config.ClusterConfig{
 		Name: "c", Network: "dev-net",
 		GPU: &config.GPUConfig{Nvidia: &config.GPUVendorConfig{Enabled: true}, AMD: &config.GPUVendorConfig{Enabled: true}},
@@ -89,6 +90,7 @@ func TestCreateClusterBranches(test *testing.T) {
 	tk.host.bins["nvidia-container-runtime"] = "/usr/bin/nvidia-container-runtime"
 	tk.host.bins["nvidia-ctk"] = "/usr/bin/nvidia-ctk"
 	tk.provider.kubeconfig = "not: [yaml"
+	tk.run.on("docker exec -i", "", nil)
 	nvidia := &config.ClusterConfig{Name: "c", GPU: &config.GPUConfig{Nvidia: &config.GPUVendorConfig{Enabled: true}}}
 	captureStdout(test, func() { err = tk.CreateCluster(context.Background(), nvidia) })
 	if err == nil || !strings.Contains(err.Error(), "failed to register NVIDIA RuntimeClass") {
@@ -149,14 +151,14 @@ func TestKindConfigEdges(test *testing.T) {
 
 	// A node image applies to every node, the default one and configured ones
 	cfg := &config.ClusterConfig{Name: "c", NodeImage: "kindest/node:v1.36.0"}
-	built, err := tk.buildKindConfig(cfg)
-	if err != nil || len(built.Nodes) != 1 || built.Nodes[0].Image != "kindest/node:v1.36.0" {
-		test.Errorf("default node = %+v, %v", built.Nodes, err)
+	built := tk.buildKindConfig(cfg)
+	if len(built.Nodes) != 1 || built.Nodes[0].Image != "kindest/node:v1.36.0" {
+		test.Errorf("default node = %+v", built.Nodes)
 	}
 	cfg.Config = []config.KindNode{{Role: "control-plane"}, {Role: "worker"}, {Role: "something-else"}}
-	built, err = tk.buildKindConfig(cfg)
-	if err != nil || len(built.Nodes) != 3 {
-		test.Fatalf("nodes = %+v, %v", built.Nodes, err)
+	built = tk.buildKindConfig(cfg)
+	if len(built.Nodes) != 3 {
+		test.Fatalf("nodes = %+v", built.Nodes)
 	}
 	for _, n := range built.Nodes {
 		if n.Image != "kindest/node:v1.36.0" {

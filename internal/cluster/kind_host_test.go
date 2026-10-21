@@ -292,17 +292,18 @@ func TestUpdateCACertificates(test *testing.T) {
 	ctx := context.Background()
 	tk := newTestKind(test)
 	tk.provider.nodes = []string{"c-control-plane", "c-worker"}
+	tk.host.files["/a.crt"], tk.host.files["/b.crt"] = "a", "b"
 	tk.run.on("docker exec", "1 added", nil)
-	if err := tk.updateCACertificates(ctx, "c"); err != nil {
+	if err := tk.updateCACertificates(ctx, "c", []string{"/a.crt", "/b.crt"}); err != nil {
 		test.Fatal(err)
 	}
-	if got := len(tk.run.ranWith("docker exec")); got != 2 {
-		test.Errorf("ran in %d nodes, want 2", got)
+	if got := len(tk.run.ranWith("docker exec")); got != 6 {
+		test.Errorf("ran %d commands, want 6 (two certificates and an update per node)", got)
 	}
 
 	tk = newTestKind(test)
 	tk.run.on("docker exec", "bad cert", errNotFaked)
-	if err := tk.updateCACertificates(ctx, "c"); err == nil || !strings.Contains(err.Error(), "bad cert") {
+	if err := tk.updateCACertificates(ctx, "c", nil); err == nil || !strings.Contains(err.Error(), "bad cert") {
 		test.Errorf("err = %v", err)
 	}
 
@@ -315,7 +316,7 @@ func TestUpdateCACertificates(test *testing.T) {
 		<-ctx.Done()
 		return []byte("partial"), ctx.Err()
 	})
-	if err := tk.updateCACertificates(ctx, "c"); err == nil || !strings.Contains(err.Error(), "timed out after 10ms") {
+	if err := tk.updateCACertificates(ctx, "c", nil); err == nil || !strings.Contains(err.Error(), "timed out after 10ms") {
 		test.Errorf("err = %v", err)
 	}
 }
@@ -571,6 +572,7 @@ func TestCreateClusterSequence(test *testing.T) {
 		CACertificates:     []string{"/certs/corp.crt"},
 		InsecureRegistries: []string{"registry.corp"},
 	}
+	tk.host.files["/certs/corp.crt"] = "cert"
 
 	if err := tk.CreateCluster(context.Background(), cfg); err != nil {
 		test.Fatal(err)
@@ -584,12 +586,11 @@ func TestCreateClusterSequence(test *testing.T) {
 	if len(tk.run.ranWith("docker exec c-control-plane update-ca-certificates")) != 1 {
 		test.Errorf("CA certificates not updated: %v", tk.run.ran())
 	}
-	if len(tk.run.ranWith("docker exec -i c-control-plane sh -c")) != 3 {
+	if len(tk.run.ranWith("docker exec -i c-control-plane sh -c grep -q 'config_path'")) != 1 {
 		test.Errorf("insecure registry not configured: %v", tk.run.ran())
 	}
-	// The GODEBUG drop-in is written under the (test) home
-	if _, err := os.Stat(filepath.Join(tk.host.home, ".kraze", "clusters", "c", "containerd-godebug.conf")); err != nil {
-		test.Error(err)
+	if len(tk.run.ranWith("docker exec -i c-control-plane sh -c systemctl restart containerd")) != 2 {
+		test.Errorf("containerd not restarted for GODEBUG and the registry: %v", tk.run.ran())
 	}
 
 	// Exists already
@@ -609,6 +610,8 @@ func TestCreateClusterFailures(test *testing.T) {
 	// A CA update failure is fatal: images wouldn't pull
 	tk = newTestKind(test)
 	tk.run.on("docker network inspect", "[]", nil).on("docker network connect", "", nil)
+	tk.host.files["/c.crt"] = "cert"
+	tk.run.on("docker exec -i c-control-plane sh -c mkdir", "", nil)
 	tk.run.on("docker exec c-control-plane update-ca-certificates", "boom", errNotFaked)
 	err := tk.CreateCluster(context.Background(), &config.ClusterConfig{Name: "c", CACertificates: []string{"/c.crt"}})
 	if err == nil || !strings.Contains(err.Error(), "failed to update CA certificates") {
@@ -618,6 +621,8 @@ func TestCreateClusterFailures(test *testing.T) {
 	// Registry and proxy failures are only warnings
 	tk = newTestKind(test)
 	tk.run.on("docker network inspect", "[]", nil).on("docker network connect", "", nil)
+	tk.run.on("docker exec -i c-control-plane sh -c mkdir -p \"$(dirname \"$1\")\" && cat > \"$1\" sh "+containerdGODEBUGConf, "", nil)
+	tk.run.on("docker exec -i c-control-plane sh -c systemctl", "", nil)
 	cfg := &config.ClusterConfig{Name: "c", InsecureRegistries: []string{"registry.corp"},
 		Proxy: &config.ProxyConfig{HTTPProxy: "http://proxy:3128"}}
 	if err := tk.CreateCluster(context.Background(), cfg); err != nil {

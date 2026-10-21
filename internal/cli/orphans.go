@@ -191,7 +191,7 @@ func removeOrphans(ctx context.Context, st *state.ClusterState, clientset kubern
 			rec.RecordChange(o.Name, history.ActionUninstall, time.Since(start), err)
 			fmt.Printf("%s Failed to remove old installation of '%s': %v\n", color.Warning(), o.Name, err)
 			failed = append(failed, o.Name)
-			delete(candidates, o.Namespace) // its resources may still be there
+			keepServiceNamespaces(candidates, o) // its resources may still be there
 			continue
 		}
 

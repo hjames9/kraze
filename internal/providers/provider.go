@@ -408,6 +408,60 @@ func shouldWaitForResource(kind string) bool {
 	return waitableKinds[kind]
 }
 
+// unreadyWorkloads checks once, with the rules `up` waits by, the workloads
+// among objs (shouldWaitForResource) and names those that aren't ready. Objects
+// without a namespace get defaultNamespace if their kind is namespaced. A
+// missing workload is named "(missing)" if reportMissing; a gone Job with
+// ttlSecondsAfterFinished never is, since Kubernetes deletes it once finished.
+func unreadyWorkloads(ctx context.Context, dynamicClient dynamic.Interface, mapper meta.RESTMapper, objs []*unstructured.Unstructured, defaultNamespace string, reportMissing bool) ([]string, error) {
+	var unready []string
+	for _, obj := range objs {
+		kind := obj.GetKind()
+		if !shouldWaitForResource(kind) {
+			continue
+		}
+		gvk := obj.GroupVersionKind()
+		mapping, err := mapper.RESTMapping(gvk.GroupKind(), gvk.Version)
+		if err != nil {
+			return nil, err
+		}
+		namespace := obj.GetNamespace()
+		if namespace == "" && mapping.Scope.Name() == meta.RESTScopeNameNamespace {
+			namespace = defaultNamespace
+		}
+		name := kind + "/" + obj.GetName()
+
+		// Namespace("") addresses a cluster-scoped object
+		current, err := dynamicClient.Resource(mapping.Resource).Namespace(namespace).Get(ctx, obj.GetName(), metav1.GetOptions{})
+		if errors.IsNotFound(err) {
+			if reportMissing && !isTTLJob(obj) {
+				unready = append(unready, name+" (missing)")
+			}
+			continue
+		}
+		if err != nil {
+			return nil, err
+		}
+		if ready, err := isResourceReady(current, kind); err != nil || !ready {
+			unready = append(unready, name)
+		}
+	}
+	return unready, nil
+}
+
+// markUnready makes the status not ready, with a message naming the workloads
+// that aren't, or the error that kept them from being checked
+func (status *ServiceStatus) markUnready(unready []string, err error) {
+	switch {
+	case err != nil:
+		status.Ready = false
+		status.Message = fmt.Sprintf("readiness unknown: %v", err)
+	case len(unready) > 0:
+		status.Ready = false
+		status.Message = "not ready: " + strings.Join(unready, ", ")
+	}
+}
+
 // readinessPollInterval is how often a resource's readiness is polled; a
 // variable so tests run fast
 var readinessPollInterval = 2 * time.Second

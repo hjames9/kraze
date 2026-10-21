@@ -399,7 +399,7 @@ func TestBuildKindConfig(test *testing.T) {
 			},
 		},
 		{
-			name: "kubeadm config patches coexist with extra mounts and the injected GODEBUG mount",
+			name: "kubeadm config patches coexist with extra mounts",
 			input: config.ClusterConfig{
 				Name: "test-cluster",
 				Config: []config.KindNode{
@@ -417,9 +417,8 @@ func TestBuildKindConfig(test *testing.T) {
 					test.Fatalf("Nodes: got %d, want 1", len(cluster.Nodes))
 				}
 				node := cluster.Nodes[0]
-				// User mount first, then the always-appended GODEBUG mount
-				if len(node.ExtraMounts) != 2 {
-					test.Fatalf("ExtraMounts: got %d, want 2 (user mount + GODEBUG)", len(node.ExtraMounts))
+				if len(node.ExtraMounts) != 1 {
+					test.Fatalf("ExtraMounts: got %d, want 1 (the user mount)", len(node.ExtraMounts))
 				}
 				if node.ExtraMounts[0].HostPath != "/mnt/cache" {
 					test.Errorf("ExtraMounts[0].HostPath: got %q, want %q", node.ExtraMounts[0].HostPath, "/mnt/cache")
@@ -434,10 +433,7 @@ func TestBuildKindConfig(test *testing.T) {
 
 	for _, tt := range tests {
 		test.Run(tt.name, func(test *testing.T) {
-			result, err := km.buildKindConfig(&tt.input)
-			if err != nil {
-				test.Fatalf("buildKindConfig failed: %v", err)
-			}
+			result := km.buildKindConfig(&tt.input)
 			tt.validate(test, result)
 		})
 	}
@@ -449,10 +445,7 @@ func TestBuildKindConfig_APIVersion(test *testing.T) {
 		Name: "test-cluster",
 	}
 
-	result, err := km.buildKindConfig(cfg)
-	if err != nil {
-		test.Fatalf("buildKindConfig failed: %v", err)
-	}
+	result := km.buildKindConfig(cfg)
 
 	if result.APIVersion != "kind.x-k8s.io/v1alpha4" {
 		test.Errorf("APIVersion: got %q, want %q", result.APIVersion, "kind.x-k8s.io/v1alpha4")
@@ -673,82 +666,6 @@ func TestGetEffectiveProxyConfig(test *testing.T) {
 	}
 }
 
-func TestBuildCAMounts(test *testing.T) {
-	km := NewKindManager()
-
-	tests := []struct {
-		name     string
-		config   *config.ClusterConfig
-		validate func(*testing.T, []v1alpha4.Mount)
-	}{
-		{
-			name: "no CA certificates",
-			config: &config.ClusterConfig{
-				Name:           "test",
-				CACertificates: []string{},
-			},
-			validate: func(test *testing.T, mounts []v1alpha4.Mount) {
-				if len(mounts) != 0 {
-					test.Errorf("Expected 0 mounts, got %d", len(mounts))
-				}
-			},
-		},
-		{
-			name: "single CA certificate",
-			config: &config.ClusterConfig{
-				Name:           "test",
-				CACertificates: []string{"/etc/ssl/certs/corporate-ca.crt"},
-			},
-			validate: func(test *testing.T, mounts []v1alpha4.Mount) {
-				if len(mounts) != 1 {
-					test.Fatalf("Expected 1 mount, got %d", len(mounts))
-				}
-				if mounts[0].HostPath != "/etc/ssl/certs/corporate-ca.crt" {
-					test.Errorf("HostPath: got %q, want %q", mounts[0].HostPath, "/etc/ssl/certs/corporate-ca.crt")
-				}
-				if mounts[0].ContainerPath != "/usr/local/share/ca-certificates/kraze-ca-0.crt" {
-					test.Errorf("ContainerPath: got %q, want %q", mounts[0].ContainerPath, "/usr/local/share/ca-certificates/kraze-ca-0.crt")
-				}
-				if !mounts[0].Readonly {
-					test.Errorf("Readonly: got false, want true")
-				}
-			},
-		},
-		{
-			name: "multiple CA certificates",
-			config: &config.ClusterConfig{
-				Name: "test",
-				CACertificates: []string{
-					"/etc/ssl/certs/ca1.crt",
-					"/etc/ssl/certs/ca2.crt",
-					"/etc/ssl/certs/ca3.crt",
-				},
-			},
-			validate: func(test *testing.T, mounts []v1alpha4.Mount) {
-				if len(mounts) != 3 {
-					test.Fatalf("Expected 3 mounts, got %d", len(mounts))
-				}
-				for i := 0; i < 3; i++ {
-					expectedContainerPath := "/usr/local/share/ca-certificates/kraze-ca-" + string(rune('0'+i)) + ".crt"
-					if mounts[i].ContainerPath != expectedContainerPath {
-						test.Errorf("Mount[%d].ContainerPath: got %q, want %q", i, mounts[i].ContainerPath, expectedContainerPath)
-					}
-					if !mounts[i].Readonly {
-						test.Errorf("Mount[%d].Readonly: got false, want true", i)
-					}
-				}
-			},
-		},
-	}
-
-	for _, tt := range tests {
-		test.Run(tt.name, func(test *testing.T) {
-			result := km.buildCAMounts(tt.config)
-			tt.validate(test, result)
-		})
-	}
-}
-
 // TestBuildNvidiaGPUMounts verifies the nvidia toolkit binary mount logic.
 // When nvidia-ctk is not in PATH (typical CI / non-GPU hosts), no mounts are returned.
 // When nvidia-ctk IS in PATH, a mount for it is returned at /usr/local/bin/nvidia-ctk.
@@ -954,12 +871,12 @@ func TestBuildKindConfigWithCorporateFeatures(test *testing.T) {
 				CACertificates: []string{"/etc/ssl/certs/ca.crt"},
 			},
 			validate: func(test *testing.T, cluster *v1alpha4.Cluster) {
-				// Should have CA mount + GODEBUG mount on the default control-plane node
+				// CA certificates are written into the nodes after creation, not mounted
 				if len(cluster.Nodes) != 1 {
 					test.Fatalf("Expected 1 node, got %d", len(cluster.Nodes))
 				}
-				if len(cluster.Nodes[0].ExtraMounts) != 2 {
-					test.Errorf("Expected 2 extra mounts (CA + GODEBUG), got %d", len(cluster.Nodes[0].ExtraMounts))
+				if len(cluster.Nodes[0].ExtraMounts) != 0 {
+					test.Errorf("Expected no extra mounts, got %d", len(cluster.Nodes[0].ExtraMounts))
 				}
 				// CA certificates are updated post-init, so no kubeadm patches expected
 				if len(cluster.KubeadmConfigPatches) != 0 {
@@ -974,10 +891,6 @@ func TestBuildKindConfigWithCorporateFeatures(test *testing.T) {
 				InsecureRegistries: []string{"ghcr.io"},
 			},
 			validate: func(test *testing.T, cluster *v1alpha4.Cluster) {
-				// Should have GODEBUG mount (always added)
-				if len(cluster.Nodes[0].ExtraMounts) != 1 {
-					test.Errorf("Expected 1 extra mount (GODEBUG), got %d", len(cluster.Nodes[0].ExtraMounts))
-				}
 				// Insecure registries are configured post-init, so no containerd patches expected
 				if len(cluster.ContainerdConfigPatches) != 0 {
 					test.Errorf("Expected 0 containerd config patches, got %d", len(cluster.ContainerdConfigPatches))
@@ -995,10 +908,6 @@ func TestBuildKindConfigWithCorporateFeatures(test *testing.T) {
 				},
 			},
 			validate: func(test *testing.T, cluster *v1alpha4.Cluster) {
-				// Should have GODEBUG mount (always added)
-				if len(cluster.Nodes[0].ExtraMounts) != 1 {
-					test.Errorf("Expected 1 extra mount (GODEBUG), got %d", len(cluster.Nodes[0].ExtraMounts))
-				}
 				// Proxy is configured after cluster init, not via kubeadm patches
 				// So we don't expect kubeadm patches for proxy
 				// Just verify the config is valid
@@ -1018,9 +927,8 @@ func TestBuildKindConfigWithCorporateFeatures(test *testing.T) {
 				},
 			},
 			validate: func(test *testing.T, cluster *v1alpha4.Cluster) {
-				// Should have CA mount + GODEBUG mount
-				if len(cluster.Nodes[0].ExtraMounts) != 2 {
-					test.Errorf("Expected 2 extra mounts (CA + GODEBUG), got %d", len(cluster.Nodes[0].ExtraMounts))
+				if len(cluster.Nodes[0].ExtraMounts) != 0 {
+					test.Errorf("Expected no extra mounts, got %d", len(cluster.Nodes[0].ExtraMounts))
 				}
 				// Both insecure registries and CA certs are configured post-init, so no containerd patches expected
 				if len(cluster.ContainerdConfigPatches) != 0 {
@@ -1036,10 +944,7 @@ func TestBuildKindConfigWithCorporateFeatures(test *testing.T) {
 
 	for _, tt := range tests {
 		test.Run(tt.name, func(test *testing.T) {
-			result, err := km.buildKindConfig(tt.config)
-			if err != nil {
-				test.Fatalf("buildKindConfig failed: %v", err)
-			}
+			result := km.buildKindConfig(tt.config)
 			tt.validate(test, result)
 		})
 	}
@@ -1139,10 +1044,7 @@ func TestBuildKindConfigWithGPU(test *testing.T) {
 
 	for _, tt := range tests {
 		test.Run(tt.name, func(test *testing.T) {
-			result, err := km.buildKindConfig(tt.config)
-			if err != nil {
-				test.Fatalf("buildKindConfig failed: %v", err)
-			}
+			result := km.buildKindConfig(tt.config)
 			tt.validate(test, result)
 		})
 	}

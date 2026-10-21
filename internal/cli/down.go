@@ -271,7 +271,7 @@ func runDown(cmd *cobra.Command, args []string) (retErr error) {
 			rec.RecordChange(svc.Name, history.ActionUninstall, time.Since(start), err)
 			if err != nil {
 				progress.UpdateService(itr, svc.Name, ui.StatusFailed, err.Error())
-				delete(namespaceCandidates, meta.Namespace) // its resources may still be there
+				keepServiceNamespaces(namespaceCandidates, meta) // its resources may still be there
 				continue
 			}
 			st.MarkServiceUninstalled(svc.Name)
@@ -330,6 +330,9 @@ func runDown(cmd *cobra.Command, args []string) (retErr error) {
 			// Deleting its namespace would remove what's left of it behind
 			// kraze's back, leaving its state entry pointing at nothing
 			delete(namespaceCandidates, svc.GetNamespace())
+			if meta, ok := st.GetService(svc.Name); ok {
+				keepServiceNamespaces(namespaceCandidates, meta)
+			}
 			continue
 		}
 
@@ -382,8 +385,10 @@ type namespaceCandidate struct {
 }
 
 // collectNamespaceCandidates gathers the namespaces of the services being
-// uninstalled, from state and from config (state may lack namespace data).
-// It must run before uninstalling, which removes the services from state.
+// uninstalled, from state and from config (state may lack namespace data),
+// and the Namespaces manifests services ship (from their recorded objects),
+// which their uninstall leaves for this check. It must run before
+// uninstalling, which removes the services from state.
 func collectNamespaceCandidates(st *state.ClusterState, services []*config.ServiceConfig) map[string]namespaceCandidate {
 	names := make([]string, 0, len(services))
 	for _, svc := range services {
@@ -394,17 +399,33 @@ func collectNamespaceCandidates(st *state.ClusterState, services []*config.Servi
 	for ns, count := range st.GetNamespacesForServices(names) {
 		candidates[ns] = namespaceCandidate{otherServices: count, createdInState: st.NamespaceCreatedByKraze(ns)}
 	}
-	for _, svc := range services {
-		ns := svc.GetNamespace()
+	add := func(ns string) {
 		if _, seen := candidates[ns]; ns == "" || seen {
-			continue
+			return
 		}
 		candidates[ns] = namespaceCandidate{
 			otherServices:  st.CountOtherServicesInNamespace(ns, names),
 			createdInState: st.NamespaceCreatedByKraze(ns),
 		}
 	}
+	for _, svc := range services {
+		add(svc.GetNamespace())
+		if meta, ok := st.GetService(svc.Name); ok {
+			for _, ns := range providers.ShippedNamespaces(meta.Resources) {
+				add(ns)
+			}
+		}
+	}
 	return candidates
+}
+
+// keepServiceNamespaces drops a service's namespace and the Namespaces it shipped
+// from the candidates, after its removal failed
+func keepServiceNamespaces(candidates map[string]namespaceCandidate, meta state.ServiceMetadata) {
+	delete(candidates, meta.Namespace)
+	for _, ns := range providers.ShippedNamespaces(meta.Resources) {
+		delete(candidates, ns)
+	}
 }
 
 // unmanagedNamespaceSettle is how long selectNamespacesToDelete waits for the

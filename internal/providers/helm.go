@@ -190,11 +190,7 @@ func (helm *HelmProvider) Install(ctx context.Context, service *config.ServiceCo
 
 	// Wait for resources to be ready using our shared wait logic
 	if helm.opts.Wait && manifest != "" {
-		newClients := helm.waitClients
-		if newClients == nil {
-			newClients = func() (*kubeClients, error) { return newKubeClients(helm.opts.KubeConfig) }
-		}
-		clients, err := newClients()
+		clients, err := helm.kubeClients()
 		if err != nil {
 			return fmt.Errorf("failed waiting for resources: %w", err)
 		}
@@ -411,7 +407,34 @@ func (helm *HelmProvider) Status(ctx context.Context, service *config.ServiceCon
 		Message:   acc.Status(),
 	}
 
+	// A release is deployed once its objects are applied, so its workloads
+	// are checked too (pods that can't pull their image)
+	if status.Ready {
+		status.markUnready(helm.unreadyWorkloads(ctx, acc.Manifest(), service.GetNamespace()))
+	}
+
 	return status, nil
+}
+
+// unreadyWorkloads names the release's workloads that aren't ready
+func (helm *HelmProvider) unreadyWorkloads(ctx context.Context, manifest, namespace string) ([]string, error) {
+	clients, err := helm.kubeClients()
+	if err != nil {
+		return nil, err
+	}
+	objs, err := parseManifestsYAML(manifest)
+	if err != nil {
+		return nil, err
+	}
+	return unreadyWorkloads(ctx, clients.dynamic, clients.mapper, objs, namespace, true)
+}
+
+// kubeClients returns the clients for the release's objects
+func (helm *HelmProvider) kubeClients() (*kubeClients, error) {
+	if helm.waitClients != nil {
+		return helm.waitClients()
+	}
+	return newKubeClients(helm.opts.KubeConfig)
 }
 
 // IsInstalled checks if a Helm release is installed

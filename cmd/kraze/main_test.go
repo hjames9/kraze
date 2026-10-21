@@ -3,8 +3,11 @@ package main
 import (
 	"io"
 	"os"
+	"os/exec"
 	"strings"
 	"testing"
+
+	"k8s.io/klog/v2"
 )
 
 // capture runs fn with os.Stdout and os.Stderr redirected, returning both
@@ -48,5 +51,40 @@ func TestRun(t *testing.T) {
 	_, errOut := capture(t, func() { code = run() })
 	if code != 1 || !strings.Contains(errOut, "Error: unknown command") {
 		t.Errorf("unknown command: exit %d, stderr:\n%s", code, errOut)
+	}
+}
+
+// TestMain lets TestGlobalFlagsBeforeSubcommand run kraze as a separate
+// process: run's flag handling is process-wide and may exit
+func TestMain(m *testing.M) {
+	if args, ok := os.LookupEnv("KRAZE_TEST_RUN_MAIN"); ok {
+		os.Args = append([]string{"kraze"}, strings.Fields(args)...)
+		os.Exit(run())
+	}
+	os.Exit(m.Run())
+}
+
+func TestGlobalFlagsBeforeSubcommand(t *testing.T) {
+	for _, args := range []string{"-v version", "--verbose version", "--plain version", "-v --plain version"} {
+		t.Run(args, func(t *testing.T) {
+			cmd := exec.Command(os.Args[0], "-test.run=^$")
+			cmd.Env = append(os.Environ(), "KRAZE_TEST_RUN_MAIN="+args)
+			out, err := cmd.CombinedOutput()
+			if err != nil || !strings.Contains(string(out), "kraze version:") {
+				t.Errorf("kraze %s: %v, output:\n%s", args, err, out)
+			}
+		})
+	}
+}
+
+func TestQuietKlog(t *testing.T) {
+	quietKlog()
+	_, errOut := capture(t, func() {
+		klog.Warning("client warning")
+		klog.Error("client error")
+		klog.Flush()
+	})
+	if errOut != "" {
+		t.Errorf("klog wrote to stderr: %q", errOut)
 	}
 }
