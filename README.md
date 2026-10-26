@@ -171,7 +171,7 @@ The interactive UI shows real-time progress with:
 ### Prerequisites
 
 - **Docker-compatible runtime** - Docker Desktop, Colima, Podman, or Rancher Desktop must be running
-- **Go 1.27.1+** - Required to build from source (not needed for Homebrew installation)
+- **Go 1.27.3+** - Required to build from source (not needed for Homebrew installation)
 
 ### Homebrew (macOS)
 

@@ -21,7 +21,7 @@ BUILD_DIR=build
 
 # golangci-lint must bundle an x/tools new enough for the Go toolchain (see
 # CLAUDE.md). CI installs this version; bump it with the Go version.
-GOLANGCI_LINT_VERSION=v2.14.0
+GOLANGCI_LINT_VERSION=v2.15.0
 CMD_DIR=./cmd/$(BINARY_NAME)
 
 # Platform targets for cross-compilation
