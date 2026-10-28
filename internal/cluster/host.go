@@ -15,7 +15,9 @@ import (
 	clientcmdapi "k8s.io/client-go/tools/clientcmd/api"
 	"sigs.k8s.io/kind/pkg/cluster"
 	"sigs.k8s.io/kind/pkg/cluster/images"
+	"sigs.k8s.io/kind/pkg/cluster/images/layeraware"
 	"sigs.k8s.io/kind/pkg/cluster/nodes"
+	"sigs.k8s.io/kind/pkg/cluster/nodeutils"
 )
 
 // What the cluster package reaches outside the process: commands (docker,
@@ -54,6 +56,8 @@ type kindProvider interface {
 	List() ([]string, error)
 	KubeConfig(name string, internal bool) (string, error)
 	ListInternalNodes(name string) ([]nodes.Node, error)
+	// ListNodes also includes the external load balancer
+	ListNodes(name string) ([]nodes.Node, error)
 }
 
 var _ kindProvider = (*cluster.Provider)(nil)
@@ -107,9 +111,28 @@ func realClusterClients() clusterClients {
 	}
 }
 
-// loadImagesFunc loads an image archive onto nodes
-type loadImagesFunc func(archive string, nodes []nodes.Node) ([]*images.LoadResult, error)
+// imageLoader loads an image archive onto a node: layer-aware (skipping
+// layers already in the node's content store) where the archive allows it,
+// otherwise in full. KindManager.loadArchive decides which
+type imageLoader struct {
+	inspect    func(archive string) (*layeraware.ImageMetadata, error)
+	layerAware func(archive string, metadata *layeraware.ImageMetadata, node nodes.Node) error
+	full       func(archive string, node nodes.Node) error
+}
 
-func layerAwareLoad(archive string, ns []nodes.Node) ([]*images.LoadResult, error) {
-	return images.LoadImageLayerAware(archive, ns, nil)
+func realImageLoader() imageLoader {
+	return imageLoader{
+		inspect: layeraware.InspectArchive,
+		layerAware: func(archive string, metadata *layeraware.ImageMetadata, node nodes.Node) error {
+			return images.LoadImageLayerAware(archive, metadata, node, nil)
+		},
+		full: func(archive string, node nodes.Node) error {
+			f, err := os.Open(archive)
+			if err != nil {
+				return err
+			}
+			defer func() { _ = f.Close() }()
+			return nodeutils.LoadImageArchive(node, f)
+		},
+	}
 }

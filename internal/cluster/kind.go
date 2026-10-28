@@ -7,7 +7,9 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/hjames9/kraze/internal/color"
@@ -17,9 +19,12 @@ import (
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/tools/clientcmd"
+	clientcmdapi "k8s.io/client-go/tools/clientcmd/api"
 	"sigs.k8s.io/kind/pkg/apis/config/defaults"
 	"sigs.k8s.io/kind/pkg/apis/config/v1alpha4"
 	"sigs.k8s.io/kind/pkg/cluster"
+	"sigs.k8s.io/kind/pkg/cluster/constants"
+	"sigs.k8s.io/kind/pkg/cluster/nodes"
 	kindexec "sigs.k8s.io/kind/pkg/exec"
 )
 
@@ -31,7 +36,7 @@ type KindManager struct {
 	run        commandRunner
 	host       hostEnv
 	clients    clusterClients
-	loadImages loadImagesFunc
+	loadImages imageLoader
 }
 
 // NewKindManager creates a new kind cluster manager
@@ -41,7 +46,7 @@ func NewKindManager() *KindManager {
 		run:        execRunner{},
 		host:       realHost(),
 		clients:    realClusterClients(),
-		loadImages: layerAwareLoad,
+		loadImages: realImageLoader(),
 	}
 }
 
@@ -224,10 +229,11 @@ func (kind *KindManager) GetKubeConfig(clusterName string, internal bool) (strin
 
 // GetKubeConfigQuiet returns the kubeconfig with optional message suppression
 func (kind *KindManager) GetKubeConfigQuiet(clusterName string, internal bool, quiet bool) (string, error) {
-	// Get the base kubeconfig from kind
+	// Get the base kubeconfig from kind. Its error is returned as is: callers
+	// say "failed to get kubeconfig", and a wrap here repeated it
 	kubeconfig, err := kind.provider.KubeConfig(clusterName, internal)
 	if err != nil {
-		return "", fmt.Errorf("failed to get kubeconfig: %w", err)
+		return "", err
 	}
 
 	// Only patch kubeconfig if we're in a containerized environment (dev containers, CI)
@@ -273,59 +279,103 @@ func (kind *KindManager) shouldPatchKubeconfig() bool {
 	return false
 }
 
-// patchKubeconfigForNativeHost replaces container names/IPs with localhost port mappings
-// This is needed on macOS/Windows where container IPs are not accessible from the host
-// but Docker provides port forwarding (e.g., 127.0.0.1:53549->6443/tcp)
-func (kind *KindManager) patchKubeconfigForNativeHost(clusterName, kubeconfig string, quiet bool) (string, error) {
-	containerName := clusterName + "-control-plane"
-
-	// Check if kubeconfig contains the container name
-	// If kind already returned a kubeconfig with localhost, we don't need to patch it
-	if !strings.Contains(kubeconfig, containerName+":6443") {
-		// Already using localhost or doesn't contain container name - no patching needed
-		return kubeconfig, nil
-	}
-
-	// Get the Docker port mapping for the API server (port 6443)
-	// Docker shows something like: 127.0.0.1:53549->6443/tcp
-	output, err := kind.run.Output(context.Background(), "docker", "port", containerName, "6443")
+// loadBalancerName is the cluster's external load balancer container, which
+// kind adds in front of the API servers when there are several control-planes,
+// or "" if it has none
+func (kind *KindManager) loadBalancerName(clusterName string) string {
+	nodeList, err := kind.provider.ListNodes(clusterName)
 	if err != nil {
-		return "", fmt.Errorf("failed to get port mapping for container %s: %w", containerName, err)
+		return ""
 	}
-
-	// Parse the output to extract the host port
-	// Output format: "0.0.0.0:53549" or "127.0.0.1:53549"
-	portMapping := strings.TrimSpace(string(output))
-	if portMapping == "" {
-		return "", fmt.Errorf("no port mapping found for port 6443")
+	name := clusterName + "-" + constants.ExternalLoadBalancerNodeRoleValue
+	for _, node := range nodeList {
+		if node.String() == name {
+			return name
+		}
 	}
-
-	// Extract just the port number from the mapping
-	// portMapping could be "0.0.0.0:53549" or "127.0.0.1:53549" or "[::]:53549"
-	parts := strings.Split(portMapping, ":")
-	if len(parts) < 2 {
-		return "", fmt.Errorf("invalid port mapping format: %s", portMapping)
-	}
-	hostPort := parts[len(parts)-1] // Get the last part (the port number)
-
-	// Replace container name with localhost and the mapped port
-	patchedConfig := strings.ReplaceAll(kubeconfig,
-		"https://"+containerName+":6443",
-		"https://127.0.0.1:"+hostPort)
-
-	if !quiet {
-		fmt.Printf("%s Using localhost port forwarding: 127.0.0.1:%s -> %s:6443\n",
-			color.Checkmark(), hostPort, containerName)
-	}
-
-	return patchedConfig, nil
+	return ""
 }
 
-// patchKubeconfigWithContainerIP replaces the server address with the container's IP
-// This provides better compatibility across different Docker network configurations
+// apiServerContainers are the containers that serve the API, in the order to
+// use them: the load balancer if there is one, so requests still reach a
+// working control-plane when another is down, then the first control-plane
+func (kind *KindManager) apiServerContainers(clusterName string) []string {
+	controlPlane := clusterName + "-control-plane"
+	if lb := kind.loadBalancerName(clusterName); lb != "" {
+		return []string{lb, controlPlane}
+	}
+	return []string{controlPlane}
+}
+
+// loopbackServer matches kind's external kubeconfig address
+var loopbackServer = regexp.MustCompile(`https://(127\.0\.0\.1|localhost):\d+`)
+
+// rewriteAPIServer points every API server address kind writes for the
+// cluster at server: a container name (the control-plane's, or the load
+// balancer's with several control-planes) or kind's 127.0.0.1 port
+func rewriteAPIServer(kubeconfig, clusterName, server string) string {
+	for _, container := range []string{clusterName + "-" + constants.ExternalLoadBalancerNodeRoleValue, clusterName + "-control-plane"} {
+		kubeconfig = strings.ReplaceAll(kubeconfig, "https://"+container+":6443", server)
+	}
+	return loopbackServer.ReplaceAllString(kubeconfig, server)
+}
+
+// patchKubeconfigForNativeHost replaces container names with localhost port mappings
+// This is needed on macOS/Windows where container IPs are not accessible from the host.
+// The API is published on the load balancer with several control-planes, on
+// the control-plane otherwise
+func (kind *KindManager) patchKubeconfigForNativeHost(clusterName, kubeconfig string, quiet bool) (string, error) {
+	for _, containerName := range []string{clusterName + "-" + constants.ExternalLoadBalancerNodeRoleValue, clusterName + "-control-plane"} {
+		// If kind already returned a kubeconfig with localhost, we don't need to patch it
+		if !strings.Contains(kubeconfig, "https://"+containerName+":6443") {
+			continue
+		}
+
+		// Get the Docker port mapping for the API server (port 6443)
+		// Docker shows something like: 127.0.0.1:53549->6443/tcp
+		output, err := kind.run.Output(context.Background(), "docker", "port", containerName, "6443")
+		if err != nil {
+			return "", fmt.Errorf("failed to get port mapping for container %s: %w", containerName, err)
+		}
+
+		// Parse the output to extract the host port
+		// Output format: "0.0.0.0:53549" or "127.0.0.1:53549"
+		portMapping := strings.TrimSpace(string(output))
+		if portMapping == "" {
+			return "", fmt.Errorf("no port mapping found for port 6443")
+		}
+
+		// Extract just the port number from the mapping
+		// portMapping could be "0.0.0.0:53549" or "127.0.0.1:53549" or "[::]:53549"
+		parts := strings.Split(portMapping, ":")
+		if len(parts) < 2 {
+			return "", fmt.Errorf("invalid port mapping format: %s", portMapping)
+		}
+		hostPort := parts[len(parts)-1] // Get the last part (the port number)
+
+		// Replace container name with localhost and the mapped port
+		kubeconfig = strings.ReplaceAll(kubeconfig,
+			"https://"+containerName+":6443",
+			"https://127.0.0.1:"+hostPort)
+
+		if !quiet {
+			fmt.Printf("%s Using localhost port forwarding: 127.0.0.1:%s -> %s:6443\n",
+				color.Checkmark(), hostPort, containerName)
+		}
+	}
+
+	return kubeconfig, nil
+}
+
+// patchKubeconfigWithContainerIP replaces the server address with the API
+// server container's IP: the load balancer's with several control-planes, so
+// the API stays reachable while one control-plane is down, else the
+// control-plane's. A load balancer that isn't on any network this machine can
+// reach (a cluster created before kraze connected it) falls back to the first
+// control-plane
 func (kind *KindManager) patchKubeconfigWithContainerIP(clusterName, kubeconfig string, customNetwork string, quiet ...bool) (string, error) {
 	shouldPrint := len(quiet) == 0 || !quiet[0]
-	containerName := clusterName + "-control-plane"
+	containers := kind.apiServerContainers(clusterName)
 
 	// Determine networks to try - prioritize custom network if specified
 	var networksToTry []string
@@ -338,75 +388,56 @@ func (kind *KindManager) patchKubeconfigWithContainerIP(clusterName, kubeconfig 
 	}
 
 	for _, network := range networksToTry {
-		output, err := kind.run.Output(context.Background(), "docker", "inspect", containerName,
-			"-f", networkIPTemplate(network))
-		if err == nil {
-			containerIP := strings.Trim(strings.TrimSpace(string(output)), "\"")
-			if containerIP != "" && containerIP != "<no value>" {
-				// Found IP on this network
-				if shouldPrint {
-					fmt.Printf("%s Using container IP %s from '%s' network\n", color.Checkmark(), containerIP, network)
-				}
-				patchedConfig := kubeconfig
-
-				// Replace hostname with container IP:6443
-				patchedConfig = strings.ReplaceAll(patchedConfig, containerName+":6443", containerIP+":6443")
-
-				// Replace any https://127.0.0.1:PORT or https://localhost:PORT with container IP:6443
-				re := regexp.MustCompile(`https://(127\.0\.0\.1|localhost):\d+`)
-				patchedConfig = re.ReplaceAllString(patchedConfig, "https://"+containerIP+":6443")
-
-				return patchedConfig, nil
+		for iter, containerName := range containers {
+			output, err := kind.run.Output(context.Background(), "docker", "inspect", containerName,
+				"-f", networkIPTemplate(network))
+			if err != nil {
+				continue
 			}
+			containerIP := strings.Trim(strings.TrimSpace(string(output)), "\"")
+			if containerIP == "" || containerIP == "<no value>" {
+				continue
+			}
+			// Found IP on this network
+			if shouldPrint {
+				switch {
+				case len(containers) == 1:
+					fmt.Printf("%s Using container IP %s from '%s' network\n", color.Checkmark(), containerIP, network)
+				case iter == 0:
+					fmt.Printf("%s Using load balancer IP %s from '%s' network\n", color.Checkmark(), containerIP, network)
+				default:
+					fmt.Printf("Note: the cluster's load balancer isn't on the '%s' network, so the API is reached through '%s' (%s) only; recreate the cluster to use the load balancer\n",
+						network, containerName, containerIP)
+				}
+			}
+			return rewriteAPIServer(kubeconfig, clusterName, "https://"+containerIP+":6443"), nil
 		}
 	}
 
 	// Fallback: get any available IP
-	output, err := kind.run.Output(context.Background(), "docker", "inspect", containerName,
-		"-f", "{{range .NetworkSettings.Networks}}{{.IPAddress}} {{end}}")
-	if err != nil {
-		return "", fmt.Errorf("failed to get container IP: %w", err)
+	for _, containerName := range containers {
+		output, err := kind.run.Output(context.Background(), "docker", "inspect", containerName,
+			"-f", "{{range .NetworkSettings.Networks}}{{.IPAddress}} {{end}}")
+		if err != nil {
+			continue
+		}
+
+		// Take the first IP from the space-separated list
+		if ips := strings.Fields(string(output)); len(ips) > 0 {
+			return rewriteAPIServer(kubeconfig, clusterName, "https://"+ips[0]+":6443"), nil
+		}
 	}
-
-	// Take the first IP from the space-separated list
-	ips := strings.Fields(string(output))
-	if len(ips) == 0 {
-		return "", fmt.Errorf("no container IP found")
-	}
-	containerIP := ips[0]
-
-	// Replace hostname and URL addresses with container IP
-	patchedConfig := kubeconfig
-	patchedConfig = strings.ReplaceAll(patchedConfig, containerName+":6443", containerIP+":6443")
-
-	// Replace any https://127.0.0.1:PORT or https://localhost:PORT with container IP:6443
-	re := regexp.MustCompile(`https://(127\.0\.0\.1|localhost):\d+`)
-	patchedConfig = re.ReplaceAllString(patchedConfig, "https://"+containerIP+":6443")
-
-	return patchedConfig, nil
+	return "", fmt.Errorf("no IP found for %s", strings.Join(containers, " or "))
 }
 
 // UpdateKubeconfigFile updates ~/.kube/config with cluster access, patched for dev container compatibility
 // This ensures kubectl works inside dev containers by using container IP instead of 127.0.0.1
 func (kind *KindManager) UpdateKubeconfigFile(clusterName string) error {
-	// Get patched kubeconfig with container IP (quiet mode to avoid duplicate messages)
-	kubeconfigContent, err := kind.GetKubeConfigQuiet(clusterName, true, true)
+	config, err := kind.kubectlConfig(clusterName)
 	if err != nil {
-		return fmt.Errorf("failed to get kubeconfig: %w", err)
+		return err
 	}
-
-	// Parse the kubeconfig
-	config, err := clientcmd.Load([]byte(kubeconfigContent))
-	if err != nil {
-		return fmt.Errorf("failed to parse kubeconfig: %w", err)
-	}
-
-	// Add insecure-skip-tls-verify to the cluster (needed because cert is for 127.0.0.1, not container IP)
 	contextName := "kind-" + clusterName
-	if cluster, exists := config.Clusters[contextName]; exists {
-		cluster.InsecureSkipTLSVerify = true
-		cluster.CertificateAuthorityData = nil // Remove CA data when using insecure
-	}
 
 	// Get path to user's kubeconfig
 	kubeconfigPath := kind.host.kubeconfigPath
@@ -438,6 +469,67 @@ func (kind *KindManager) UpdateKubeconfigFile(clusterName string) error {
 		return fmt.Errorf("failed to write kubeconfig: %w", err)
 	}
 
+	return nil
+}
+
+// kubectlConfig is the kubeconfig UpdateKubeconfigFile writes for kubectl:
+// kind's internal one, patched for dev containers, with TLS verification off
+// (the certificate doesn't name the container IP)
+func (kind *KindManager) kubectlConfig(clusterName string) (*clientcmdapi.Config, error) {
+	// Get patched kubeconfig with container IP (quiet mode to avoid duplicate messages)
+	kubeconfigContent, err := kind.GetKubeConfigQuiet(clusterName, true, true)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get kubeconfig: %w", err)
+	}
+
+	// Parse the kubeconfig
+	config, err := clientcmd.Load([]byte(kubeconfigContent))
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse kubeconfig: %w", err)
+	}
+
+	// Add insecure-skip-tls-verify to the cluster (needed because cert is for 127.0.0.1, not container IP)
+	if cluster, exists := config.Clusters["kind-"+clusterName]; exists {
+		cluster.InsecureSkipTLSVerify = true
+		cluster.CertificateAuthorityData = nil // Remove CA data when using insecure
+	}
+	return config, nil
+}
+
+// RefreshKubeconfigFile brings the cluster's entry in ~/.kube/config up to
+// date when its API server address no longer is: the container's IP changed
+// after a restart, or the load balancer joined the network (RepairClusterNetwork
+// on a cluster an older kraze created). Unlike UpdateKubeconfigFile it changes
+// only that address, and leaves the current context, and a kubeconfig without
+// the entry, alone
+func (kind *KindManager) RefreshKubeconfigFile(clusterName string) error {
+	key := "kind-" + clusterName
+	existing, err := kind.host.loadKubeconfig()
+	if err != nil {
+		return nil // no kubeconfig to refresh
+	}
+	entry := existing.Clusters[key]
+	if entry == nil {
+		return nil
+	}
+
+	config, err := kind.kubectlConfig(clusterName)
+	if err != nil {
+		return err
+	}
+	fresh := config.Clusters[key]
+	if fresh == nil || fresh.Server == entry.Server {
+		return nil
+	}
+
+	old := entry.Server
+	entry.Server = fresh.Server
+	entry.InsecureSkipTLSVerify = fresh.InsecureSkipTLSVerify
+	entry.CertificateAuthorityData = fresh.CertificateAuthorityData
+	if err := clientcmd.WriteToFile(*existing, kind.host.kubeconfigPath); err != nil {
+		return fmt.Errorf("failed to write kubeconfig: %w", err)
+	}
+	fmt.Printf("%s Updated kubeconfig context '%s': API server %s -> %s\n", color.Checkmark(), key, old, fresh.Server)
 	return nil
 }
 
@@ -615,18 +707,39 @@ func (kind *KindManager) LoadImage(ctx context.Context, clusterName, imageName s
 		return fmt.Errorf("failed to save image '%s': %w (make sure the image exists locally)", imageName, err)
 	}
 
-	// Load the image onto all nodes using layer-aware transfer
-	results, err := kind.loadImages(imageTar, nodes)
-	if err != nil {
+	if err := kind.loadArchive(imageTar, nodes); err != nil {
 		return fmt.Errorf("failed to load image '%s': %w", imageName, err)
-	}
-	for _, result := range results {
-		if result.Error != nil {
-			return fmt.Errorf("failed to load image onto node %s: %w", result.Node.String(), result.Error)
-		}
 	}
 
 	return nil
+}
+
+// loadArchive loads an image archive onto every node, as `kind load
+// docker-image` does: concurrently, and layer-aware where possible, so layers
+// a node already has aren't sent again. An archive layer-aware loading can't
+// read, or a failed layer-aware load on a node, falls back to loading the full
+// archive there. Unlike kind, it waits for every node before returning, since
+// the caller removes the archive once it returns; every node that failed is
+// reported.
+func (kind *KindManager) loadArchive(archive string, nodeList []nodes.Node) error {
+	metadata, inspectErr := kind.loadImages.inspect(archive)
+	errs := make([]error, len(nodeList))
+	var wg sync.WaitGroup
+	for iter, node := range nodeList {
+		wg.Go(func() {
+			layerErr := inspectErr
+			if layerErr == nil {
+				if layerErr = kind.loadImages.layerAware(archive, metadata, node); layerErr == nil {
+					return
+				}
+			}
+			if err := kind.loadImages.full(archive, node); err != nil {
+				errs[iter] = fmt.Errorf("failed to load image onto node %s: %w (layer-aware load: %v)", node.String(), err, layerErr)
+			}
+		})
+	}
+	wg.Wait()
+	return errors.Join(errs...)
 }
 
 // UntagImage removes the tag reference from an image without removing the image itself
@@ -1243,9 +1356,13 @@ func (kind *KindManager) buildKindNode(node config.KindNode) v1alpha4.Node {
 // - clusterName: name of the kind cluster
 // - networkName: explicit network name (optional, auto-detected if empty)
 // - subnet: network subnet for creation (optional, e.g., "172.1.0.0/16")
-// - ipv4Address: static IP for the cluster container (optional)
+// - ipv4Address: static IP for the control-plane container (optional)
+//
+// The control-plane decides which network is used: the first one it can join.
+// Every other node then joins it too, so fixDefaultRoutes can route each
+// node's traffic through it; a node left off the network keeps kind's route.
 func (kind *KindManager) connectToHostNetwork(clusterName string, networkName string, subnet string, ipv4Address string) error {
-	containerName := clusterName + "-control-plane"
+	controlPlane := clusterName + "-control-plane"
 
 	// Determine which networks to try
 	var networksToTry []string
@@ -1273,7 +1390,7 @@ func (kind *KindManager) connectToHostNetwork(clusterName string, networkName st
 		if ipv4Address != "" {
 			connectArgs = append(connectArgs, "--ip", ipv4Address)
 		}
-		connectArgs = append(connectArgs, network, containerName)
+		connectArgs = append(connectArgs, network, controlPlane)
 
 		if _, err := kind.run.Output(context.Background(), "docker", connectArgs...); err != nil {
 			// Might already be connected or other error, try next network
@@ -1286,13 +1403,7 @@ func (kind *KindManager) connectToHostNetwork(clusterName string, networkName st
 			fmt.Printf("%s Connected cluster to '%s' network for better connectivity\n", color.Checkmark(), network)
 		}
 
-		// Fix the default route inside every kind node so internet traffic flows
-		// through this network's NAT rules. Without this, nodes with two network
-		// interfaces (kind + bridge) keep routing internet traffic through the kind
-		// interface, which may lack working iptables masquerade rules.
-		if err := kind.fixDefaultRouteForCluster(clusterName, network); err != nil {
-			fmt.Printf("Warning: Could not update default route via '%s': %v\n", network, err)
-		}
+		kind.joinNetwork(clusterName, network, false)
 		return nil
 	}
 
@@ -1300,12 +1411,104 @@ func (kind *KindManager) connectToHostNetwork(clusterName string, networkName st
 	return fmt.Errorf("could not connect to any common Docker network")
 }
 
-// ensureNetworkExists checks if a Docker network exists and creates it if needed
-// fixDefaultRouteForCluster updates the default route inside every kind node of
-// the cluster to use the gateway of the given Docker network. This ensures
+// joinNetwork brings the rest of the cluster onto the network the
+// control-plane joined: the other nodes (with an address Docker assigns: a
+// static IP is the control-plane's) and the load balancer, and points each
+// node's default route at the network's gateway.
+//
+// For a new cluster (repair false) every node is connected. Repairing an
+// existing one, on a later up, connects only what isn't on the network (nodes
+// of a cluster an older kraze created) and changes only routes that aren't
+// via the gateway (a route set in a node doesn't survive a restart of it, or
+// of Docker), saying what it changed
+func (kind *KindManager) joinNetwork(clusterName, network string, repair bool) {
+	controlPlane := clusterName + "-control-plane"
+	connect := func(what, container string) bool {
+		if repair && kind.onNetwork(container, network) {
+			return true
+		}
+		if out, err := kind.run.CombinedOutput(context.Background(), "", "docker", "network", "connect", network, container); err != nil {
+			fmt.Printf("Warning: Could not connect %s '%s' to '%s' network: %v: %s\n", what, container, network, err, strings.TrimSpace(string(out)))
+			return false
+		}
+		fmt.Printf("%s Connected %s '%s' to '%s' network\n", color.Checkmark(), what, container, network)
+		return true
+	}
+
+	connected := []string{controlPlane}
+	for _, node := range kind.clusterNodeNames(clusterName) {
+		if node != controlPlane && connect("node", node) {
+			connected = append(connected, node)
+		}
+	}
+
+	// With several control-planes, kind puts a load balancer in front of
+	// them: on this network too, the kubeconfig can use it, and the API
+	// stays reachable while a control-plane is down. It needs no route:
+	// it only proxies to the control-planes on kind's network
+	if lb := kind.loadBalancerName(clusterName); lb != "" {
+		connect("load balancer", lb)
+	}
+
+	// Fix the default route inside every connected node so internet traffic
+	// flows through this network's NAT rules. Without this, nodes with two
+	// network interfaces (kind + this network) keep routing internet traffic
+	// through the kind interface, which may lack working iptables masquerade
+	// rules.
+	if err := kind.fixDefaultRoutes(network, connected, repair); err != nil {
+		fmt.Printf("Warning: Could not update default route via '%s': %v\n", network, err)
+	}
+}
+
+// onNetwork reports whether a container has an address on the network
+func (kind *KindManager) onNetwork(container, network string) bool {
+	out, err := kind.run.Output(context.Background(), "docker", "inspect", container, "-f", networkIPTemplate(network))
+	ip := strings.Trim(strings.TrimSpace(string(out)), "\"")
+	return err == nil && ip != "" && ip != "<no value>"
+}
+
+// RepairClusterNetwork restores, on an existing kind cluster, what
+// connectToHostNetwork set up when it was created and what an older kraze
+// left out: see joinNetwork. The network is the one the control-plane joined:
+// network if it's set, else the first auto-detected one it's on. A cluster
+// whose control-plane joined none is left alone. Changes are printed;
+// nothing is printed for a cluster that needs none
+func (kind *KindManager) RepairClusterNetwork(clusterName, network string) {
+	networks := kind.detectNetworks()
+	if network != "" {
+		networks = []string{network}
+	}
+	for _, candidate := range networks {
+		if kind.onNetwork(clusterName+"-control-plane", candidate) {
+			kind.joinNetwork(clusterName, candidate, true)
+			return
+		}
+	}
+}
+
+// clusterNodeNames lists the cluster's node containers, or just the
+// control-plane if kind can't list them (with a warning: the other nodes
+// then stay off the network)
+func (kind *KindManager) clusterNodeNames(clusterName string) []string {
+	nodeList, err := kind.provider.ListInternalNodes(clusterName)
+	if err != nil || len(nodeList) == 0 {
+		fmt.Printf("Warning: Could not list the nodes of cluster '%s' (%v); only the control-plane is connected\n", clusterName, err)
+		return []string{clusterName + "-control-plane"}
+	}
+	names := make([]string, len(nodeList))
+	for iter, node := range nodeList {
+		names[iter] = node.String()
+	}
+	// kind lists them in no particular order
+	slices.Sort(names)
+	return names
+}
+
+// fixDefaultRoutes updates the default route inside the given nodes, which
+// must be connected to the network, to use the network's gateway. This ensures
 // outbound internet traffic is NATted through that network's iptables rules
 // rather than through the kind-internal network, which may have no NAT.
-func (kind *KindManager) fixDefaultRouteForCluster(clusterName, networkName string) error {
+func (kind *KindManager) fixDefaultRoutes(networkName string, nodeNames []string, repair bool) error {
 	// Get the gateway IP for this network
 	out, err := kind.run.Output(context.Background(), "docker", "network", "inspect", networkName,
 		"--format", "{{range .IPAM.Config}}{{.Gateway}}{{end}}")
@@ -1317,20 +1520,23 @@ func (kind *KindManager) fixDefaultRouteForCluster(clusterName, networkName stri
 		return fmt.Errorf("no gateway found for network %s", networkName)
 	}
 
-	// Get all nodes in this cluster
-	nodesOut, err := kind.run.Output(context.Background(), "kind", "get", "nodes", "--name", clusterName)
-	if err != nil {
-		// Fall back to just the control-plane
-		nodesOut = []byte(clusterName + "-control-plane")
-	}
-	nodes := strings.Fields(string(nodesOut))
-
-	for _, node := range nodes {
+	for _, node := range nodeNames {
+		// Repairing, a route that's already right is left alone, quietly
+		if repair {
+			current, err := kind.run.Output(context.Background(), "docker", "exec", node, "ip", "route", "show", "default")
+			if err == nil && strings.HasPrefix(string(current), "default via "+gateway+" ") {
+				continue
+			}
+		}
 		routeOut, err := kind.run.CombinedOutput(context.Background(), "", "docker", "exec", node,
 			"ip", "route", "replace", "default", "via", gateway)
-		if err != nil {
+		switch {
+		case err != nil:
 			fmt.Printf("Warning: Could not update default route in node '%s': %v: %s\n", node, err, routeOut)
-		} else {
+		case repair:
+			fmt.Printf("%s Restored default route in '%s' to use '%s' gateway (%s)\n",
+				color.Checkmark(), node, networkName, gateway)
+		default:
 			fmt.Printf("%s Default route in '%s' updated to use '%s' gateway (%s)\n",
 				color.Checkmark(), node, networkName, gateway)
 		}
@@ -1338,6 +1544,7 @@ func (kind *KindManager) fixDefaultRouteForCluster(clusterName, networkName stri
 	return nil
 }
 
+// ensureNetworkExists checks if a Docker network exists and creates it if needed
 func (kind *KindManager) ensureNetworkExists(networkName string, subnet string) error {
 	// Check if network already exists
 	if _, err := kind.run.Output(context.Background(), "docker", "network", "inspect", networkName); err == nil {

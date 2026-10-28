@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -21,8 +22,9 @@ import (
 	"k8s.io/client-go/rest"
 	clientcmdapi "k8s.io/client-go/tools/clientcmd/api"
 	"sigs.k8s.io/kind/pkg/cluster"
-	"sigs.k8s.io/kind/pkg/cluster/images"
+	"sigs.k8s.io/kind/pkg/cluster/images/layeraware"
 	"sigs.k8s.io/kind/pkg/cluster/nodes"
+	kindexec "sigs.k8s.io/kind/pkg/exec"
 )
 
 // errNotFaked is what fakeRunner returns for a command no rule matches, as
@@ -127,11 +129,33 @@ type fakeNode struct {
 
 func (n fakeNode) String() string { return n.name }
 
+// unreachableNode is a kind node whose commands all fail, recording what
+// kind's own loading code tried to run there
+type unreachableNode struct {
+	fakeNode
+	ran *[]string
+}
+
+func (n unreachableNode) Command(name string, args ...string) kindexec.Cmd {
+	*n.ran = append(*n.ran, strings.Join(append([]string{name}, args...), " "))
+	return failingCmd{}
+}
+
+// failingCmd is a kind command that fails when run
+type failingCmd struct{}
+
+func (c failingCmd) Run() error                       { return errors.New("node unreachable") }
+func (c failingCmd) SetEnv(...string) kindexec.Cmd    { return c }
+func (c failingCmd) SetStdin(io.Reader) kindexec.Cmd  { return c }
+func (c failingCmd) SetStdout(io.Writer) kindexec.Cmd { return c }
+func (c failingCmd) SetStderr(io.Writer) kindexec.Cmd { return c }
+
 // fakeProvider is a kind provider holding clusters by name
 type fakeProvider struct {
 	mu         sync.Mutex
 	clusters   []string
 	nodes      []string // node names of every cluster
+	external   []string // external nodes (the load balancer), only in ListNodes
 	kubeconfig string
 	createErr  error
 	listErr    error
@@ -170,6 +194,19 @@ func (p *fakeProvider) List() ([]string, error) {
 
 func (p *fakeProvider) KubeConfig(string, bool) (string, error) {
 	return p.kubeconfig, p.kubeErr
+}
+
+func (p *fakeProvider) ListNodes(name string) ([]nodes.Node, error) {
+	out, err := p.ListInternalNodes(name)
+	if err != nil {
+		return nil, err
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for _, n := range p.external {
+		out = append(out, fakeNode{name: n})
+	}
+	return out, nil
 }
 
 func (p *fakeProvider) ListInternalNodes(string) ([]nodes.Node, error) {
@@ -255,8 +292,11 @@ type testKind struct {
 	provider *fakeProvider
 	host     *testHost
 	dynamic  *dynamicfake.FakeDynamicClient
-	loaded   []string // archives loadImages was given
-	loadErr  error    // per-node load error
+	loadMu   sync.Mutex // nodes load concurrently
+	loaded   []string   // archives loaded onto a node, by either path
+	loads    []string   // "<path> <node>" per node load, path layer-aware or full
+	// Errors from inspecting the archive, a layer-aware load and a full load
+	inspectErr, layerErr, loadErr error
 }
 
 func newTestKind(t *testing.T) *testKind {
@@ -275,16 +315,28 @@ func newTestKind(t *testing.T) *testKind {
 			clientset: func(*rest.Config) (kubernetes.Interface, error) { return fake.NewSimpleClientset(), nil },
 			dynamic:   func(*rest.Config) (dynamic.Interface, error) { return tk.dynamic, nil },
 		},
-		loadImages: func(archive string, ns []nodes.Node) ([]*images.LoadResult, error) {
-			tk.loaded = append(tk.loaded, archive)
-			var results []*images.LoadResult
-			for _, n := range ns {
-				results = append(results, &images.LoadResult{Node: n, Success: tk.loadErr == nil, Error: tk.loadErr})
-			}
-			return results, nil
+		loadImages: imageLoader{
+			inspect: func(string) (*layeraware.ImageMetadata, error) {
+				return &layeraware.ImageMetadata{}, tk.inspectErr
+			},
+			layerAware: func(archive string, _ *layeraware.ImageMetadata, n nodes.Node) error {
+				tk.recordLoad(archive, "layer-aware "+n.String())
+				return tk.layerErr
+			},
+			full: func(archive string, n nodes.Node) error {
+				tk.recordLoad(archive, "full "+n.String())
+				return tk.loadErr
+			},
 		},
 	}
 	return tk
+}
+
+func (tk *testKind) recordLoad(archive, load string) {
+	tk.loadMu.Lock()
+	defer tk.loadMu.Unlock()
+	tk.loaded = append(tk.loaded, archive)
+	tk.loads = append(tk.loads, load)
 }
 
 func newTestImages() (*ImageManager, *fakeRunner) {

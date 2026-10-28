@@ -20,6 +20,8 @@ type clusterManager interface {
 	GetKubeconfigForExternalCluster(cfg *config.ClusterConfig) (string, error)
 	VerifyClusterAccess(ctx context.Context, kubeconfig string) error
 	UpdateKubeconfigFile(name string) error
+	RepairClusterNetwork(name, network string)
+	RefreshKubeconfigFile(name string) error
 	LoadImage(ctx context.Context, clusterName, image string) error
 	UntagImage(ctx context.Context, clusterName, image string) error
 }

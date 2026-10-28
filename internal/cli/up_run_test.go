@@ -13,6 +13,7 @@ import (
 	"github.com/hjames9/kraze/internal/history"
 	"github.com/hjames9/kraze/internal/providers"
 	"github.com/hjames9/kraze/internal/state"
+	"github.com/spf13/cobra"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
@@ -129,9 +130,14 @@ func TestUpExistingClusterUpgrades(t *testing.T) {
 		t.Fatalf("second up: %v\n%s", err, out)
 	}
 
-	if got := env.eventsWith("cluster."); len(got) != 0 {
+	if got := env.eventsWith("cluster.create"); len(got) != 0 {
 		t.Errorf("an existing cluster must not be created, got %v", got)
 	}
+	// Each up repairs the existing cluster's network, then its kubeconfig entry
+	assertEqual(t, "cluster events", env.eventsWith("cluster."), []string{
+		"cluster.repair-network c ", "cluster.refresh-kubeconfig c",
+		"cluster.repair-network c ", "cluster.refresh-kubeconfig c",
+	})
 	if env.cluster.kubeconfigUpdated {
 		t.Error("~/.kube/config is only updated for a new cluster")
 	}
@@ -269,7 +275,7 @@ func TestUpRemoveOrphansBeforeInstalling(t *testing.T) {
 	if out, err := runCmd(t, runUp); err != nil {
 		t.Fatalf("up failed: %v\n%s", err, out)
 	}
-	if len(env.events) == 0 || env.events[0] != "orphan.uninstall shop/old-a" {
+	if got := env.eventsWithout("cluster."); len(got) == 0 || got[0] != "orphan.uninstall shop/old-a" {
 		t.Errorf("events = %v, want the orphan removed first", env.events)
 	}
 	if env.state(t, "web").IsServiceInstalled("old-a") {
@@ -518,4 +524,43 @@ func TestUpRefusesGPUMismatch(t *testing.T) {
 		t.Error("a new cluster's state should record NVIDIA GPUs")
 	}
 
+}
+
+// up repairs an existing kind cluster before installing: on the configured
+// network, and a kubeconfig that can't be refreshed is only a warning. A
+// cluster up just created needs no repair, and down and history never repair
+func TestUpRepairsExistingCluster(t *testing.T) {
+	env := withFakeDeps(t)
+	useConfig(t, strings.Replace(kindConfig, "  name: c\n", "  name: c\n  network: dev\n", 1))
+	env.cluster.exists = true
+	env.cluster.errs["RefreshKubeconfigFile"] = errBoom
+
+	out, err := runCmd(t, runUp)
+	if err != nil {
+		t.Fatalf("up failed: %v\n%s", err, out)
+	}
+	assertContains(t, out, "Warning: failed to refresh kubeconfig: boom")
+	events := env.eventsWithout("history.")
+	if len(events) < 2 || events[0] != "cluster.repair-network c dev" || events[1] != "cluster.refresh-kubeconfig c" {
+		t.Errorf("events = %v, want the repair before anything else", events)
+	}
+
+	env = withFakeDeps(t)
+	useConfig(t, kindConfig)
+	if out, err := runCmd(t, runUp); err != nil {
+		t.Fatalf("up failed: %v\n%s", err, out)
+	}
+	assertEqual(t, "cluster events of a created cluster", env.eventsWith("cluster."), []string{"cluster.create c"})
+
+	for name, run := range map[string]func(*cobra.Command, []string) error{"down": runDown, "history": runHistory} {
+		env := withFakeDeps(t)
+		useConfig(t, kindConfig)
+		env.cluster.exists = true
+		if out, err := runCmd(t, run); err != nil {
+			t.Fatalf("%s failed: %v\n%s", name, err, out)
+		}
+		if got := env.eventsWith("cluster.re"); len(got) != 0 {
+			t.Errorf("%s repaired: %v", name, got)
+		}
+	}
 }

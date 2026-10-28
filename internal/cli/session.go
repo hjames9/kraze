@@ -125,6 +125,16 @@ func connectCluster(ctx context.Context, mgr clusterManager, cfg *config.Config,
 		switch {
 		case exists:
 			Verbose("Cluster '%s' already exists", cfg.Cluster.Name)
+			if onMissing == createMissing {
+				// Before installing: nodes restarted since the last up have
+				// lost their routes, and a cluster an older kraze created
+				// has nodes off the network. Its address in ~/.kube/config
+				// may have changed with either
+				mgr.RepairClusterNetwork(cfg.Cluster.Name, cfg.Cluster.Network)
+				if err := mgr.RefreshKubeconfigFile(cfg.Cluster.Name); err != nil {
+					fmt.Printf("Warning: failed to refresh kubeconfig: %v\n", err)
+				}
+			}
 		case onMissing == skipMissing:
 			return nil, nil
 		default:

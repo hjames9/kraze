@@ -167,6 +167,19 @@ func (e *fakeEnv) eventsWith(prefix string) []string {
 	return out
 }
 
+// eventsWithout is every event without the prefix, in order
+func (e *fakeEnv) eventsWithout(prefix string) []string {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	var out []string
+	for _, ev := range e.events {
+		if !strings.HasPrefix(ev, prefix) {
+			out = append(out, ev)
+		}
+	}
+	return out
+}
+
 // provider returns the fake provider for a service, creating it
 func (e *fakeEnv) provider(name string) *fakeProvider {
 	e.mu.Lock()
@@ -295,6 +308,15 @@ func (c *fakeCluster) UpdateKubeconfigFile(string) error {
 	c.kubeconfigUpdated = true
 	c.env.mu.Unlock()
 	return c.err("UpdateKubeconfigFile")
+}
+
+func (c *fakeCluster) RepairClusterNetwork(name, network string) {
+	c.env.event("cluster.repair-network %s %s", name, network)
+}
+
+func (c *fakeCluster) RefreshKubeconfigFile(name string) error {
+	c.env.event("cluster.refresh-kubeconfig %s", name)
+	return c.err("RefreshKubeconfigFile")
 }
 
 func (c *fakeCluster) LoadImage(_ context.Context, _, image string) error {

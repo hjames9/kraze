@@ -270,6 +270,27 @@ func TestInitKindCluster(t *testing.T) {
 	assertEqual(t, "history changes", changeActions(entry), []string{"bad:1:load-image:failed", "good:1:load-image:succeeded"})
 }
 
+// The dry run counts the nodes kind creates, replicas included
+func TestInitDryRunNodeCount(t *testing.T) {
+	for config, want := range map[string]string{
+		"project: web\ncluster:\n  name: c\n": "Nodes: 1",
+		"project: web\ncluster:\n  name: c\n  config:\n    - role: control-plane\n    - role: worker\n      replicas: 2\n": "Nodes: 3",
+	} {
+		env := withFakeDeps(t)
+		useConfig(t, config)
+		dryRun = true
+
+		out, err := runCmd(t, runInit)
+		if err != nil {
+			t.Fatalf("init failed: %v\n%s", err, out)
+		}
+		assertContains(t, out, "[DRY RUN] Would create kind cluster 'c'", want)
+		if len(env.eventsWith("cluster.create")) != 0 {
+			t.Error("a dry run creates nothing")
+		}
+	}
+}
+
 func TestInitCreateFails(t *testing.T) {
 	env := withFakeDeps(t)
 	useConfig(t, preloadConfig)

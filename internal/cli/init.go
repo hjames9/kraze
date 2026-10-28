@@ -83,7 +83,7 @@ func runInit(cmd *cobra.Command, args []string) (retErr error) {
 			} else if cfg.Cluster.Version != "" {
 				fmt.Printf("  Node image: kindest/node:v%s\n", cfg.Cluster.Version)
 			}
-			fmt.Printf("  Nodes: %d\n", len(cfg.Cluster.Config))
+			fmt.Printf("  Nodes: %d\n", cfg.Cluster.NodeCount())
 			return nil
 		}
 

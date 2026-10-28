@@ -109,6 +109,20 @@ func (c *ClusterConfig) IsExternal() bool {
 	return c.External != nil && c.External.Enabled
 }
 
+// NodeCount is the number of kind nodes the cluster is created with: one per
+// config entry, or replicas of it, and a single control-plane when config is
+// empty
+func (c *ClusterConfig) NodeCount() int {
+	if len(c.Config) == 0 {
+		return 1
+	}
+	count := 0
+	for _, node := range c.Config {
+		count += max(node.Replicas, 1)
+	}
+	return count
+}
+
 // ValuesField represents a values file or array of values files
 // Supports both: values: "single.yaml" and values: ["base.yaml", "override.yaml"]
 type ValuesField struct {

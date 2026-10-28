@@ -16,8 +16,7 @@ import (
 	"k8s.io/client-go/kubernetes/fake"
 	"k8s.io/client-go/rest"
 	k8stesting "k8s.io/client-go/testing"
-	"sigs.k8s.io/kind/pkg/cluster/images"
-	"sigs.k8s.io/kind/pkg/cluster/nodes"
+	"sigs.k8s.io/kind/pkg/cluster/images/layeraware"
 )
 
 var errFail = errors.New("forbidden")
@@ -53,7 +52,7 @@ func TestKindManagerFailures(test *testing.T) {
 		{"delete: kind fails", func(tk *testKind) { tk.provider.clusters = []string{"c"}; tk.provider.deleteErr = errFail },
 			func(tk *testKind) error { return tk.DeleteCluster("c") }, "failed to delete cluster"},
 		{"kubeconfig: kind fails", func(tk *testKind) { tk.provider.kubeErr = errFail },
-			func(tk *testKind) error { _, err := tk.GetKubeConfig("c", false); return err }, "failed to get kubeconfig"},
+			func(tk *testKind) error { _, err := tk.GetKubeConfig("c", false); return err }, "forbidden"},
 		{"update kubeconfig: kind fails", func(tk *testKind) { tk.provider.kubeErr = errFail },
 			func(tk *testKind) error { return tk.UpdateKubeconfigFile("c") }, "failed to get kubeconfig"},
 		{"update kubeconfig: can't write", func(tk *testKind) {
@@ -65,7 +64,7 @@ func TestKindManagerFailures(test *testing.T) {
 			func(tk *testKind) error { return tk.LoadImage(ctx, "c", "a:1") }, "failed to list cluster nodes"},
 		{"load image: loading fails", func(tk *testKind) {
 			tk.run.on("docker save", "", nil)
-			tk.loadImages = func(string, []nodes.Node) ([]*images.LoadResult, error) { return nil, errFail }
+			tk.inspectErr, tk.loadErr = errFail, errFail
 		}, func(tk *testKind) error { return tk.LoadImage(ctx, "c", "a:1") }, "failed to load image 'a:1'"},
 		{"cgroup dirs: no nodes listed", func(tk *testKind) { tk.provider.nodesErr = errFail },
 			func(tk *testKind) error { return tk.ensureKubeletCgroupDirectories("c") }, "failed to list cluster nodes"},
@@ -120,7 +119,7 @@ func TestKindManagerFailures(test *testing.T) {
 			tk.dynamic.PrependReactor("update", "runtimeclasses", func(k8stesting.Action) (bool, runtime.Object, error) { return true, nil, errFail })
 		}, func(tk *testKind) error { return tk.registerNvidiaRuntimeClass(ctx, "c") }, "failed to update NVIDIA RuntimeClass"},
 		{"default route: gateway unknown", nil,
-			func(tk *testKind) error { return tk.fixDefaultRouteForCluster("c", "dev-net") }, "inspect network dev-net"},
+			func(tk *testKind) error { return tk.fixDefaultRoutes("dev-net", []string{"c-control-plane"}, false) }, "inspect network dev-net"},
 		{"external: no home for the default kubeconfig", func(tk *testKind) { tk.host.homeErr = errFail },
 			func(tk *testKind) error { _, err := tk.GetKubeconfigForExternalCluster(external("")); return err }, "failed to get user home directory"},
 		{"external: no home for ~", func(tk *testKind) { tk.host.homeErr = errFail },
@@ -168,6 +167,24 @@ func TestKindManagerFailures(test *testing.T) {
 				test.Errorf("err = %v, want %q", err, tt.want)
 			}
 		})
+	}
+}
+
+// Callers of GetKubeConfigQuiet add "failed to get kubeconfig"; it used to be
+// added by both, so the message said it twice
+func TestKubeconfigErrorNotRepeated(test *testing.T) {
+	ctx := context.Background()
+	for name, run := range map[string]func(tk *testKind) error{
+		"update kubeconfig": func(tk *testKind) error { return tk.UpdateKubeconfigFile("c") },
+		"runtime class":     func(tk *testKind) error { return tk.registerNvidiaRuntimeClass(ctx, "c") },
+	} {
+		tk := newTestKind(test)
+		tk.provider.kubeErr = errFail
+		var err error
+		captureStdout(test, func() { err = run(tk) })
+		if err == nil || strings.Count(err.Error(), "failed to get kubeconfig") != 1 {
+			test.Errorf("%s: err = %v, want \"failed to get kubeconfig\" once", name, err)
+		}
 	}
 }
 
@@ -288,8 +305,30 @@ func TestRealHostWiring(test *testing.T) {
 	if _, err := clients.dynamic(&rest.Config{Host: "https://127.0.0.1:1"}); err != nil {
 		test.Error(err)
 	}
-	if _, err := layerAwareLoad(filepath.Join(test.TempDir(), "missing.tar"), nil); err == nil {
+	loader, missing := realImageLoader(), filepath.Join(test.TempDir(), "missing.tar")
+	if _, err := loader.inspect(missing); err == nil {
+		test.Error("a missing archive can't be inspected")
+	}
+	if err := loader.full(missing, nil); err == nil {
 		test.Error("a missing archive can't be loaded")
+	}
+	// Both loads go to the node through kind: the layer-aware one asks what
+	// its content store holds, the full one which snapshotter to import with
+	var ran []string
+	node := unreachableNode{fakeNode{name: "c-control-plane"}, &ran}
+	if err := loader.layerAware(missing, &layeraware.ImageMetadata{}, node); err == nil {
+		test.Error("a layer-aware load onto an unreachable node can't succeed")
+	}
+	archive := filepath.Join(test.TempDir(), "image.tar")
+	if err := os.WriteFile(archive, nil, 0o600); err != nil {
+		test.Fatal(err)
+	}
+	if err := loader.full(archive, node); err == nil {
+		test.Error("a full load onto an unreachable node can't succeed")
+	}
+	if len(ran) != 2 || !strings.HasPrefix(ran[0], "ctr --namespace=k8s.io content ls") ||
+		!strings.HasPrefix(ran[1], "containerd config dump") {
+		test.Errorf("ran %q on the node", ran)
 	}
 	test.Setenv("KUBECONFIG", filepath.Join(test.TempDir(), "none"))
 	if cfg, err := realHost().loadKubeconfig(); err != nil || cfg == nil {

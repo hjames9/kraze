@@ -3,10 +3,13 @@ package cluster
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -15,6 +18,8 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/tools/clientcmd"
 	clientcmdapi "k8s.io/client-go/tools/clientcmd/api"
+	"sigs.k8s.io/kind/pkg/cluster/images/layeraware"
+	"sigs.k8s.io/kind/pkg/cluster/nodes"
 )
 
 func TestPatchKubeconfigWithContainerIP(test *testing.T) {
@@ -67,6 +72,125 @@ func TestPatchKubeconfigWithContainerIP(test *testing.T) {
 	}
 }
 
+// Every address kind writes for the cluster points at the one server
+func TestRewriteAPIServer(test *testing.T) {
+	for in, want := range map[string]string{
+		"server: https://c-control-plane:6443":          "server: https://10.0.0.9:6443",
+		"server: https://c-external-load-balancer:6443": "server: https://10.0.0.9:6443",
+		"server: https://127.0.0.1:41234":               "server: https://10.0.0.9:6443",
+		"server: https://localhost:41234":               "server: https://10.0.0.9:6443",
+		// Other clusters' addresses are left alone
+		"server: https://other-control-plane:6443": "server: https://other-control-plane:6443",
+		"server: https://c-control-plane2:6443":    "server: https://c-control-plane2:6443",
+	} {
+		if got := rewriteAPIServer(in, "c", "https://10.0.0.9:6443"); got != want {
+			test.Errorf("%q: got %q, want %q", in, got, want)
+		}
+	}
+}
+
+// With several control-planes the API is reached through kind's load
+// balancer, for both the internal kubeconfig (which names it) and the
+// external one (127.0.0.1 and its published port)
+func TestPatchKubeconfigWithLoadBalancer(test *testing.T) {
+	for _, kubeconfig := range []string{"server: https://c-external-load-balancer:6443", "server: https://127.0.0.1:41234"} {
+		tk := newTestKind(test)
+		tk.provider.nodes = []string{"c-control-plane", "c-control-plane2", "c-control-plane3"}
+		tk.provider.external = []string{"c-external-load-balancer"}
+		tk.run.on("docker inspect c-external-load-balancer -f "+networkIPTemplate("dev-net"), "172.30.0.9", nil)
+		tk.run.on("docker inspect c-control-plane -f "+networkIPTemplate("dev-net"), "172.30.0.2", nil)
+		var got string
+		var err error
+		out := captureStdout(test, func() { got, err = tk.patchKubeconfigWithContainerIP("c", kubeconfig, "dev-net") })
+		if err != nil || got != "server: https://172.30.0.9:6443" {
+			test.Errorf("%q: got %q, %v", kubeconfig, got, err)
+		}
+		if !strings.Contains(out, "Using load balancer IP 172.30.0.9 from 'dev-net' network") {
+			test.Errorf("output:\n%s", out)
+		}
+	}
+}
+
+// A cluster created before kraze connected the load balancer: the first
+// control-plane is used, and kraze says why
+func TestPatchKubeconfigLoadBalancerUnreachable(test *testing.T) {
+	tk := newTestKind(test)
+	tk.provider.nodes = []string{"c-control-plane", "c-control-plane2"}
+	tk.provider.external = []string{"c-external-load-balancer"}
+	tk.run.on("docker inspect c-external-load-balancer -f "+networkIPTemplate("dev-net"), "<no value>", nil)
+	tk.run.on("docker inspect c-control-plane -f "+networkIPTemplate("dev-net"), "172.30.0.2", nil)
+	var got string
+	var err error
+	out := captureStdout(test, func() {
+		got, err = tk.patchKubeconfigWithContainerIP("c", "server: https://c-external-load-balancer:6443", "dev-net")
+	})
+	if err != nil || got != "server: https://172.30.0.2:6443" {
+		test.Errorf("got %q, %v", got, err)
+	}
+	if !strings.Contains(out, "load balancer isn't on the 'dev-net' network, so the API is reached through 'c-control-plane' (172.30.0.2) only") {
+		test.Errorf("output:\n%s", out)
+	}
+
+	// On no network: any IP, the load balancer's first
+	tk = newTestKind(test)
+	tk.provider.external = []string{"c-external-load-balancer"}
+	tk.run.on("docker inspect c-external-load-balancer -f {{range .NetworkSettings.Networks}}", "172.18.0.9 ", nil)
+	if got, err := tk.patchKubeconfigWithContainerIP("c", "server: https://127.0.0.1:1", "", true); err != nil || got != "server: https://172.18.0.9:6443" {
+		test.Errorf("fallback got %q, %v", got, err)
+	}
+	tk = newTestKind(test)
+	tk.provider.external = []string{"c-external-load-balancer"}
+	tk.run.on("docker inspect c-control-plane -f {{range .NetworkSettings.Networks}}", "172.18.0.2 ", nil)
+	if got, err := tk.patchKubeconfigWithContainerIP("c", "server: https://127.0.0.1:1", "", true); err != nil || got != "server: https://172.18.0.2:6443" {
+		test.Errorf("fallback without a load balancer IP got %q, %v", got, err)
+	}
+	tk = newTestKind(test)
+	tk.provider.external = []string{"c-external-load-balancer"}
+	if _, err := tk.patchKubeconfigWithContainerIP("c", "x", "", true); err == nil || !strings.Contains(err.Error(), "c-external-load-balancer or c-control-plane") {
+		test.Errorf("err = %v", err)
+	}
+}
+
+// Listing the nodes failing means no load balancer is assumed
+func TestLoadBalancerNameUnlisted(test *testing.T) {
+	tk := newTestKind(test)
+	tk.provider.external = []string{"c-external-load-balancer"}
+	tk.provider.nodesErr = errors.New("docker ps failed")
+	if got := tk.loadBalancerName("c"); got != "" {
+		test.Errorf("got %q", got)
+	}
+	tk.provider.nodesErr = nil
+	if got := tk.loadBalancerName("c"); got != "c-external-load-balancer" {
+		test.Errorf("got %q", got)
+	}
+	// Another cluster's load balancer isn't this one's
+	tk.provider.external = []string{"other-external-load-balancer"}
+	if got := tk.loadBalancerName("c"); got != "" {
+		test.Errorf("got %q", got)
+	}
+}
+
+// kubectl's kubeconfig, written from kind's internal one, uses the load
+// balancer too
+func TestUpdateKubeconfigFileWithLoadBalancer(test *testing.T) {
+	tk := newTestKind(test)
+	tk.host.files["/.dockerenv"] = ""
+	tk.provider.nodes = []string{"c-control-plane", "c-control-plane2"}
+	tk.provider.external = []string{"c-external-load-balancer"}
+	tk.provider.kubeconfig = strings.ReplaceAll(kindKubeconfig, "c-control-plane:6443", "c-external-load-balancer:6443")
+	tk.run.on("docker inspect c-external-load-balancer -f "+networkIPTemplate("bridge"), "172.17.0.9", nil)
+	if err := tk.UpdateKubeconfigFile("c"); err != nil {
+		test.Fatal(err)
+	}
+	written, err := clientcmd.LoadFromFile(filepath.Join(tk.host.home, ".kube", "config"))
+	if err != nil {
+		test.Fatal(err)
+	}
+	if got := written.Clusters["kind-c"]; got == nil || got.Server != "https://172.17.0.9:6443" || !got.InsecureSkipTLSVerify {
+		test.Errorf("kind cluster = %+v", got)
+	}
+}
+
 func TestGetKubeConfigPatching(test *testing.T) {
 	// Inside a container: the container's IP
 	tk := newTestKind(test)
@@ -99,6 +223,19 @@ func TestPatchKubeconfigForNativeHost(test *testing.T) {
 	tk.run.on("docker port c-control-plane 6443", "[::]:6001", nil)
 	if got, _ := tk.patchKubeconfigForNativeHost("c", "https://c-control-plane:6443", true); got != "https://127.0.0.1:6001" {
 		test.Errorf("IPv6 mapping: %q", got)
+	}
+	// With several control-planes only the load balancer publishes the API
+	tk = newTestKind(test)
+	tk.run.on("docker port c-external-load-balancer 6443", "0.0.0.0:6002\n[::]:6002\n", nil)
+	if got, err := tk.patchKubeconfigForNativeHost("c", "server: https://c-external-load-balancer:6443", true); err != nil || got != "server: https://127.0.0.1:6002" {
+		test.Errorf("load balancer: %q, %v", got, err)
+	}
+	if len(tk.run.ranWith("docker port c-control-plane")) != 0 {
+		test.Error("the control-plane publishes no port with several control-planes")
+	}
+	tk = newTestKind(test)
+	if _, err := tk.patchKubeconfigForNativeHost("c", "https://c-external-load-balancer:6443", true); err == nil || !strings.Contains(err.Error(), "container c-external-load-balancer") {
+		test.Errorf("err = %v", err)
 	}
 	for out, want := range map[string]string{"": "no port mapping", "garbage": "invalid port mapping"} {
 		tk := newTestKind(test)
@@ -203,7 +340,7 @@ func TestLoadImage(test *testing.T) {
 
 	tk = newTestKind(test)
 	tk.run.on("docker save", "", nil)
-	tk.loadErr = errors.New("disk full")
+	tk.layerErr, tk.loadErr = errors.New("no layers"), errors.New("disk full")
 	if err := tk.LoadImage(ctx, "c", "app:dev"); err == nil || !strings.Contains(err.Error(), "onto node c-control-plane: disk full") {
 		test.Errorf("err = %v", err)
 	}
@@ -212,6 +349,119 @@ func TestLoadImage(test *testing.T) {
 	tk.provider.nodes = nil
 	if err := tk.LoadImage(ctx, "c", "app:dev"); err == nil || !strings.Contains(err.Error(), "no nodes found") {
 		test.Errorf("err = %v", err)
+	}
+}
+
+// Each node loads layer-aware, falling back to the full archive when the
+// archive can't be inspected or the layer-aware load fails on that node
+func TestLoadImageFallback(test *testing.T) {
+	ctx := context.Background()
+	twoNodes := []string{"c-control-plane", "c-worker"}
+
+	for _, tc := range []struct {
+		name                          string
+		inspectErr, layerErr, loadErr error
+		want                          []string // in any order: nodes load concurrently
+		wantErrs                      []string
+	}{
+		{name: "layer-aware",
+			want: []string{"layer-aware c-control-plane", "layer-aware c-worker"}},
+		{name: "archive can't be inspected", inspectErr: errors.New("unsupported format"),
+			want: []string{"full c-control-plane", "full c-worker"}},
+		{name: "layer-aware load fails", layerErr: errors.New("ctr failed"),
+			want: []string{"full c-control-plane", "full c-worker", "layer-aware c-control-plane", "layer-aware c-worker"}},
+		{name: "full load fails too", layerErr: errors.New("ctr failed"), loadErr: errors.New("disk full"),
+			want: []string{"full c-control-plane", "full c-worker", "layer-aware c-control-plane", "layer-aware c-worker"},
+			wantErrs: []string{
+				"onto node c-control-plane: disk full (layer-aware load: ctr failed)",
+				"onto node c-worker: disk full (layer-aware load: ctr failed)",
+			}},
+		{name: "inspect error is reported", inspectErr: errors.New("unsupported format"), loadErr: errors.New("disk full"),
+			want:     []string{"full c-control-plane", "full c-worker"},
+			wantErrs: []string{"disk full (layer-aware load: unsupported format)"}},
+	} {
+		test.Run(tc.name, func(t *testing.T) {
+			tk := newTestKind(t)
+			tk.provider.nodes = twoNodes
+			tk.run.on("docker save", "", nil)
+			tk.inspectErr, tk.layerErr, tk.loadErr = tc.inspectErr, tc.layerErr, tc.loadErr
+
+			err := tk.LoadImage(ctx, "c", "app:dev")
+			if len(tc.wantErrs) == 0 && err != nil {
+				t.Fatal(err)
+			}
+			if len(tc.wantErrs) > 0 && err == nil {
+				t.Fatalf("want errors %q", tc.wantErrs)
+			}
+			for _, want := range tc.wantErrs {
+				if !strings.Contains(err.Error(), want) {
+					t.Errorf("err = %v, want %q", err, want)
+				}
+			}
+			slices.Sort(tk.loads)
+			if !slices.Equal(tk.loads, tc.want) {
+				t.Errorf("loads = %v, want %v", tk.loads, tc.want)
+			}
+		})
+	}
+}
+
+// Nodes load at the same time, as kind's own load does: every node's load
+// starts before any finishes
+func TestLoadImageNodesConcurrently(test *testing.T) {
+	tk := newTestKind(test)
+	tk.provider.nodes = []string{"c-control-plane", "c-worker", "c-worker2"}
+	tk.run.on("docker save", "", nil)
+
+	var started sync.WaitGroup
+	started.Add(len(tk.provider.nodes))
+	allStarted := make(chan struct{})
+	go func() { started.Wait(); close(allStarted) }()
+	tk.loadImages.layerAware = func(string, *layeraware.ImageMetadata, nodes.Node) error {
+		started.Done()
+		select {
+		case <-allStarted:
+			return nil
+		case <-time.After(5 * time.Second):
+			return errors.New("the other nodes' loads never started")
+		}
+	}
+	// A timed-out load would otherwise be hidden by the fallback
+	tk.loadImages.full = func(string, nodes.Node) error { return errors.New("fell back to a full load") }
+	if err := tk.LoadImage(context.Background(), "c", "app:dev"); err != nil {
+		test.Fatal(err)
+	}
+}
+
+// A node that fails doesn't end the load early: the archive is removed once
+// LoadImage returns, so it waits for the nodes still loading
+func TestLoadImageWaitsForEveryNode(test *testing.T) {
+	tk := newTestKind(test)
+	tk.provider.nodes = []string{"c-control-plane", "c-worker"}
+	tk.run.on("docker save", "", nil)
+
+	failed := make(chan struct{})
+	var slowDone atomic.Bool
+	tk.loadImages.layerAware = func(string, *layeraware.ImageMetadata, nodes.Node) error { return errors.New("ctr failed") }
+	tk.loadImages.full = func(_ string, n nodes.Node) error {
+		if n.String() == "c-control-plane" {
+			defer close(failed)
+			return errors.New("disk full")
+		}
+		<-failed
+		time.Sleep(20 * time.Millisecond)
+		slowDone.Store(true)
+		return nil
+	}
+	err := tk.LoadImage(context.Background(), "c", "app:dev")
+	if err == nil || !strings.Contains(err.Error(), "onto node c-control-plane: disk full") {
+		test.Errorf("err = %v", err)
+	}
+	if strings.Contains(fmt.Sprint(err), "c-worker") {
+		test.Errorf("c-worker loaded, but err = %v", err)
+	}
+	if !slowDone.Load() {
+		test.Error("LoadImage returned before c-worker finished loading")
 	}
 }
 
@@ -379,22 +629,32 @@ func TestConfigureProxy(test *testing.T) {
 	}
 }
 
+// Every node joins the network the control-plane joined, and each node's
+// default route then goes through it. The static IP is the control-plane's
 func TestConnectToHostNetwork(test *testing.T) {
 	tk := newTestKind(test)
+	tk.provider.nodes = []string{"c-worker2", "c-control-plane", "c-worker"} // kind's order varies
 	tk.run.on("docker network inspect dev-net --format", "172.30.0.1", nil)
 	tk.run.on("docker network inspect dev-net", "[]", nil)
 	tk.run.on("docker network connect", "", nil)
-	tk.run.on("kind get nodes --name c", "c-control-plane\nc-worker\n", nil)
 	tk.run.on("docker exec", "", nil)
-	if err := tk.connectToHostNetwork("c", "dev-net", "", "172.30.0.10"); err != nil {
+	var err error
+	out := captureStdout(test, func() { err = tk.connectToHostNetwork("c", "dev-net", "", "172.30.0.10") })
+	if err != nil {
 		test.Fatal(err)
 	}
-	if got := tk.run.ranWith("docker network connect"); len(got) != 1 || got[0].argv != "docker network connect --ip 172.30.0.10 dev-net c-control-plane" {
-		test.Errorf("connect = %v", got)
-	}
-	routes := tk.run.ranWith("docker exec")
-	if len(routes) != 2 || routes[1].argv != "docker exec c-worker ip route replace default via 172.30.0.1" {
-		test.Errorf("routes = %v", routes)
+	assertArgv(test, "connects", tk.run.ranWith("docker network connect"), []string{
+		"docker network connect --ip 172.30.0.10 dev-net c-control-plane",
+		"docker network connect dev-net c-worker",
+		"docker network connect dev-net c-worker2",
+	})
+	assertArgv(test, "routes", tk.run.ranWith("docker exec"), []string{
+		"docker exec c-control-plane ip route replace default via 172.30.0.1",
+		"docker exec c-worker ip route replace default via 172.30.0.1",
+		"docker exec c-worker2 ip route replace default via 172.30.0.1",
+	})
+	if strings.Contains(out, "Warning") {
+		test.Errorf("unexpected warning:\n%s", out)
 	}
 
 	// A missing network is created when a subnet is given
@@ -418,20 +678,161 @@ func TestConnectToHostNetwork(test *testing.T) {
 	}
 }
 
-func TestFixDefaultRouteFallsBackToControlPlane(test *testing.T) {
+// A node that can't join the network keeps kind's route: changing it to a
+// gateway the node has no interface for fails ("Nexthop has invalid gateway")
+// With several control-planes the load balancer joins too, without a route
+// change: it only proxies to the control-planes
+func TestConnectToHostNetworkLoadBalancer(test *testing.T) {
 	tk := newTestKind(test)
-	tk.run.on("docker network inspect bridge --format", "172.17.0.1\n", nil)
+	tk.provider.nodes = []string{"c-control-plane", "c-control-plane2", "c-worker"}
+	tk.provider.external = []string{"c-external-load-balancer"}
+	tk.run.on("docker network inspect dev-net --format", "172.30.0.1", nil)
+	tk.run.on("docker network inspect dev-net", "[]", nil)
+	tk.run.on("docker network connect", "", nil)
 	tk.run.on("docker exec", "", nil)
-	if err := tk.fixDefaultRouteForCluster("c", "bridge"); err != nil {
+	var err error
+	out := captureStdout(test, func() { err = tk.connectToHostNetwork("c", "dev-net", "", "") })
+	if err != nil {
 		test.Fatal(err)
 	}
-	if got := tk.run.ranWith("docker exec"); len(got) != 1 || !strings.HasPrefix(got[0].argv, "docker exec c-control-plane ip route") {
-		test.Errorf("routes = %v", got)
+	assertArgv(test, "connects", tk.run.ranWith("docker network connect"), []string{
+		"docker network connect dev-net c-control-plane",
+		"docker network connect dev-net c-control-plane2",
+		"docker network connect dev-net c-worker",
+		"docker network connect dev-net c-external-load-balancer",
+	})
+	assertArgv(test, "routes", tk.run.ranWith("docker exec"), []string{
+		"docker exec c-control-plane ip route replace default via 172.30.0.1",
+		"docker exec c-control-plane2 ip route replace default via 172.30.0.1",
+		"docker exec c-worker ip route replace default via 172.30.0.1",
+	})
+	if !strings.Contains(out, "Connected load balancer 'c-external-load-balancer' to 'dev-net' network") {
+		test.Errorf("output:\n%s", out)
 	}
+
+	// A load balancer that can't join is a warning; the nodes are still routed
+	tk = newTestKind(test)
+	tk.provider.nodes = []string{"c-control-plane", "c-control-plane2"}
+	tk.provider.external = []string{"c-external-load-balancer"}
+	tk.run.on("docker network inspect dev-net --format", "172.30.0.1", nil)
+	tk.run.on("docker network inspect dev-net", "[]", nil)
+	tk.run.on("docker network connect dev-net c-external-load-balancer", "no such container", errNotFaked)
+	tk.run.on("docker network connect", "", nil)
+	tk.run.on("docker exec", "", nil)
+	out = captureStdout(test, func() { err = tk.connectToHostNetwork("c", "dev-net", "", "") })
+	if err != nil || !strings.Contains(out, "Could not connect load balancer 'c-external-load-balancer' to 'dev-net' network") {
+		test.Errorf("err = %v, output:\n%s", err, out)
+	}
+	if len(tk.run.ranWith("docker exec")) != 2 {
+		test.Errorf("routes = %v", tk.run.ranWith("docker exec"))
+	}
+}
+
+func TestConnectToHostNetworkNodeFails(test *testing.T) {
+	tk := newTestKind(test)
+	tk.provider.nodes = []string{"c-control-plane", "c-worker", "c-worker2"}
+	tk.run.on("docker network inspect dev-net --format", "172.30.0.1", nil)
+	tk.run.on("docker network inspect dev-net", "[]", nil)
+	tk.run.on("docker network connect dev-net c-worker2", "Error response from daemon: no such container", errNotFaked)
+	tk.run.on("docker network connect", "", nil)
+	tk.run.on("docker exec", "", nil)
+	var err error
+	out := captureStdout(test, func() { err = tk.connectToHostNetwork("c", "dev-net", "", "") })
+	if err != nil {
+		test.Fatal(err)
+	}
+	if !strings.Contains(out, "Could not connect node 'c-worker2' to 'dev-net' network") || !strings.Contains(out, "no such container") {
+		test.Errorf("output:\n%s", out)
+	}
+	assertArgv(test, "routes", tk.run.ranWith("docker exec"), []string{
+		"docker exec c-control-plane ip route replace default via 172.30.0.1",
+		"docker exec c-worker ip route replace default via 172.30.0.1",
+	})
+}
+
+// Nodes join the network the control-plane ended up on, not the first one
+// tried
+func TestConnectToHostNetworkNodesFollowControlPlane(test *testing.T) {
+	tk := newTestKind(test)
+	tk.provider.nodes = []string{"c-control-plane", "c-worker"}
+	tk.host.files["/.dockerenv"] = ""
+	tk.run.on("docker inspect devbox", "dev-net\n", nil)
+	tk.run.on("docker network inspect bridge --format", "172.17.0.1", nil)
+	tk.run.on("docker network inspect", "[]", nil)
+	tk.run.on("docker network connect dev-net c-control-plane", "already connected", errNotFaked)
+	tk.run.on("docker network connect", "", nil)
+	tk.run.on("docker exec", "", nil)
+	if err := tk.connectToHostNetwork("c", "", "", ""); err != nil {
+		test.Fatal(err)
+	}
+	assertArgv(test, "connects", tk.run.ranWith("docker network connect"), []string{
+		"docker network connect dev-net c-control-plane",
+		"docker network connect bridge c-control-plane",
+		"docker network connect bridge c-worker",
+	})
+	assertArgv(test, "routes", tk.run.ranWith("docker exec"), []string{
+		"docker exec c-control-plane ip route replace default via 172.17.0.1",
+		"docker exec c-worker ip route replace default via 172.17.0.1",
+	})
+}
+
+// If kind can't list the nodes, only the control-plane is connected, and it
+// says so: the old kind CLI fallback skipped the workers silently
+func TestConnectToHostNetworkNodesUnlisted(test *testing.T) {
+	tk := newTestKind(test)
+	tk.provider.nodesErr = errors.New("docker ps failed")
+	tk.run.on("docker network inspect dev-net --format", "172.30.0.1", nil)
+	tk.run.on("docker network inspect dev-net", "[]", nil)
+	tk.run.on("docker network connect", "", nil)
+	tk.run.on("docker exec", "", nil)
+	var err error
+	out := captureStdout(test, func() { err = tk.connectToHostNetwork("c", "dev-net", "", "") })
+	if err != nil {
+		test.Fatal(err)
+	}
+	if !strings.Contains(out, "Could not list the nodes of cluster 'c' (docker ps failed); only the control-plane is connected") {
+		test.Errorf("output:\n%s", out)
+	}
+	assertArgv(test, "connects", tk.run.ranWith("docker network connect"), []string{"docker network connect dev-net c-control-plane"})
+	assertArgv(test, "routes", tk.run.ranWith("docker exec"), []string{"docker exec c-control-plane ip route replace default via 172.30.0.1"})
+}
+
+func TestFixDefaultRoutes(test *testing.T) {
+	tk := newTestKind(test)
+	tk.run.on("docker network inspect bridge --format", "172.17.0.1\n", nil)
+	tk.run.on("docker exec c-worker ", "Error: Nexthop has invalid gateway.", errNotFaked)
+	tk.run.on("docker exec", "", nil)
+	var err error
+	out := captureStdout(test, func() { err = tk.fixDefaultRoutes("bridge", []string{"c-control-plane", "c-worker"}, false) })
+	if err != nil {
+		test.Fatal(err)
+	}
+	// A node whose route can't be changed is a warning; the others still are
+	assertArgv(test, "routes", tk.run.ranWith("docker exec"), []string{
+		"docker exec c-control-plane ip route replace default via 172.17.0.1",
+		"docker exec c-worker ip route replace default via 172.17.0.1",
+	})
+	if !strings.Contains(out, "Could not update default route in node 'c-worker'") ||
+		!strings.Contains(out, "Default route in 'c-control-plane' updated to use 'bridge' gateway (172.17.0.1)") {
+		test.Errorf("output:\n%s", out)
+	}
+
 	tk = newTestKind(test)
 	tk.run.on("docker network inspect", "\n", nil)
-	if err := tk.fixDefaultRouteForCluster("c", "bridge"); err == nil {
+	if err := tk.fixDefaultRoutes("bridge", []string{"c-control-plane"}, false); err == nil {
 		test.Error("want an error for a network without a gateway")
+	}
+}
+
+// assertArgv checks the commands that ran, in order
+func assertArgv(test *testing.T, what string, ran []runCall, want []string) {
+	test.Helper()
+	got := make([]string, len(ran))
+	for iter, call := range ran {
+		got[iter] = call.argv
+	}
+	if !slices.Equal(got, want) {
+		test.Errorf("%s:\n got  %q\n want %q", what, got, want)
 	}
 }
 
@@ -637,5 +1038,213 @@ func TestCreateClusterFailures(test *testing.T) {
 	}
 	if len(tk.provider.created) != 0 {
 		test.Error("nothing should be created")
+	}
+}
+
+// repairKind is a cluster on dev-net (gateway 172.30.0.1) whose nodes' state
+// the test sets: which containers are on the network, and each node's route
+func repairKind(t *testing.T, onNetwork map[string]bool, routes map[string]string) *testKind {
+	t.Helper()
+	tk := newTestKind(t)
+	tk.provider.nodes = []string{"c-control-plane", "c-control-plane2", "c-worker"}
+	tk.provider.external = []string{"c-external-load-balancer"}
+	tk.run.on("docker network inspect dev-net --format", "172.30.0.1\n", nil)
+	for _, c := range []string{"c-control-plane", "c-control-plane2", "c-worker", "c-external-load-balancer"} {
+		ip := "<no value>"
+		if onNetwork[c] {
+			ip = "172.30.0.9"
+		}
+		tk.run.on("docker inspect "+c+" -f "+networkIPTemplate("dev-net"), ip+"\n", nil)
+	}
+	for node, route := range routes {
+		tk.run.on("docker exec "+node+" ip route show default", route+"\n", nil)
+	}
+	tk.run.on("docker network connect", "", nil)
+	tk.run.on("docker exec", "", nil)
+	return tk
+}
+
+var allOnNetwork = map[string]bool{"c-control-plane": true, "c-control-plane2": true, "c-worker": true, "c-external-load-balancer": true}
+
+func viaGateway(nodes ...string) map[string]string {
+	routes := map[string]string{}
+	for _, n := range nodes {
+		routes[n] = "default via 172.30.0.1 dev eth1"
+	}
+	return routes
+}
+
+// A cluster that needs nothing is left alone, quietly
+func TestRepairClusterNetworkHealthy(test *testing.T) {
+	tk := repairKind(test, allOnNetwork, viaGateway("c-control-plane", "c-control-plane2", "c-worker"))
+	out := captureStdout(test, func() { tk.RepairClusterNetwork("c", "dev-net") })
+	if out != "" {
+		test.Errorf("output:\n%s", out)
+	}
+	if got := tk.run.ranWith("docker network connect"); len(got) != 0 {
+		test.Errorf("connected %v", got)
+	}
+	if got := tk.run.ranWith("docker exec c-control-plane ip route replace"); len(got) != 0 {
+		test.Errorf("routes %v", got)
+	}
+	for _, n := range []string{"c-control-plane2", "c-worker"} {
+		if got := tk.run.ranWith("docker exec " + n + " ip route replace"); len(got) != 0 {
+			test.Errorf("routes %v", got)
+		}
+	}
+}
+
+// Nodes restarted since the last up lost the route kraze set: it's restored
+func TestRepairClusterNetworkRestoresRoutes(test *testing.T) {
+	routes := viaGateway("c-control-plane2")
+	routes["c-control-plane"] = "default via 172.18.0.1 dev eth0"
+	routes["c-worker"] = "default via 172.18.0.1 dev eth0"
+	tk := repairKind(test, allOnNetwork, routes)
+	out := captureStdout(test, func() { tk.RepairClusterNetwork("c", "dev-net") })
+	var replaced []string
+	for _, call := range tk.run.ranWith("docker exec") {
+		if strings.Contains(call.argv, "route replace") {
+			replaced = append(replaced, call.argv)
+		}
+	}
+	if !slices.Equal(replaced, []string{
+		"docker exec c-control-plane ip route replace default via 172.30.0.1",
+		"docker exec c-worker ip route replace default via 172.30.0.1",
+	}) {
+		test.Errorf("replaced %q", replaced)
+	}
+	if !strings.Contains(out, "Restored default route in 'c-control-plane' to use 'dev-net' gateway (172.30.0.1)") ||
+		!strings.Contains(out, "Restored default route in 'c-worker'") || strings.Contains(out, "c-control-plane2") {
+		test.Errorf("output:\n%s", out)
+	}
+	if got := tk.run.ranWith("docker network connect"); len(got) != 0 {
+		test.Errorf("connected %v", got)
+	}
+}
+
+// A cluster an older kraze created: only the control-plane is on the
+// network. The rest joins, and the joined nodes are routed
+func TestRepairClusterNetworkConnectsOlderCluster(test *testing.T) {
+	tk := repairKind(test, map[string]bool{"c-control-plane": true},
+		map[string]string{"c-control-plane": "default via 172.30.0.1 dev eth1"})
+	out := captureStdout(test, func() { tk.RepairClusterNetwork("c", "dev-net") })
+	assertArgv(test, "connects", tk.run.ranWith("docker network connect"), []string{
+		"docker network connect dev-net c-control-plane2",
+		"docker network connect dev-net c-worker",
+		"docker network connect dev-net c-external-load-balancer",
+	})
+	for _, want := range []string{
+		"Connected load balancer 'c-external-load-balancer' to 'dev-net' network",
+		"Restored default route in 'c-control-plane2'", "Restored default route in 'c-worker'",
+	} {
+		if !strings.Contains(out, want) {
+			test.Errorf("want %q in output:\n%s", want, out)
+		}
+	}
+	if strings.Contains(out, "Restored default route in 'c-control-plane' ") {
+		test.Errorf("the control-plane's route was right:\n%s", out)
+	}
+}
+
+// The network is the configured one, or else the first detected one the
+// control-plane is on; on none, nothing is touched
+func TestRepairClusterNetworkFindsNetwork(test *testing.T) {
+	tk := repairKind(test, allOnNetwork, viaGateway("c-control-plane", "c-control-plane2", "c-worker"))
+	tk.host.files["/.dockerenv"] = ""
+	tk.run.on("docker inspect devbox", "other-net dev-net\n", nil)
+	tk.run.on("docker inspect c-control-plane -f "+networkIPTemplate("other-net"), "<no value>\n", nil)
+	tk.RepairClusterNetwork("c", "")
+	if got := tk.run.ranWith("docker network inspect dev-net --format"); len(got) != 1 {
+		test.Errorf("want dev-net repaired, ran %v", tk.run.ran())
+	}
+
+	tk = newTestKind(test)
+	tk.RepairClusterNetwork("c", "dev-net")
+	if got := tk.run.ran(); len(got) != 1 || !strings.HasPrefix(got[0], "docker inspect c-control-plane") {
+		test.Errorf("a control-plane on no network should only be looked up, ran %v", got)
+	}
+}
+
+// The user's kubeconfig entry for the cluster gets the current address, and
+// nothing else changes
+func TestRefreshKubeconfigFile(test *testing.T) {
+	stale := func() *clientcmdapi.Config {
+		cfg := clientcmdapi.NewConfig()
+		cfg.Clusters["kind-c"] = &clientcmdapi.Cluster{Server: "https://172.30.0.2:6443", InsecureSkipTLSVerify: true}
+		cfg.Clusters["prod"] = &clientcmdapi.Cluster{Server: "https://prod"}
+		cfg.AuthInfos["kind-c"] = &clientcmdapi.AuthInfo{Token: "keep"}
+		cfg.Contexts["kind-c"] = &clientcmdapi.Context{Cluster: "kind-c", AuthInfo: "kind-c"}
+		cfg.Contexts["prod"] = &clientcmdapi.Context{Cluster: "prod"}
+		cfg.CurrentContext = "prod"
+		return cfg
+	}
+	setup := func(t *testing.T) *testKind {
+		tk := newTestKind(t)
+		tk.host.files["/.dockerenv"] = ""
+		tk.provider.kubeconfig = strings.ReplaceAll(kindKubeconfig, "c-control-plane:6443", "c-external-load-balancer:6443")
+		tk.provider.nodes = []string{"c-control-plane", "c-control-plane2"}
+		tk.provider.external = []string{"c-external-load-balancer"}
+		tk.run.on("docker inspect c-external-load-balancer -f "+networkIPTemplate("bridge"), "172.30.0.9", nil)
+		return tk
+	}
+	path := func(tk *testKind) string { return filepath.Join(tk.host.home, ".kube", "config") }
+
+	tk := setup(test)
+	tk.host.existing = stale()
+	var err error
+	out := captureStdout(test, func() { err = tk.RefreshKubeconfigFile("c") })
+	if err != nil {
+		test.Fatal(err)
+	}
+	if !strings.Contains(out, "Updated kubeconfig context 'kind-c': API server https://172.30.0.2:6443 -> https://172.30.0.9:6443") {
+		test.Errorf("output:\n%s", out)
+	}
+	written, err := clientcmd.LoadFromFile(path(tk))
+	if err != nil {
+		test.Fatal(err)
+	}
+	if got := written.Clusters["kind-c"]; got == nil || got.Server != "https://172.30.0.9:6443" || !got.InsecureSkipTLSVerify {
+		test.Errorf("kind-c = %+v", got)
+	}
+	if written.CurrentContext != "prod" || written.Clusters["prod"] == nil || written.AuthInfos["kind-c"].Token != "keep" {
+		test.Errorf("only the address may change, got %+v", written)
+	}
+
+	// Up to date, no entry for the cluster, or no kubeconfig: nothing written
+	upToDate := stale()
+	upToDate.Clusters["kind-c"].Server = "https://172.30.0.9:6443"
+	noEntry := stale()
+	delete(noEntry.Clusters, "kind-c")
+	for name, existing := range map[string]*clientcmdapi.Config{"up to date": upToDate, "no entry": noEntry, "no kubeconfig": nil} {
+		tk := setup(test)
+		tk.host.existing = existing
+		out := captureStdout(test, func() { err = tk.RefreshKubeconfigFile("c") })
+		if err != nil || out != "" {
+			test.Errorf("%s: err = %v, output %q", name, err, out)
+		}
+		if _, statErr := os.Stat(path(tk)); !os.IsNotExist(statErr) {
+			test.Errorf("%s: the kubeconfig was written", name)
+		}
+	}
+
+	// Failures are returned
+	tk = setup(test)
+	tk.host.existing = stale()
+	tk.provider.kubeErr = errors.New("no control-plane")
+	if err := tk.RefreshKubeconfigFile("c"); err == nil || !strings.Contains(err.Error(), "no control-plane") {
+		test.Errorf("err = %v", err)
+	}
+	tk = setup(test)
+	tk.host.existing = stale()
+	tk.KindManager.host.kubeconfigPath = filepath.Join(tk.host.home, "file", "config")
+	_ = os.WriteFile(filepath.Join(tk.host.home, "file"), nil, 0o644)
+	if err := tk.RefreshKubeconfigFile("c"); err == nil || !strings.Contains(err.Error(), "failed to write kubeconfig") {
+		test.Errorf("err = %v", err)
+	}
+	tk = setup(test)
+	tk.host.existing = stale()
+	tk.provider.kubeconfig = "not: [yaml"
+	if err := tk.RefreshKubeconfigFile("c"); err == nil {
+		test.Error("want an error for a kubeconfig that doesn't parse")
 	}
 }

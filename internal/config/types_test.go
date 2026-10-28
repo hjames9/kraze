@@ -367,3 +367,26 @@ func TestConfigValidate(test *testing.T) {
 		})
 	}
 }
+
+func TestClusterConfigNodeCount(test *testing.T) {
+	tests := []struct {
+		name     string
+		nodes    []KindNode
+		expected int
+	}{
+		{"no config is a single control-plane", nil, 1},
+		{"one entry per node", []KindNode{{Role: "control-plane"}, {Role: "worker"}}, 2},
+		{"replicas", []KindNode{{Role: "control-plane"}, {Role: "worker", Replicas: 2}}, 3},
+		{"one replica", []KindNode{{Role: "control-plane", Replicas: 1}}, 1},
+		{"replicas on every entry", []KindNode{{Role: "control-plane", Replicas: 3}, {Role: "worker", Replicas: 4}}, 7},
+	}
+
+	for _, tt := range tests {
+		test.Run(tt.name, func(t *testing.T) {
+			cfg := ClusterConfig{Config: tt.nodes}
+			if got := cfg.NodeCount(); got != tt.expected {
+				t.Errorf("NodeCount() = %d, want %d", got, tt.expected)
+			}
+		})
+	}
+}

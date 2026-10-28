@@ -197,3 +197,24 @@ func TestKubeconfigFallbacks(test *testing.T) {
 		test.Errorf("no networks = %v", nets)
 	}
 }
+
+// NodeCount, which init's dry run prints, is the number of nodes the cluster
+// is created with
+func TestNodeCountMatchesKindConfig(test *testing.T) {
+	tk := newTestKind(test)
+	nvidia := &config.GPUConfig{Nvidia: &config.GPUVendorConfig{Enabled: true}}
+	for name, cfg := range map[string]*config.ClusterConfig{
+		"default":          {},
+		"default with GPU": {GPU: nvidia},
+		"control plane":    {Config: []config.KindNode{{Role: "control-plane"}}},
+		"worker replicas":  {Config: []config.KindNode{{Role: "control-plane"}, {Role: "worker", Replicas: 2}}},
+		"replicas and GPU": {GPU: nvidia, Config: []config.KindNode{{Role: "control-plane", Replicas: 3}, {Role: "worker", Replicas: 2}}},
+		"one replica":      {Config: []config.KindNode{{Role: "control-plane"}, {Role: "worker", Replicas: 1}}},
+		"several entries":  {Config: []config.KindNode{{Role: "control-plane"}, {Role: "worker"}, {Role: "worker"}}},
+	} {
+		cfg.Name = "c"
+		if got, want := cfg.NodeCount(), len(tk.buildKindConfig(cfg).Nodes); got != want {
+			test.Errorf("%s: NodeCount() = %d, kind config has %d nodes", name, got, want)
+		}
+	}
+}
