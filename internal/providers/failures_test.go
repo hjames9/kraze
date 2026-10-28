@@ -569,3 +569,48 @@ func TestBadDocumentSeparator(t *testing.T) {
 		t.Errorf("CRDs = %v, output:\n%s", crds, out)
 	}
 }
+
+// What Helm leaves after a pull: the untarred chart's directory, or a .tgz
+func TestFindPulledChart(t *testing.T) {
+	dir := func(names ...string) string {
+		d := t.TempDir()
+		for _, name := range names {
+			var err error
+			if strings.HasSuffix(name, "/") {
+				err = os.Mkdir(filepath.Join(d, name), 0o755)
+			} else {
+				err = os.WriteFile(filepath.Join(d, name), nil, 0o644)
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+		}
+		return d
+	}
+	for _, tt := range []struct {
+		name, want, wantErr string
+		dir                 string
+	}{
+		{name: "untarred", dir: dir("README", "mychart/"), want: "mychart"},
+		{name: "tgz", dir: dir("README", "mychart-1.0.0.tgz"), want: "mychart-1.0.0.tgz"},
+		{name: "empty", dir: dir(), wantErr: "no chart found"},
+		{name: "no chart", dir: dir("README"), wantErr: "could not find chart"},
+		{name: "missing", dir: filepath.Join(t.TempDir(), "missing"), wantErr: "failed to read temp directory"},
+	} {
+		got, err := findPulledChart(tt.dir)
+		if tt.wantErr != "" {
+			if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
+				t.Errorf("%s: err = %v, want %q", tt.name, err, tt.wantErr)
+			}
+		} else if err != nil || got != filepath.Join(tt.dir, tt.want) {
+			t.Errorf("%s: got %q, %v; want %q", tt.name, got, err, tt.want)
+		}
+	}
+
+	if _, err := findPulledTgz(dir("mychart/"), "repo/mychart"); err == nil || !strings.Contains(err.Error(), `no .tgz found`) {
+		t.Errorf("no .tgz: err = %v", err)
+	}
+	if _, err := findPulledTgz(filepath.Join(t.TempDir(), "missing"), "repo/mychart"); err == nil || !strings.Contains(err.Error(), "failed to read") {
+		t.Errorf("missing dir: err = %v", err)
+	}
+}

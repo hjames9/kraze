@@ -13,7 +13,7 @@
 
 set -euo pipefail
 
-FLOOR=99.0
+FLOOR=99.3
 
 profile=${1:?usage: $0 <coverage.out>}
 

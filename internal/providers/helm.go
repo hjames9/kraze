@@ -571,33 +571,9 @@ func (helm *HelmProvider) pullHTTPChartInto(service *config.ServiceConfig, tmpDi
 		return "", fmt.Errorf("failed to pull chart: %w", err)
 	}
 
-	// Find the extracted chart directory
-	// When Untar=true, helm extracts to destdir/chartname/
-	entries, err := os.ReadDir(tmpDir)
+	chartPath, err := findPulledChart(tmpDir)
 	if err != nil {
-		return "", fmt.Errorf("failed to read temp directory: %w", err)
-	}
-
-	if len(entries) == 0 {
-		return "", fmt.Errorf("no chart found in temp directory")
-	}
-
-	// Look for a directory (untarred chart) or .tgz file
-	var chartPath string
-	for _, entry := range entries {
-		if entry.IsDir() {
-			// Found the chart directory
-			chartPath = filepath.Join(tmpDir, entry.Name())
-			break
-		} else if strings.HasSuffix(entry.Name(), ".tgz") {
-			// Found a .tgz file
-			chartPath = filepath.Join(tmpDir, entry.Name())
-			break
-		}
-	}
-
-	if chartPath == "" {
-		return "", fmt.Errorf("could not find chart in temp directory: %s", tmpDir)
+		return "", err
 	}
 
 	if helm.opts.Verbose {
@@ -605,6 +581,24 @@ func (helm *HelmProvider) pullHTTPChartInto(service *config.ServiceConfig, tmpDi
 	}
 
 	return chartPath, nil
+}
+
+// findPulledChart returns the chart Helm pulled into dir: the directory it was
+// untarred to (Untar=true extracts to dir/chartname/), or else a .tgz
+func findPulledChart(dir string) (string, error) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return "", fmt.Errorf("failed to read temp directory: %w", err)
+	}
+	if len(entries) == 0 {
+		return "", fmt.Errorf("no chart found in temp directory")
+	}
+	for _, entry := range entries {
+		if entry.IsDir() || strings.HasSuffix(entry.Name(), ".tgz") {
+			return filepath.Join(dir, entry.Name()), nil
+		}
+	}
+	return "", fmt.Errorf("could not find chart in temp directory: %s", dir)
 }
 
 // addHTTPRepositoryForChart adds an HTTP(S) Helm repository and returns its
@@ -808,7 +802,11 @@ func (helm *HelmProvider) PullChartToDir(service *config.ServiceConfig, destDir 
 		return "", fmt.Errorf("failed to pull chart %q: %w", chartRef, err)
 	}
 
-	// Find the downloaded .tgz file in destDir.
+	return findPulledTgz(destDir, chartRef)
+}
+
+// findPulledTgz returns the .tgz Helm pulled chartRef to in destDir
+func findPulledTgz(destDir, chartRef string) (string, error) {
 	entries, err := os.ReadDir(destDir)
 	if err != nil {
 		return "", fmt.Errorf("failed to read %s: %w", destDir, err)

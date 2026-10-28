@@ -3,8 +3,10 @@ package pack
 import (
 	"archive/tar"
 	"compress/gzip"
+	"errors"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -229,5 +231,94 @@ func TestCreatePackageUnusableServiceName(t *testing.T) {
 	err := CreatePackage([]string{cfgPath}, parse(t, cfgPath), "dev", filepath.Join(t.TempDir(), "out.tar.gz"), false)
 	if err == nil || !strings.Contains(err.Error(), "creating chart staging dir") {
 		t.Errorf("err = %v", err)
+	}
+}
+
+// failAfter accepts n bytes, then fails every write
+type failAfter struct{ n int }
+
+func (w *failAfter) Write(p []byte) (int, error) {
+	if len(p) > w.n {
+		written := w.n
+		w.n = 0
+		return written, errors.New("disk full")
+	}
+	w.n -= len(p)
+	return len(p), nil
+}
+
+// A package with one of everything writePackageTar writes
+func testPackageContents(t *testing.T) packageContents {
+	t.Helper()
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "kraze.yml")
+	writeFile(t, cfgPath, "project: web\ncluster:\n  name: c\nservices:\n  a:\n    type: manifests\n    path: ./a.yaml\n")
+	chart := filepath.Join(dir, "chart.tgz")
+	writeFile(t, chart, "chart")
+	asset := filepath.Join(dir, "a.yaml")
+	writeFile(t, asset, "kind: ConfigMap\n")
+	return packageContents{
+		archiveRoot:  dir,
+		configPaths:  []string{cfgPath},
+		krazeVersion: "test",
+		remoteCharts: map[string]remoteChartInfo{"db": {tgzPath: chart, archPath: ".krazepack/charts/db.tgz"}},
+		remoteManifests: map[string]remoteManifestInfo{"web": {files: []remoteManifestFile{
+			{origURL: "https://example.com/web.yaml", content: []byte("kind: Service\n"), archPath: ".krazepack/manifests/web-0.yaml"},
+		}}},
+		localAssets: []Asset{{AbsPath: asset, ArchPath: "a.yaml"}},
+	}
+}
+
+// Every write of the package can fail; each failure names what was being written
+func TestWritePackageTarFailures(t *testing.T) {
+	pc := testPackageContents(t)
+	var full countingWriter
+	if err := writePackageTar(&full, pc); err != nil {
+		t.Fatal(err)
+	}
+
+	// tar writes in 512-byte blocks, so failing at each block boundary reaches
+	// every step
+	var errs []string
+	for n := 0; n < full.n; n += 512 {
+		err := writePackageTar(&failAfter{n: n}, pc)
+		if err == nil {
+			t.Fatalf("failing after %d of %d bytes: want an error", n, full.n)
+		}
+		errs = append(errs, err.Error())
+	}
+	for _, want := range []string{"writing config", "writing bundled chart", "writing bundled manifest", "writing asset", "writing metadata", "closing tar"} {
+		if !slices.ContainsFunc(errs, func(e string) bool { return strings.HasPrefix(e, want) }) {
+			t.Errorf("no failure reported as %q; got %q", want, errs)
+		}
+	}
+}
+
+// gzip writes its header on the first write and buffers the rest, so a small
+// package that fails after the header fails closing the gzip stream
+func TestWritePackageGzipCloseFails(t *testing.T) {
+	err := writePackage(&failAfter{n: 10}, testPackageContents(t))
+	if err == nil || !strings.HasPrefix(err.Error(), "closing gzip") {
+		t.Errorf("err = %v, want closing gzip", err)
+	}
+}
+
+type countingWriter struct{ n int }
+
+func (w *countingWriter) Write(p []byte) (int, error) { w.n += len(p); return len(p), nil }
+
+// Entries and packages over the limits are rejected
+func TestExtractTarLimits(t *testing.T) {
+	archive := filepath.Join(t.TempDir(), "big.tar.gz")
+	rawTarGz(t, archive, fileEntry("a", strings.Repeat("x", 10)), fileEntry("b", strings.Repeat("y", 10)))
+
+	if err := extractTarLimited(archive, t.TempDir(), 100, 100); err != nil {
+		t.Errorf("within the limits: %v", err)
+	}
+	if err := extractTarLimited(archive, t.TempDir(), 9, 100); err == nil || !strings.Contains(err.Error(), `"a" exceeds the 9 byte per-file limit`) {
+		t.Errorf("entry over the limit: err = %v", err)
+	}
+	if err := extractTarLimited(archive, t.TempDir(), 100, 15); err == nil || !strings.Contains(err.Error(), "exceed the 15 byte limit") {
+		t.Errorf("total over the limit: err = %v", err)
 	}
 }

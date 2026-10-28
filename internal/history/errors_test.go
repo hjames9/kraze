@@ -3,6 +3,8 @@ package history
 import (
 	"context"
 	"errors"
+	"os"
+	"os/user"
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
@@ -39,15 +41,33 @@ func TestLoadAndDeleteErrors(t *testing.T) {
 	}
 }
 
-func TestCurrentUserFallsBack(t *testing.T) {
-	t.Setenv("USER", "")
-	t.Setenv("USERNAME", "")
-	if currentUser() == "" {
-		t.Error("the user should never be empty")
+// $USER, then the OS's user, then "unknown"; "@host" when the hostname is known
+func TestCurrentUser(t *testing.T) {
+	t.Cleanup(func() { lookupUser, hostname = user.Current, os.Hostname })
+	osUser := func(name string, err error) func() (*user.User, error) {
+		return func() (*user.User, error) { return &user.User{Username: name}, err }
 	}
-	t.Setenv("USER", "dev")
-	if got := currentUser(); got == "" || got[:3] != "dev" {
-		t.Errorf("user = %q", got)
+	host := func(name string, err error) func() (string, error) {
+		return func() (string, error) { return name, err }
+	}
+	failed := errors.New("unknown")
+	for _, tt := range []struct {
+		env    string
+		lookup func() (*user.User, error)
+		host   func() (string, error)
+		want   string
+	}{
+		{"dev", osUser("os", nil), host("box", nil), "dev@box"},
+		{"", osUser("os", nil), host("box", nil), "os@box"},
+		{"", osUser("", failed), host("box", nil), "unknown@box"},
+		{"dev", osUser("os", nil), host("", failed), "dev"},
+		{"dev", osUser("os", nil), host("", nil), "dev"},
+	} {
+		t.Setenv("USER", tt.env)
+		lookupUser, hostname = tt.lookup, tt.host
+		if got := currentUser(); got != tt.want {
+			t.Errorf("USER=%q: user = %q, want %q", tt.env, got, tt.want)
+		}
 	}
 }
 

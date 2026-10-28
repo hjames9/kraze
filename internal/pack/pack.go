@@ -408,16 +408,60 @@ func CreatePackage(configPaths []string, cfg *config.Config, krazeVersion string
 	}
 	defer func() { _ = os.Remove(tmpOutput) }() // no-op once renamed into place
 
-	gw := gzip.NewWriter(f)
-	tw := tar.NewWriter(gw)
+	err = writePackage(f, packageContents{
+		archiveRoot:     archiveRoot,
+		configPaths:     configPaths,
+		krazeVersion:    krazeVersion,
+		remoteCharts:    remoteCharts,
+		remoteManifests: remoteManifests,
+		localAssets:     localAssets,
+		externalPaths:   externalPaths,
+	})
+	if err != nil {
+		_ = f.Close()
+		return err
+	}
+	if err := f.Close(); err != nil {
+		return fmt.Errorf("closing output file: %w", err)
+	}
+
+	return os.Rename(tmpOutput, outputPath)
+}
+
+// packageContents is what CreatePackage gathered for writePackage
+type packageContents struct {
+	archiveRoot     string
+	configPaths     []string
+	krazeVersion    string
+	remoteCharts    map[string]remoteChartInfo
+	remoteManifests map[string]remoteManifestInfo
+	localAssets     []Asset
+	externalPaths   map[string]string
+}
+
+// writePackage writes the package archive (gzipped tar) to w
+func writePackage(w io.Writer, pc packageContents) error {
+	gw := gzip.NewWriter(w)
+	if err := writePackageTar(gw, pc); err != nil {
+		return err
+	}
+	if err := gw.Close(); err != nil {
+		return fmt.Errorf("closing gzip: %w", err)
+	}
+	return nil
+}
+
+// writePackageTar writes the package's tar stream to w
+func writePackageTar(w io.Writer, pc packageContents) error {
+	tw := tar.NewWriter(w)
 
 	// Write config files (with remote sources rewritten).
-	for _, cfgPath := range configPaths {
-		archCfgPath, err := relArchivePath(archiveRoot, cfgPath)
+	for _, cfgPath := range pc.configPaths {
+		archCfgPath, err := relArchivePath(pc.archiveRoot, cfgPath)
 		if err != nil {
 			return err
 		}
-		rewritten, err := rewriteConfig(cfgPath, archCfgPath, remoteCharts, remoteManifests, externalPaths)
+		rewritten, err := rewriteConfig(cfgPath, archCfgPath, pc.remoteCharts, pc.remoteManifests, pc.externalPaths)
 		if err != nil {
 			return fmt.Errorf("rewriting %s: %w", cfgPath, err)
 		}
@@ -427,14 +471,14 @@ func CreatePackage(configPaths []string, cfg *config.Config, krazeVersion string
 	}
 
 	// Write bundled remote charts.
-	for name, pc := range remoteCharts {
-		if err := addFileToTar(tw, pc.tgzPath, pc.archPath); err != nil {
+	for name, chart := range pc.remoteCharts {
+		if err := addFileToTar(tw, chart.tgzPath, chart.archPath); err != nil {
 			return fmt.Errorf("writing bundled chart for %s: %w", name, err)
 		}
 	}
 
 	// Write bundled HTTP manifests.
-	for name, dm := range remoteManifests {
+	for name, dm := range pc.remoteManifests {
 		for _, f := range dm.files {
 			if err := addBytesToTar(tw, f.content, f.archPath); err != nil {
 				return fmt.Errorf("writing bundled manifest for %s: %w", name, err)
@@ -443,21 +487,21 @@ func CreatePackage(configPaths []string, cfg *config.Config, krazeVersion string
 	}
 
 	// Write local assets.
-	for _, asset := range localAssets {
+	for _, asset := range pc.localAssets {
 		if err := addFileToTar(tw, asset.AbsPath, asset.ArchPath); err != nil {
 			return fmt.Errorf("writing asset %s: %w", asset.ArchPath, err)
 		}
 	}
 
 	// Write metadata.
-	configFileArchPaths := make([]string, len(configPaths))
-	for i, p := range configPaths {
-		rel, _ := relArchivePath(archiveRoot, p)
+	configFileArchPaths := make([]string, len(pc.configPaths))
+	for i, p := range pc.configPaths {
+		rel, _ := relArchivePath(pc.archiveRoot, p)
 		configFileArchPaths[i] = rel
 	}
 	meta := PackageMetadata{
 		Version:      metadataVersion,
-		KrazeVersion: krazeVersion,
+		KrazeVersion: pc.krazeVersion,
 		CreatedAt:    time.Now().UTC().Format(time.RFC3339),
 		ConfigFiles:  configFileArchPaths,
 	}
@@ -472,14 +516,7 @@ func CreatePackage(configPaths []string, cfg *config.Config, krazeVersion string
 	if err := tw.Close(); err != nil {
 		return fmt.Errorf("closing tar: %w", err)
 	}
-	if err := gw.Close(); err != nil {
-		return fmt.Errorf("closing gzip: %w", err)
-	}
-	if err := f.Close(); err != nil {
-		return fmt.Errorf("closing output file: %w", err)
-	}
-
-	return os.Rename(tmpOutput, outputPath)
+	return nil
 }
 
 // rewriteConfig reads configPath and returns a YAML copy where remote Helm
@@ -745,6 +782,12 @@ func addBytesToTar(tw *tar.Writer, content []byte, archPath string) error {
 }
 
 func extractTar(archivePath, destDir string) error {
+	return extractTarLimited(archivePath, destDir, maxExtractedEntrySize, maxExtractedTotalSize)
+}
+
+// extractTarLimited is extractTar with the size limits as parameters, so tests
+// can check them without writing gigabytes
+func extractTarLimited(archivePath, destDir string, maxEntrySize, maxTotalSize int64) error {
 	f, err := os.Open(archivePath)
 	if err != nil {
 		return err
@@ -792,7 +835,7 @@ func extractTar(archivePath, destDir string) error {
 			if err != nil {
 				return err
 			}
-			written, copyErr := io.Copy(out, io.LimitReader(tr, maxExtractedEntrySize+1))
+			written, copyErr := io.Copy(out, io.LimitReader(tr, maxEntrySize+1))
 			closeErr := out.Close()
 			if copyErr != nil {
 				return copyErr
@@ -801,12 +844,12 @@ func extractTar(archivePath, destDir string) error {
 				// A failed close can mean the file was not fully written
 				return closeErr
 			}
-			if written > maxExtractedEntrySize {
-				return fmt.Errorf("invalid archive entry: %q exceeds the %d byte per-file limit", header.Name, int64(maxExtractedEntrySize))
+			if written > maxEntrySize {
+				return fmt.Errorf("invalid archive entry: %q exceeds the %d byte per-file limit", header.Name, maxEntrySize)
 			}
 			totalWritten += written
-			if totalWritten > maxExtractedTotalSize {
-				return fmt.Errorf("invalid archive: extracted contents exceed the %d byte limit", int64(maxExtractedTotalSize))
+			if totalWritten > maxTotalSize {
+				return fmt.Errorf("invalid archive: extracted contents exceed the %d byte limit", maxTotalSize)
 			}
 		}
 	}

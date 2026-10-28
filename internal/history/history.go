@@ -326,17 +326,24 @@ func truncateError(err error) string {
 	return strings.ToValidUTF8(msg[:MaxErrorLength], "") + "…"
 }
 
+// The user and host lookups, replaced in tests: whether user.Current works
+// depends on the machine
+var (
+	lookupUser = user.Current
+	hostname   = os.Hostname
+)
+
 func currentUser() string {
 	name := os.Getenv("USER")
 	if name == "" {
-		if u, err := user.Current(); err == nil {
+		if u, err := lookupUser(); err == nil {
 			name = u.Username
 		}
 	}
 	if name == "" {
 		name = "unknown"
 	}
-	if host, err := os.Hostname(); err == nil && host != "" {
+	if host, err := hostname(); err == nil && host != "" {
 		return name + "@" + host
 	}
 	return name
@@ -344,8 +351,6 @@ func currentUser() string {
 
 func newID() string {
 	b := make([]byte, 8)
-	if _, err := rand.Read(b); err != nil {
-		return fmt.Sprintf("%x", time.Now().UnixNano())
-	}
+	_, _ = rand.Read(b) // never returns an error: since Go 1.24 it crashes instead
 	return hex.EncodeToString(b)
 }
