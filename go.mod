@@ -9,7 +9,7 @@ require (
 	github.com/mattn/go-runewidth v0.0.31
 	github.com/moby/moby/client v0.6.2
 	github.com/spf13/cobra v1.10.2
-	go.yaml.in/yaml/v3 v3.0.5
+	go.yaml.in/yaml/v3 v3.0.6
 	golang.org/x/sys v0.49.0
 	golang.org/x/term v0.47.0
 	helm.sh/helm/v4 v4.3.1
