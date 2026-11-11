@@ -200,10 +200,8 @@ deps: ## Download and tidy dependencies
 	$(GOMOD) download
 	$(GOMOD) tidy
 
-deps-upgrade: ## Upgrade all dependencies
-	@echo "Upgrading dependencies..."
-	$(GOGET) -u ./...
-	$(GOMOD) tidy
+deps-upgrade: ## Upgrade all dependencies (kube-openapi hold, kind fork; see scripts/deps-upgrade.sh)
+	@scripts/deps-upgrade.sh
 
 verify: fmt vet test ## Run fmt, vet, and test
 
